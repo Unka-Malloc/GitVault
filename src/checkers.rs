@@ -45,6 +45,10 @@ pub struct Context {
     /// `rules.default`. Carried so the gate can tell a deliberate rule from a
     /// fallback; the API, SSH and signing paths already make that distinction.
     pub reason: String,
+    /// The identity came from `rules.default` rather than a rule about this
+    /// repository. Mirrored from the identity outcome for the same reason it is
+    /// a field there: a display string is not a policy decision.
+    pub via_default: bool,
     /// What the rules say should be used.
     pub expected_email: Option<String>,
     /// What git will actually stamp. Attribution follows this one.
@@ -195,7 +199,7 @@ pub fn identity_gate(ctx: &Context) -> Option<CheckerOutcome> {
     // any directory with a `git init` in it. That is not a guard against a wrong
     // identity; it is the invention of a requirement that no rule expressed. The API,
     // SSH and signing paths have always refused the fallback for the same reason.
-    if ctx.reason.starts_with("rules.default") {
+    if ctx.via_default {
         return None;
     }
 
@@ -480,6 +484,7 @@ mod tests {
             identity: "personal".into(),
             account: None,
             reason: "rules.owners[Owner]".into(),
+            via_default: false,
             expected_email: Some("maintainer@example.invalid".into()),
             actual_email: Some("maintainer@example.invalid".into()),
             args: Vec::new(),

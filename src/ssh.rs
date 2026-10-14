@@ -126,7 +126,7 @@ pub fn run(cfg: &Config, vault: &Vault, args: &[String]) -> Result<i32> {
         .ok_or_else(|| anyhow::anyhow!("identity '{}' has no account", outcome.identity))?;
 
     // Same refusals as the API path, for the same reasons.
-    if outcome.reason.starts_with("rules.default") {
+    if outcome.via_default {
         bail!(
             "refusing to authenticate: no explicit rule for owner '{:?}'\n  \
              resolved account: {account}",
@@ -143,6 +143,7 @@ pub fn run(cfg: &Config, vault: &Vault, args: &[String]) -> Result<i32> {
         vault,
         &format!("GitVault: confirm to authenticate {account} over SSH"),
         false,
+        None,
     )?;
     let key = vault.ssh_key_for(&account)?;
     let passphrase = vault.passphrase_for(&account);
@@ -265,14 +266,6 @@ pub fn askpass_script(passphrase: &str) -> Result<PathBuf> {
     unsafe { std::env::set_var("GITVAULT_ASKPASS_VALUE", passphrase) };
     Ok(path)
 }
-
-/// Path helper for tests and callers that know only a slug.
-pub fn slug_remote(slug: &str) -> String {
-    format!("git@github.com:{slug}.git")
-}
-
-#[allow(dead_code)]
-fn unused(_: PathBuf) {}
 
 #[cfg(test)]
 mod tests {

@@ -139,11 +139,6 @@ pub struct Checker {
     /// Command and arguments. Placeholders are substituted from the run context:
     /// `{repo}`, `{event}`, `{identity}`, `{account}`, `{email}`.
     pub command: Vec<String>,
-    /// Environment variables removed before the checker runs. Used to stop a
-    /// parent process (an editor, an agent harness) from leaking credentials or
-    /// steering the checker through ambient state.
-    #[serde(default)]
-    pub strip_env: Vec<String>,
     /// Extra environment for the checker. `{identity}`-style placeholders apply.
     #[serde(default)]
     pub env: BTreeMap<String, String>,

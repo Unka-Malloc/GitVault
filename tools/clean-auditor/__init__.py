@@ -35,6 +35,7 @@ import time
 # the checker's own prefix: two checkers sharing a process (the test suite) must
 # not collide on a top-level module name like `stage1`.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "agent-profiles"))
 from clean_ranges import ranges as review_ranges  # noqa: E402
 import clean_stage1 as stage1  # noqa: E402
 # profile_sync is imported lazily in main(): --serve-tools never touches it,
@@ -269,7 +270,7 @@ def audited(settings, base, head, runtime):
 # paths or endpoints.
 RUNTIME_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,79}$")
 PI_THINKING = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
-DEFAULT_RUNTIME = {"provider": "example", "model": "deepseek/deepseek-v4.1-flash", "effort": "high"}
+from audit_runtime import DEFAULT_RUNTIME  # noqa: E402  single source: tools/agent-profiles/audit_runtime.py
 
 
 def declared_runtime(settings):

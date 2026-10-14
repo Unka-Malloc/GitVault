@@ -139,7 +139,7 @@ pub fn run(cfg: &Config, vault: &Vault, args: &[String], cwd: &PathBuf) -> Resul
         .clone()
         .ok_or_else(|| anyhow::anyhow!("identity '{}' has no account", outcome.identity))?;
 
-    if outcome.reason.starts_with("rules.default") {
+    if outcome.via_default {
         bail!(
             "refusing to sign: no explicit rule for owner '{:?}'\n  resolved account: {account}",
             repo.owner().unwrap_or_default()

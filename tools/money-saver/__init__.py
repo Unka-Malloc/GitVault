@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "agent-profiles"))
 # profile_sync is imported lazily in main(): --serve-tools never touches it,
 # so the bridge works even where the library is not beside the plugin.
 
@@ -278,7 +279,7 @@ def _review_for(run_dir):
         spec = importlib.util.spec_from_file_location("money_saver_full_audit", ROOT / "full_audit.py")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        review = module.make_review(Review, run_dir)
+        review = module.make_review(Review, run_dir, DOMAINS)
     return review
 
 
@@ -352,7 +353,7 @@ def serve_tools(run_dir):
 # paths or endpoints.
 RUNTIME_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,79}$")
 PI_THINKING = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
-DEFAULT_RUNTIME = {"provider": "example", "model": "deepseek/deepseek-v4.1-flash", "effort": "high"}
+from audit_runtime import DEFAULT_RUNTIME  # noqa: E402  single source: tools/agent-profiles/audit_runtime.py
 
 
 def declared_runtime(settings):

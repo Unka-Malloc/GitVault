@@ -6,7 +6,7 @@ from pathlib import Path
 import re
 
 
-def make_review(base_class, run_dir):
+def make_review(base_class, run_dir, domains):
     class FullReview(base_class):
         def __init__(self, directory):
             super().__init__(directory)
@@ -42,7 +42,7 @@ def make_review(base_class, run_dir):
                 self.event(operation, args.get("path"))
             if operation == "inventory":
                 return {"mode": "full-service", "projects": self.projects,
-                        "documents": self.catalog, "cost_domains": ["sql", "storage", "network", "compute", "cloudflare", "vps"],
+                        "documents": self.catalog, "cost_domains": list(domains),
                         "instructions": "Read original_request, then inspect every project. list/find accept glob pattern and offset; read returns numbered source. Submit project coverage including exact inspected entry points, data paths, clients and cancellation/retry paths. No source execution or production access."}
             if operation == "original_request":
                 self.original_read = True

@@ -30,6 +30,11 @@ pub struct Outcome {
     /// What git will actually stamp on the commit. Attribution follows this one.
     pub actual_email: Option<String>,
     pub reason: String,
+    /// The identity came from `rules.default`, not a rule about this
+    /// repository. Credential-issuing paths refuse a default route: a fallback
+    /// must never be a credential source. Carried as a field, not parsed out
+    /// of `reason`, so a wording change cannot silently open the gate.
+    pub via_default: bool,
     /// Set when the assertion disagreed with the owner rule.
     pub conflict: Option<String>,
     pub assertion: Option<String>,
@@ -43,6 +48,7 @@ impl Outcome {
             "expected_email": self.expected_email,
             "actual_email": self.actual_email,
             "reason": self.reason,
+            "via_default": self.via_default,
             "assertion": self.assertion,
             "conflict": self.conflict,
         })
@@ -95,14 +101,14 @@ pub fn resolve(cfg: &Config, repo: &Repo, ignore_assertion: bool) -> Result<Outc
         .and_then(|o| cfg.rules.owners.get(o))
         .cloned();
 
-    let (chosen, reason, conflict) = if let Some(a) = assertion.clone() {
+    let (chosen, reason, conflict, via_default) = if let Some(a) = assertion.clone() {
         let conflict = match (&owner_rule, owner.as_deref()) {
             (Some(rule), Some(o)) if rule != &a => Some(format!(
                 "{ASSERTION_FILE} asserts '{a}' but rules.owners maps '{o}' to '{rule}'"
             )),
             _ => None,
         };
-        (a, format!("{ASSERTION_FILE} assertion"), conflict)
+        (a, format!("{ASSERTION_FILE} assertion"), conflict, false)
     } else if let Some(rule) = owner_rule.clone() {
         (
             rule,
@@ -111,6 +117,7 @@ pub fn resolve(cfg: &Config, repo: &Repo, ignore_assertion: bool) -> Result<Outc
                 owner.clone().unwrap_or_default()
             ),
             None,
+            false,
         )
     } else if let Some(rule) = cfg
         .rules
@@ -122,9 +129,10 @@ pub fn resolve(cfg: &Config, repo: &Repo, ignore_assertion: bool) -> Result<Outc
             rule.identity.clone(),
             format!("rules.paths['{}']", rule.prefix.display()),
             None,
+            false,
         )
     } else if let Some(default) = cfg.rules.default.clone() {
-        (default, "rules.default".to_string(), None)
+        (default, "rules.default".to_string(), None, true)
     } else {
         bail!(
             "no identity matches repository {} (remote owner: {})\n\
@@ -143,6 +151,7 @@ pub fn resolve(cfg: &Config, repo: &Repo, ignore_assertion: bool) -> Result<Outc
         // commit will be attributed to the wrong account no matter what the rules say.
         actual_email: repo.configured_email(),
         reason,
+        via_default,
         conflict,
         assertion,
     })

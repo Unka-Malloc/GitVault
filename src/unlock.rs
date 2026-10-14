@@ -132,6 +132,7 @@ pub fn ensure_open(
     vault: &crate::vault::Vault,
     reason: &str,
     announce: bool,
+    ttl_secs: Option<u64>,
 ) -> Result<SystemTime> {
     if is_unlocked() {
         return Ok(SystemTime::now());
@@ -139,7 +140,7 @@ pub fn ensure_open(
     if !vault.exists() {
         bail!("no vault yet; run: gitvault auth init");
     }
-    let secs = default_ttl_secs();
+    let secs = ttl_secs.unwrap_or_else(default_ttl_secs);
     // Biometric first. It is the only step an automated process cannot satisfy, which
     // is what makes this a gate rather than a timer.
     require_biometric(reason)?;

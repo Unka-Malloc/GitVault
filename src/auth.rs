@@ -13,8 +13,6 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use anyhow::{Context, Result, bail};
 
 use crate::config::Config;
-use crate::git::Repo;
-use crate::identity;
 use crate::vault::{Store, Vault};
 
 pub fn cmd_init(vault: &Vault) -> Result<()> {
@@ -31,11 +29,9 @@ pub fn cmd_init(vault: &Vault) -> Result<()> {
     // works before any credential depends on it.
     vault.save(&Store::default())?;
     println!("vault created at {}", vault.path().display());
-    println!("the key is in the keychain under service '{KEYCHAIN_SERVICE_NAME}'");
+    println!("the key is in the keychain under service '{}'", crate::vault::keychain_service());
     Ok(())
 }
-
-const KEYCHAIN_SERVICE_NAME: &str = "gitvault-vault-key";
 
 pub fn cmd_add(vault: &Vault, account: &str) -> Result<()> {
     if account.trim().is_empty() {
@@ -317,55 +313,6 @@ pub fn cmd_import_key(
     Ok(())
 }
 
-/// Resolve the credential that may be used for a repository, applying policy.
-///
-/// Policy is the point of this function. Holding a token in the vault does not
-/// permit its use anywhere: an identity whose account is not listed for the
-/// repository's owner is refused, so a misconfigured or malicious call cannot
-/// borrow the wrong account.
-pub fn credential_for_repo(cfg: &Config, repo: &Repo, vault: &Vault) -> Result<(String, String)> {
-    let outcome = identity::resolve(cfg, repo, false)?;
-
-    let account = outcome
-        .account
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("identity '{}' has no account", outcome.identity))?;
-
-    let owner = repo
-        .owner()
-        .ok_or_else(|| anyhow::anyhow!("repository has no parsable origin owner"))?;
-
-    // Refuse a default-routed identity.
-    //
-    // `rules.default` exists so that local conventions (commit email, checkers)
-    // degrade gracefully for unrouted repositories. It must NOT be a credential
-    // source: that would mean every repository on the machine - including one the
-    // caller invented on the spot - could ask for the default account's token.
-    // Issuance requires an explicit owner rule or a repository assertion.
-    if outcome.reason.starts_with("rules.default") {
-        bail!(
-            "refusing to issue a credential from the default route\n  \
-             repository owner : {owner}\n  \
-             resolved account : {account}\n  \
-             resolved by      : {}\n\
-             add an explicit rules.owners entry for this owner, or a \
-             .gitvault-identity assertion in the repository",
-            outcome.reason
-        );
-    }
-
-
-    let store = vault.load()?;
-    let token = store.get(&account).ok_or_else(|| {
-        anyhow::anyhow!(
-            "no stored token for account '{account}'\n  \
-             run: gitvault auth add {account}"
-        )
-    })?;
-
-    Ok((account.to_string(), token.to_string()))
-}
-
 /// Report presence, never content. An agent needs to know whether it can act;
 /// it never needs the token to find that out.
 pub fn cmd_status(vault: &Vault, cfg: &Config, account: Option<&str>, json: bool) -> Result<()> {
@@ -414,81 +361,3 @@ pub fn cmd_status(vault: &Vault, cfg: &Config, account: Option<&str>, json: bool
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::{Identity, Rules};
-    use std::collections::BTreeMap;
-    use std::path::PathBuf;
-
-    fn cfg_with(owner: &str, identity: &str, account: &str) -> Config {
-        let mut identities = BTreeMap::new();
-        identities.insert(
-            identity.to_string(),
-            Identity {
-                name: "n".into(),
-                email: "e@x".into(),
-                account: Some(account.to_string()),
-                ssh_key: None,
-                signing_key: None,
-            },
-        );
-        let mut owners = BTreeMap::new();
-        owners.insert(owner.to_string(), identity.to_string());
-        Config {
-            identities,
-            rules: Rules {
-                owners,
-                ..Default::default()
-            },
-            checkers: vec![],
-            record_dir: None,
-        }
-    }
-
-    fn repo(owner_repo: &str) -> Repo {
-        Repo::for_test("/tmp/x", Some(&format!("git@github.com:{owner_repo}.git")))
-    }
-
-    #[test]
-    fn the_account_comes_from_the_owner_rule_and_nowhere_else() {
-        // Replaces the two allowlist tests. The requirement is that a repository is
-        // acted on as its designated account: the owner rule decides, so a
-        // misconfiguration cannot select a different account. Nothing needs to list
-        // permitted accounts, because there is no second way to choose one.
-        let cfg = cfg_with("acme", "acme", "acme-bot");
-        let v = Vault::open_at(PathBuf::from("/nonexistent")).unwrap();
-
-        // The account is the designated one, and the only reason it cannot proceed is
-        // the absent vault - proving the named account was chosen.
-        let err = credential_for_repo(&cfg, &repo("acme/launcher"), &v)
-            .expect_err("no vault here");
-        assert!(err.to_string().contains("acme-bot"), "{err}");
-    }
-
-    #[test]
-    fn an_owner_with_no_rule_is_refused_rather_than_defaulted() {
-        // The other half: no rule for this owner means refuse, so an invented
-        // repository name cannot borrow the default account.
-        let mut cfg = cfg_with("SomeOrg", "personal", "alice");
-        cfg.rules.owners.clear();
-        cfg.rules.default = Some("personal".to_string());
-        let v = Vault::open_at(PathBuf::from("/nonexistent")).unwrap();
-        let err = credential_for_repo(&cfg, &repo("Attacker/Repo"), &v)
-            .expect_err("must refuse");
-        assert!(err.to_string().contains("default route"), "{err}");
-    }
-
-    #[test]
-    fn default_route_never_issues_a_credential() {
-        // No rules.owners entry for this owner, but rules.default is set. Issuing
-        // here would hand the default account's token to any repository.
-        let mut cfg = cfg_with("SomeOrg", "personal", "alice");
-        cfg.rules.owners.clear();
-        cfg.rules.default = Some("personal".to_string());
-        let v = Vault::open_at(PathBuf::from("/nonexistent")).unwrap();
-        let err = credential_for_repo(&cfg, &repo("Attacker/Repo"), &v)
-            .expect_err("must refuse");
-        assert!(err.to_string().contains("default route"), "{err}");
-    }
-}

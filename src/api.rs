@@ -13,7 +13,6 @@
 //! the target repository, and issuance refuses if the routing is not explicit.
 
 use std::io::Write;
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
@@ -47,7 +46,6 @@ pub enum Access {
 /// Retained for reporting and for future risk-based policy. It deliberately does
 /// NOT soften the unlock requirement: reads of private repositories are not
 /// harmless, so both classes need an open window.
-pub fn _access_is_reported_not_enforced() {}
 pub fn access_for_method(method: &str) -> Access {
     match method.to_ascii_uppercase().as_str() {
         "GET" | "HEAD" | "OPTIONS" => Access::Read,
@@ -86,7 +84,7 @@ fn authorize(cfg: &Config, target: &Target, access: Access, vault: &Vault) -> Re
             // An explicitly routed owner is required. Falling back to rules.default
             // would mean any repository name the caller invents could borrow the
             // default account's credentials.
-            if outcome.reason.starts_with("rules.default") {
+            if outcome.via_default {
                 bail!(
                     "refusing to act: no explicit rule for owner '{:?}'\n  \
                      resolved account : {account}\n  \
@@ -111,6 +109,7 @@ fn authorize(cfg: &Config, target: &Target, access: Access, vault: &Vault) -> Re
                 vault,
                 &format!("GitVault: confirm to authenticate {account} to the GitHub API"),
                 false,
+                None,
             )?;
             let token = vault.token_for(&account)?;
             (account, token)
@@ -131,6 +130,7 @@ fn authorize(cfg: &Config, target: &Target, access: Access, vault: &Vault) -> Re
                 vault,
                 &format!("GitVault: confirm to authenticate {account}"),
                 false,
+                None,
             )?;
             let token = vault.token_for(&account)?;
             (account, token)
@@ -459,16 +459,6 @@ mod tests {
     }
 
     #[test]
-    fn access_classification_does_not_soften_the_gate() {
-        // The classification exists for reporting; the gate must treat reads and
-        // writes alike. This test pins that intent so a future change has to be
-        // deliberate.
-        assert_eq!(access_for_method("GET"), Access::Read);
-        assert_eq!(access_for_method("POST"), Access::Write);
-        _access_is_reported_not_enforced();
-    }
-
-    #[test]
     fn jq_handles_the_shapes_agents_actually_write() {
         let body = r#"{"login":"x","n":{"deep":42},"items":[{"id":7},{"id":8}]}"#;
         assert_eq!(apply_jq(body, ".login").unwrap(), "x");
@@ -504,5 +494,40 @@ mod tests {
     #[test]
     fn jq_rejects_non_json_rather_than_guessing() {
         assert!(apply_jq("not json", ".x").is_err());
+    }
+
+    #[test]
+    fn a_default_route_is_marked_so_the_gate_can_refuse_it() {
+        // The vault would hold the default account's token, and the repository
+        // matches no owner rule - so `rules.default` resolves the identity. A
+        // fallback may not be a credential source: the outcome must say so
+        // structurally, not through a display string the gate has to parse.
+        use crate::config::{Identity, Rules};
+        use std::collections::BTreeMap;
+
+        let mut identities = BTreeMap::new();
+        identities.insert(
+            "personal".to_string(),
+            Identity {
+                name: "n".into(),
+                email: "e@x".into(),
+                account: Some("acct".to_string()),
+                ssh_key: None,
+                signing_key: None,
+            },
+        );
+        let cfg = Config {
+            identities,
+            rules: Rules {
+                owners: BTreeMap::new(),
+                default: Some("personal".to_string()),
+                ..Default::default()
+            },
+            checkers: vec![],
+            record_dir: None,
+        };
+        let repo = Repo::for_test("/tmp/x", Some("git@github.com:Attacker/Repo.git"));
+        let outcome = crate::identity::resolve(&cfg, &repo, false).unwrap();
+        assert!(outcome.via_default, "an unrouted repository must not look routed");
     }
 }

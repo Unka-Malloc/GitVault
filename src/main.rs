@@ -273,14 +273,6 @@ enum RepoCommand {
         owner: String,
         #[arg(long, default_value_t = 30)]
         limit: u32,
-        /// Include archived repositories.
-        ///
-        /// Off by default because archived repositories are usually noise, but it
-        /// must be reachable: an archived repository is still readable and may be the
-        /// only copy of something, and silently omitting it makes the tool look like
-        /// it cannot see what plainly exists.
-        #[arg(long)]
-        all: bool,
         /// Filter by visibility: all, public, private.
         #[arg(long, default_value = "all")]
         visibility: String,
@@ -643,6 +635,7 @@ fn context_for(
         identity: outcome.identity.clone(),
         account: outcome.account.clone(),
         reason: outcome.reason.clone(),
+        via_default: outcome.via_default,
         expected_email: outcome.expected_email.clone(),
         actual_email: outcome.actual_email.clone(),
         args,
@@ -811,8 +804,7 @@ fn cmd_unlock(ttl: Option<u64>) -> anyhow::Result<ExitCode> {
     if !vault.exists() {
         anyhow::bail!("no vault yet; run: gitvault auth init");
     }
-    let _ = ttl;
-    unlock::ensure_open(&vault, "GitVault: confirm to open the credential vault", true)?;
+    unlock::ensure_open(&vault, "GitVault: confirm to open the credential vault", true, ttl)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -993,7 +985,7 @@ fn cmd_pr(
             if json {
                 None
             } else {
-                Some(".0".to_string())
+                Some(".[].html_url".to_string())
             },
         ),
         PrCommand::View { number, json } => (
@@ -1127,7 +1119,7 @@ fn cmd_issue(
         IssueCommand::List { state, limit, json } => get(
             format!("/repos/{slug}/issues?state={state}&per_page={limit}"),
             slug.clone(),
-            if json { None } else { Some(".0".into()) },
+            if json { None } else { Some(".[].html_url".into()) },
         ),
         IssueCommand::View { number, json } => get(
             format!("/repos/{slug}/issues/{number}"),
@@ -1183,7 +1175,6 @@ fn cmd_repo(config: Option<&PathBuf>, command: RepoCommand) -> anyhow::Result<Ex
         RepoCommand::List {
             owner,
             limit,
-            all,
             visibility,
             json,
         } => {
@@ -1204,16 +1195,10 @@ fn cmd_repo(config: Option<&PathBuf>, command: RepoCommand) -> anyhow::Result<Ex
                 "Organization" => format!("/orgs/{owner}/repos"),
                 _ => format!("/users/{owner}/repos"),
             };
-            // No jq: an earlier version filtered on ".0", which reduced every listing to
-            // its first element and made the tool appear blind to repositories that
-            // exist. `--json` is accepted for symmetry and changes nothing, because the
-            // response is JSON either way.
-            let _ = json;
-            let _ = all;
             get(
                 format!("{base}?per_page={limit}&type={visibility}"),
                 format!("{owner}/.github"),
-                None,
+                if json { None } else { Some(".[].full_name".into()) },
             )
         }
         RepoCommand::DefaultBranch { slug } => {
@@ -1258,7 +1243,7 @@ fn cmd_release(
         ReleaseCommand::List { limit, json } => get(
             format!("/repos/{slug}/releases?per_page={limit}"),
             slug.clone(),
-            if json { None } else { Some(".0.tag_name".into()) },
+            if json { None } else { Some(".[].tag_name".into()) },
         ),
         ReleaseCommand::View { tag, json } => get(
             format!("/repos/{slug}/releases/tags/{tag}"),
@@ -1297,15 +1282,14 @@ fn cmd_release(
                 slug.clone(),
                 Some(".id".into()),
             );
-            let code = api::run(&cfg, &vault, &id_req)?;
-            if code != 0 {
-                return Ok(ExitCode::from(code as u8));
-            }
-            anyhow::bail!(
-                "deleting release '{tag}' needs its numeric id; \
-                 run `gitvault api /repos/{slug}/releases/tags/{tag} --jq .id` \
-                 then `gitvault api /repos/{slug}/releases/ID -X DELETE`"
+            let id = api::run_value(&cfg, &vault, &id_req)?;
+            let mut r = get(
+                format!("/repos/{slug}/releases/{}", id.trim()),
+                slug.clone(),
+                None,
             );
+            r.method = "DELETE".into();
+            r
         }
     };
     emit(&cfg, &vault, req)

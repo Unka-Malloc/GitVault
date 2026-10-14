@@ -36,7 +36,7 @@ const KEY_LEN: usize = 32;
 const KEYCHAIN_SERVICE: &str = "gitvault-vault-key";
 
 /// Overridable so tests do not touch the real vault key.
-fn keychain_service() -> String {
+pub(crate) fn keychain_service() -> String {
     std::env::var("GITVAULT_KEYCHAIN_SERVICE").unwrap_or_else(|_| KEYCHAIN_SERVICE.to_string())
 }
 

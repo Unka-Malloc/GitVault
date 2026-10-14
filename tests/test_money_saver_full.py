@@ -27,7 +27,7 @@ class FullAuditTests(unittest.TestCase):
     def test_full_scope_original_and_project_coverage(self):
         ms.write_json(self.scope / "snapshot.json", {"files":{"demo/server.py":"def fetch():\n    return 1\n"}, "projects":{"demo":{}}})
         ms.write_json(self.scope / "request.json", {"conversation_url":"https://example.invalid/chat", "messages":["Exact original request"]})
-        review = full.make_review(ms.Review, self.scope)
+        review = full.make_review(ms.Review, self.scope, ms.DOMAINS)
         report = self.report()
         report["projects"] = {"demo":{"status":"reviewed", "reason":"Inspected synthetic service"}}
         with self.assertRaises(ValueError): review.submit(report)
@@ -35,7 +35,7 @@ class FullAuditTests(unittest.TestCase):
         self.assertEqual(review.context({"operation":"original_request"})["messages"], ["Exact original request"])
         with self.assertRaises(ValueError): review.submit(report)
         self.assertIn("def fetch", review.context({"operation":"read", "path":"demo/server.py"})["content"])
-        resumed = full.make_review(ms.Review, self.scope)
+        resumed = full.make_review(ms.Review, self.scope, ms.DOMAINS)
         self.assertTrue(resumed.original_read)
         self.assertIn("demo/server.py", resumed.reads)
         self.assertEqual(review.context({"operation":"find", "text":"missing|fetch"})["total"], 1)

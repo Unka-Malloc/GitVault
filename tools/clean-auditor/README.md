@@ -105,7 +105,7 @@ review, and `unknown` cannot pass.
   it. The boundaries that cannot be bypassed are the ones GitVault itself
   controls: `pr create`, `pr merge`, `release create`.
 - A range with no published content to compare against (a brand-new branch with
-  no remote base) is scanned whole (`--scope snapshot`) and the receipt records
+  no remote base) is scanned whole, and the receipt records
   `fallback: snapshot-no-merge-base`.
 - The semantic stage is not paid for twice: the deterministic stage runs on
   every operation, but a range that already passed the semantic review is

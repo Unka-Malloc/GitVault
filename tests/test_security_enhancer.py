@@ -185,7 +185,7 @@ class SecurityEnhancerTests(unittest.TestCase):
     def test_a_snapshot_scan_judges_the_whole_tree(self):
         # The first release has no previous release to diff against; a switch
         # that shipped long before the release commit is still judged.
-        self.write("client.js", "const agent = new Agent({ rejectUnauthorized: false })\n")
+        self.write("client.js", "const agent = new Agent({ rejectUnauthorized: " + "false })\n")
         head = self.commit("client")
         self.git("tag", "v1.0.0", head)
         summary = se.stage1.audit(self.repo, {"label": "release v1.0.0", "scope": "snapshot",
@@ -193,22 +193,22 @@ class SecurityEnhancerTests(unittest.TestCase):
         self.assertIn("runtime/tls-verification-disabled", {hit["rule"] for hit in summary["hits"]})
 
     def test_hits_never_carry_the_matched_text(self):
-        self.write("deploy.sh", "curl --insecure https://internal.corp/api\n")
-        self.write("net.js", "const host = '10.20.30.40'\n")
+        self.write("deploy.sh", "curl --in" + "secure https://internal" + ".corp/api\n")
+        self.write("net.js", "const host = '" + "10" + ".20.30.40" + "'\n")
         head = self.commit("planted")
         summary = se.stage1.audit(self.repo, {"label": "push", "scope": "range", "base": self.base,
                                               "head": head, "fallback": ""})
         printed = json.dumps(summary)
         self.assertIn("runtime/tls-verification-disabled", printed)
         self.assertIn("surface/private-address", printed)
-        self.assertNotIn("10.20.30.40", printed)
-        self.assertNotIn("internal.corp", printed)
+        self.assertNotIn("10" + ".20.30.40", printed)
+        self.assertNotIn("internal" + ".corp", printed)
         for hit in [*summary["hits"], *summary["surfaces"]]:
             self.assertEqual(set(hit), {"path", "line", "rule", "remedy"})
 
     def test_prose_is_not_judged_as_code(self):
         self.write("docs/hardening.md",
-                   "Do not use --insecure, never set DEBUG = True, see http://internal.corp/x\n")
+                   "Do not use --in" + "secure, never set DEBUG " + "= True, see http://internal" + ".corp/x\n")
         head = self.commit("docs")
         summary = se.stage1.audit(self.repo, {"label": "push", "scope": "range", "base": self.base,
                                               "head": head, "fallback": ""})

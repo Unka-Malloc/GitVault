@@ -99,31 +99,6 @@ impl Repo {
             .filter(|s| !s.is_empty() && s != "HEAD")
     }
 
-    /// Path of every file staged for the next commit. Used by pre-commit so the
-    /// decision matches the index, not the working tree the developer sees.
-    pub fn staged_paths(&self) -> Result<Vec<String>> {
-        let out = git(
-            &self.root,
-            &["diff", "--cached", "--name-only", "--diff-filter=ACMR"],
-        )?;
-        Ok(out
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect())
-    }
-
-    /// Every object id the current branch would introduce relative to base.
-    pub fn commits_in_range(&self, base: &str, head: &str) -> Result<Vec<String>> {
-        let out = git(&self.root, &["rev-list", &format!("{base}..{head}")])?;
-        Ok(out
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .collect())
-    }
 
     /// The email git will actually stamp on a commit here.
     ///
@@ -139,20 +114,6 @@ impl Repo {
             .filter(|s| !s.is_empty())
     }
 
-    pub fn configured_name(&self) -> Option<String> {
-        git(&self.root, &["config", "user.name"])
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    }
-
-    pub fn is_ancestor(&self, maybe_ancestor: &str, descendant: &str) -> bool {
-        git(
-            &self.root,
-            &["merge-base", "--is-ancestor", maybe_ancestor, descendant],
-        )
-        .is_ok()
-    }
 
     /// Resolve a revision to a commit id; refuses when it does not exist. Used
     /// by the release boundary, where a tag that is not in this checkout means
@@ -165,20 +126,6 @@ impl Repo {
         Ok(out.trim().to_string())
     }
 
-    /// The zero object id git uses for "this ref does not exist remotely yet".
-    pub const NULL_SHA: &'static str = "0000000000000000000000000000000000000000";
-
-    /// Root commit of a history, used when pushing a branch that is new remotely.
-    pub fn root_commit(&self, head: &str) -> Result<String> {
-        let out = git(&self.root, &["rev-list", "--max-parents=0", head])?;
-        let last = out
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .next_back()
-            .unwrap_or(head);
-        Ok(last.to_string())
-    }
 }
 
 pub fn parse_owner(remote: &str) -> Option<String> {

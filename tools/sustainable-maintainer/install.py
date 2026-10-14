@@ -91,7 +91,7 @@ def install_payload(target):
     for name in ("__init__.py", "maintainer_ranges.py", "maintainer_stage1.py", "plugin.yaml"):
         shutil.copyfile(SOURCE / name, target / name)
         (target / name).chmod(0o600)
-    for name in ("profile_sync.py", "pi-bridge.ts"):
+    for name in ("profile_sync.py", "pi-bridge.ts", "audit_runtime.py"):
         shutil.copyfile(LIBRARY / name, target / name)
         (target / name).chmod(0o600)
     # The legacy embedded runner is gone from the payload entirely: an
