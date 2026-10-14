@@ -1,0 +1,38 @@
+model:
+  default: deepseek/deepseek-v4.1-flash
+  provider: example
+agent:
+  reasoning_effort: high
+  coding_context: "off"
+  environment_probe: false
+  bot_mode_protocol: false
+  turn_liveness:
+    timeout_s: 0
+tool_loop_guardrails:
+  hard_stop_enabled: false
+  non_interactive_hard_stop_enabled: false
+fallback_model: []
+compression:
+  enabled: false
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+  nudge_interval: 0
+mcp_servers: {}
+plugins:
+  enabled: [money-saver]
+platform_toolsets:
+  cli: [money_saver]
+terminal:
+  backend: local
+display:
+  tool_progress: none
+auxiliary:
+  title_generation:
+    enabled: false
+    model_upgrade_enabled: false
+  background_review:
+    enabled: false
+tools:
+  tool_search:
+    enabled: "off"

@@ -1,0 +1,318 @@
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT: AtomicU64 = AtomicU64::new(0);
+struct Fixture(PathBuf);
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+fn git(repo: &Path, args: &[&str]) -> Output {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap()
+}
+fn checked(repo: &Path, args: &[&str]) {
+    let result = git(repo, args);
+    assert!(result.status.success(), "fixture Git command failed");
+}
+fn fixture(checker: &str) -> Fixture {
+    let root = std::env::temp_dir().join(format!(
+        "gitvault-hook-test-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(root.join("hooks")).unwrap();
+    checked(&root, &["init", "-q"]);
+    checked(&root, &["config", "commit.gpgsign", "false"]);
+    checked(&root, &["config", "user.name", "Synthetic"]);
+    checked(
+        &root,
+        &["config", "user.email", "synthetic@example.invalid"],
+    );
+    checked(
+        &root,
+        &[
+            "config",
+            "core.hooksPath",
+            root.join("hooks").to_str().unwrap(),
+        ],
+    );
+    std::fs::write(root.join("one"), "base\n").unwrap();
+    std::fs::write(root.join("two"), "base\n").unwrap();
+    checked(&root, &["add", "."]);
+    checked(&root, &["commit", "-qm", "base"]);
+    std::fs::write(root.join("checker.sh"), checker).unwrap();
+    let cfg = format!(
+        "record_dir = '{}'\n[identities.fixture]\nname = 'Synthetic'\nemail = 'synthetic@example.invalid'\n[rules]\ndefault = 'fixture'\n[[checkers]]\nname = 'money-saver-fixture'\non = ['prepare-commit-msg', 'pre-applypatch']\ntimeout_secs = 0\ncommand = ['/bin/sh', '{}', '{{repo}}']\n",
+        root.join("runs").display(),
+        root.join("checker.sh").display()
+    );
+    std::fs::write(root.join("config.toml"), cfg).unwrap();
+    let hook = root.join("hooks/prepare-commit-msg");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nexec '{}' --config '{}' hook prepare-commit-msg\n",
+            env!("CARGO_BIN_EXE_gitvault"),
+            root.join("config.toml").display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::copy(
+        root.join("hooks/prepare-commit-msg"),
+        root.join("hooks/pre-applypatch"),
+    )
+    .unwrap();
+    let patch_hook = root.join("hooks/pre-applypatch");
+    let text = std::fs::read_to_string(&patch_hook)
+        .unwrap()
+        .replace("hook prepare-commit-msg", "hook pre-applypatch");
+    std::fs::write(patch_hook, text).unwrap();
+    Fixture(root)
+}
+
+#[test]
+fn pull_request_event_runs_registered_checkers() {
+    // `pr` is the publication boundary that is not a git hook: GitVault's own
+    // pull-request operations run the same registry, so a checker registered for
+    // the event is selected and sees GITVAULT_EVENT=pr.
+    let root = std::env::temp_dir().join(format!(
+        "gitvault-pr-test-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _cleanup = Fixture(root.clone());
+    std::fs::create_dir_all(&root).unwrap();
+    checked(&root, &["init", "-q"]);
+    // Neutral hooks: this fixture must not run the machine's real hook chain,
+    // and its own commit must not reach the installed gates.
+    checked(&root, &["config", "core.hooksPath", root.join("no-hooks").to_str().unwrap()]);
+    checked(&root, &["config", "user.name", "Synthetic"]);
+    checked(&root, &["config", "user.email", "synthetic@example.invalid"]);
+    std::fs::write(root.join("one"), "base\n").unwrap();
+    checked(&root, &["add", "."]);
+    checked(&root, &["commit", "-qm", "base"]);
+    let marker = root.join("reviewed");
+    let checker = root.join("checker.sh");
+    std::fs::write(
+        &checker,
+        format!(
+            "#!/bin/sh\nprintf '%s|%s' \"$GITVAULT_EVENT\" \"$GITVAULT_PR_HEAD\" > '{}'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    let cfg = format!(
+        "record_dir = '{}'\n[identities.fixture]\nname = 'Synthetic'\nemail = 'synthetic@example.invalid'\n[rules]\ndefault = 'fixture'\n[[checkers]]\nname = 'publication'\non = ['pr']\ncommand = ['/bin/sh', '{}', '{{repo}}']\n",
+        root.join("runs").display(),
+        checker.display()
+    );
+    std::fs::write(root.join("config.toml"), cfg).unwrap();
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_gitvault"))
+        .args([
+            "--config",
+            root.join("config.toml").to_str().unwrap(),
+            "check",
+            "--event",
+            "pr",
+            "--directory",
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "pr check failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let recorded = std::fs::read_to_string(&marker).unwrap();
+    assert!(recorded.starts_with("pr|"), "checker saw '{recorded}'");
+}
+
+/// A throwaway repository with its own config; `checkers` is the checker block
+/// and `event` the registry events it covers.
+fn publication_fixture(events: &str, blocking: bool) -> Fixture {
+    let root = std::env::temp_dir().join(format!(
+        "gitvault-pub-test-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    checked(&root, &["init", "-q"]);
+    checked(&root, &["config", "core.hooksPath", root.join("no-hooks").to_str().unwrap()]);
+    checked(&root, &["config", "user.name", "Synthetic"]);
+    checked(&root, &["config", "user.email", "synthetic@example.invalid"]);
+    std::fs::write(root.join("one"), "base\n").unwrap();
+    checked(&root, &["add", "."]);
+    checked(&root, &["commit", "-qm", "base"]);
+    checked(&root, &["tag", "v1.0.0"]);
+    let marker = root.join("ran");
+    let checker = root.join("checker.sh");
+    std::fs::write(
+        &checker,
+        format!(
+            "#!/bin/sh\nprintf '%s|%s|%s' \"$GITVAULT_EVENT\" \"$GITVAULT_RELEASE_TAG\" \"$GITVAULT_PR_NUMBER\" > '{}'\nprintf 'receipt: %s\\n' \"$HOME/receipts/run.json\"\n{}",
+            marker.display(),
+            if blocking { "exit 1\n" } else { "exit 0\n" }
+        ),
+    )
+    .unwrap();
+    let cfg = format!(
+        "record_dir = '{}'\n[identities.fixture]\nname = 'Synthetic'\nemail = 'synthetic@example.invalid'\n[rules]\ndefault = 'fixture'\n[[checkers]]\nname = 'publication'\non = [{events}]\ncommand = ['/bin/sh', '{}', '{{repo}}']\n",
+        root.join("runs").display(),
+        checker.display()
+    );
+    std::fs::write(root.join("config.toml"), cfg).unwrap();
+    Fixture(root)
+}
+
+#[test]
+fn release_event_runs_registered_checkers_with_the_tag() {
+    let fixture = publication_fixture("'release'", false);
+    let root = fixture.0.clone();
+    let marker = root.join("ran");
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_gitvault"))
+        .args([
+            "--config", root.join("config.toml").to_str().unwrap(),
+            "check", "--event", "release", "--tag", "v1.0.0", "--directory", root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "release check failed: {}", String::from_utf8_lossy(&result.stderr));
+    let recorded = std::fs::read_to_string(&marker).unwrap();
+    assert!(recorded.starts_with("release|v1.0.0|"), "checker saw '{recorded}'");
+}
+
+#[test]
+fn release_create_is_refused_before_any_credential_is_touched() {
+    // The gate sits ahead of the vault, so this holds with no vault at all --
+    // and the absence of an authentication error proves nothing reached the API.
+    let fixture = publication_fixture("'release'", true);
+    let root = fixture.0.clone();
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_gitvault"))
+        .args([
+            "--config", root.join("config.toml").to_str().unwrap(),
+            "release", "create", "v1.0.0", "--repo", "Owner/Name",
+        ])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "a blocked release must fail");
+    assert!(stderr.contains("refused this release"), "stderr: {stderr}");
+    for credential_error in ["unlock", "authentication", "credential"] {
+        assert!(!stderr.to_lowercase().contains(credential_error),
+                "the gate must run before any credential is touched: {stderr}");
+    }
+}
+
+#[test]
+fn merge_is_refused_before_the_api_call() {
+    let fixture = publication_fixture("'pr'", true);
+    let root = fixture.0.clone();
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_gitvault"))
+        .args([
+            "--config", root.join("config.toml").to_str().unwrap(),
+            "pr", "merge", "7", "--repo", "Owner/Name",
+        ])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "a blocked merge must fail");
+    assert!(stderr.contains("refused this merge"), "stderr: {stderr}");
+    let recorded = std::fs::read_to_string(root.join("ran")).unwrap();
+    assert!(recorded.starts_with("pr||7"), "checker saw '{recorded}'");
+}
+
+#[test]
+fn a_run_is_recorded_without_this_machines_paths() {
+    // The record is what the dashboard page reads, so it must describe the work
+    // and not the machine: a checker that prints a path under HOME gets it
+    // replaced before anything is stored.
+    let fixture = publication_fixture("'pr'", false);
+    let root = fixture.0.clone();
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_gitvault"))
+        .args([
+            "--config", root.join("config.toml").to_str().unwrap(),
+            "check", "--event", "pr", "--directory", root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+
+    let runs: Vec<_> = std::fs::read_dir(root.join("runs")).unwrap().flatten().collect();
+    assert_eq!(runs.len(), 1, "exactly one run was recorded");
+    let record = std::fs::read_to_string(runs[0].path().join("engine.json")).unwrap();
+    for leaked in ["/Users", "/var/folders", "/home/"] {
+        assert!(!record.contains(leaked), "the record describes this machine: {record}");
+    }
+    assert!(record.contains("[LOCAL_PATH]"), "the printed path is marked: {record}");
+    assert!(record.contains("\"event\": \"pr\""), "{record}");
+    assert!(record.contains("\"name\": \"publication\""), "{record}");
+
+    // `records` reads the same store without opening the vault or the network.
+    let listed = std::process::Command::new(env!("CARGO_BIN_EXE_gitvault"))
+        .args([
+            "--config", root.join("config.toml").to_str().unwrap(),
+            "records", "list", "--json",
+        ])
+        .output()
+        .unwrap();
+    let json = String::from_utf8_lossy(&listed.stdout);
+    assert!(listed.status.success(), "{}", String::from_utf8_lossy(&listed.stderr));
+    assert!(json.contains("\"outcomes\""), "{json}");
+    assert!(!json.contains("stdout"), "the list projection leaves the transcript out: {json}");
+}
+
+#[test]
+fn mandatory_hook_blocks_even_no_verify() {
+    let f = fixture("exit 1\n");
+    let before = git(&f.0, &["rev-parse", "HEAD"]).stdout;
+    let result = git(
+        &f.0,
+        &["commit", "--no-verify", "--allow-empty", "-m", "refused"],
+    );
+    assert!(!result.status.success());
+    assert_eq!(git(&f.0, &["rev-parse", "HEAD"]).stdout, before);
+}
+
+#[test]
+fn completion_wait_and_partial_commit_use_actual_index() {
+    let f = fixture("sleep 1.1\ngit -C \"$1\" diff --cached --name-only > \"$1/observed\"\n");
+    std::fs::write(f.0.join("one"), "changed one\n").unwrap();
+    std::fs::write(f.0.join("two"), "changed two\n").unwrap();
+    checked(&f.0, &["add", "two"]);
+    checked(&f.0, &["commit", "--only", "one", "-qm", "partial"]);
+    assert_eq!(
+        std::fs::read_to_string(f.0.join("observed")).unwrap(),
+        "one\n"
+    );
+    assert_eq!(
+        String::from_utf8(git(&f.0, &["diff", "--cached", "--name-only"]).stdout).unwrap(),
+        "two\n"
+    );
+}
+
+#[test]
+fn patch_application_cannot_create_an_unreviewed_commit() {
+    let f = fixture("exit 0\n");
+    std::fs::write(f.0.join("one"), "patch change\n").unwrap();
+    checked(&f.0, &["add", "one"]);
+    checked(&f.0, &["commit", "-qm", "patch source"]);
+    let patch = git(&f.0, &["format-patch", "-1", "--stdout"]).stdout;
+    checked(&f.0, &["reset", "--hard", "HEAD^"]);
+    let before = git(&f.0, &["rev-parse", "HEAD"]).stdout;
+    std::fs::write(f.0.join("change.patch"), patch).unwrap();
+    std::fs::write(f.0.join("checker.sh"), "exit 1\n").unwrap();
+    assert!(!git(&f.0, &["am", "change.patch"]).status.success());
+    assert_eq!(git(&f.0, &["rev-parse", "HEAD"]).stdout, before);
+}

@@ -1,0 +1,6 @@
+name: sustainable-maintainer
+version: "1.0.0"
+description: "Read-only source inspection and a single verdict for long-term maintainability review."
+provides_tools:
+  - maintainer_context
+  - maintainer_submit_review

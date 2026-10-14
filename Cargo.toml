@@ -1,0 +1,24 @@
+[package]
+name = "gitvault"
+version = "0.1.0"
+edition = "2024"
+description = "Git identity interceptor: resolve who may act on a repository, then run registered checkers before the action lands"
+license = "Apache-2.0"
+publish = false
+repository = "https://github.com/Unka-Malloc/gitvault"
+
+[[bin]]
+name = "gitvault"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.23.1"
+chacha20poly1305 = "0.11.0"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+rand = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+toml = "1.1.6"
+wait-timeout = "0.2.1"
+zeroize = "1.9.1"

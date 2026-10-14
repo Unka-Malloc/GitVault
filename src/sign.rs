@@ -1,0 +1,545 @@
+//! Commit-signing proxy.
+//!
+//! Git calls `gpg.ssh.program` as:
+//!
+//! ```text
+//! <program> -Y sign -n git -f <key> <buffer-file>
+//! ```
+//!
+//! The working directory is the repository root, which is how the target
+//! repository is identified here: the SSH agent protocol carries no such context,
+//! but the process environment does.
+//!
+//! The private key is read from the vault and loaded into a throwaway agent, so no
+//! key file needs to exist. `ssh-keygen -Y sign -f <public-key>` signs with the
+//! agent's private key, verified before relying on it.
+
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+
+use anyhow::{Context, Result, bail};
+
+use crate::config::Config;
+use crate::git::Repo;
+use crate::identity;
+use crate::vault::Vault;
+
+/// Parse `-Y sign -n <namespace> -f <key> <buffer>`.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Invocation {
+    pub namespace: String,
+    /// The key path git passed. Reported for diagnosis; the key actually used comes
+    /// from the vault, so a path that does not exist is not a failure.
+    pub key: Option<String>,
+    pub buffer: PathBuf,
+}
+
+/// True when git is asking for a signature rather than a verification.
+///
+/// `-Y sign` is the only request GitVault answers itself; the rest belong to
+/// ssh-keygen. Deciding this by scanning for the subcommand is deliberate: the
+/// alternative is to treat every call as signing, which silently broke verification.
+pub fn is_signing_request(args: &[String]) -> bool {
+    args.iter().any(|a| a == "sign")
+}
+
+/// Hand the request to the real ssh-keygen unchanged.
+fn passthrough(args: &[String]) -> Result<i32> {
+    let status = std::process::Command::new("ssh-keygen")
+        .args(args)
+        .status()
+        .context("failed to run ssh-keygen")?;
+    Ok(status.code().unwrap_or(1))
+}
+
+/// Parse git's arguments.
+///
+/// The shape depends on configuration, which is what made this subtle. Two forms
+/// were observed from the same git version:
+///
+/// ```text
+/// -Y sign -n git -f <key> <buffer>          # simple config
+/// -Y sign -n git -f <key> -U <buffer>       # when git supplies its own key file
+/// ```
+///
+/// The buffer is therefore the **last** positional argument, not the first. An
+/// earlier version took the first positional it saw after `-f` and so signed git's
+/// temporary *key* file instead of the commit. ssh-keygen accepted that happily,
+/// wrote the signature to `<key>.sig`, and left stdout empty, so every commit landed
+/// with no usable signature and verified as bad.
+pub fn parse(args: &[String]) -> Result<Invocation> {
+    let mut namespace = "git".to_string();
+    let mut key = None;
+    let mut positional: Vec<String> = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-Y" => i += 2, // takes a value: "sign"
+            "-n" => {
+                namespace = args.get(i + 1).cloned().unwrap_or(namespace);
+                i += 2;
+            }
+            "-f" => {
+                // Consumed as the key, never as the buffer. This is the argument the
+                // earlier version mistook for the buffer.
+                key = args.get(i + 1).cloned();
+                i += 2;
+            }
+            "-O" => i += 2, // e.g. -Overify-time=...
+            other if other.starts_with('-') => i += 1, // -U and any other bare flag
+            other => {
+                positional.push(other.to_string());
+                i += 1;
+            }
+        }
+    }
+
+    let buffer = positional
+        .pop()
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("no buffer file given; git should pass one to sign"))?;
+    if buffer.as_os_str().is_empty() {
+        anyhow::bail!("the buffer path git passed is empty");
+    }
+
+    Ok(Invocation {
+        namespace,
+        key,
+        buffer,
+    })
+}
+
+pub fn run(cfg: &Config, vault: &Vault, args: &[String], cwd: &PathBuf) -> Result<i32> {
+    // git runs `gpg.ssh.program` for verification too, not only for signing. Observed
+    // calls, all with the same configured program:
+    //
+    //   -Y sign            -n git -f <key> <buffer>      produce a signature
+    //   -Y find-principals -f <signers> -s <sig>        who signed this
+    //   -Y check-novalidate -n git -s <sig>             is the signature well formed
+    //   -Y verify          -n git -f <signers> -I <p> -s <sig>
+    //
+    // Those three verification subcommands must reach the real ssh-keygen. Handling
+    // them here as if they were signing requests meant git never got an answer, and
+    // every commit verified as bad no matter how valid the signature was. Only
+    // signing is ours to intercept; anything else is passed straight through.
+    if !is_signing_request(args) {
+        return passthrough(args);
+    }
+
+    let inv = parse(args)?;
+
+    // The repository identifies which identity may sign. Without it there is no
+    // policy to apply, and signing anyway would be signing as whoever happens to be
+    // configured.
+    let repo = Repo::discover(cwd)?;
+    let outcome = identity::resolve(cfg, &repo, false)?;
+    let account = outcome
+        .account
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("identity '{}' has no account", outcome.identity))?;
+
+    if outcome.reason.starts_with("rules.default") {
+        bail!(
+            "refusing to sign: no explicit rule for owner '{:?}'\n  resolved account: {account}",
+            repo.owner().unwrap_or_default()
+        );
+    }
+
+    // No unlock gate here, and that is a decision rather than an omission.
+    //
+    // The gate exists to bound how long a credential stays usable after a human
+    // confirms. That makes sense where something leaves the machine: an API call sends
+    // data, a push publishes a record that cannot be unpublished. A commit does
+    // neither. It is local, and it is reversible - amend, rebase, reset and discard all
+    // work on it without the vault. The moment a commit becomes permanent is the push,
+    // and the push is gated.
+    //
+    // Signing is also not what decides the identity. The owner rules above decide it,
+    // and the signer only attaches evidence of that decision. Gating evidence, while
+    // the thing it is evidence of has already been decided and carries no gate, buys
+    // nothing and costs a prompt on every commit.
+    //
+    // What this does not change: the signing key still never leaves this process, and
+    // an egress operation still needs a window. Reading the key for a local signature
+    // is not egress.
+    let key = vault.signing_key_for(&account)?;
+    let passphrase = vault.passphrase_for(&account);
+
+    let (sock, agent_pid) = start_agent()?;
+    if let Err(e) = load_key(&sock, &key, passphrase.as_deref()) {
+        let _ = kill_agent(agent_pid.as_deref());
+        return Err(e);
+    }
+
+    // Signing itself uses the agent; `-f` only needs a public key, which holds no
+    // secret. The private key's temporary file lives inside this guard and is
+    // removed even if any step below fails.
+    let pub_text = public_key_from_agent(&sock, &crate::vault::Store::fingerprint(&key))?;
+    let pub_file = TempSecret::write(&pub_text)?;
+
+    // Measured invocation behaviour:
+    //
+    //   sign <pub> <buffer>        -> writes <buffer>.sig
+    //   sign <pub> -  < buffer     -> writes the signature to stdout
+    //   sign <pub> <buffer> -      -> "Cannot sign mix of paths and standard input"
+    //
+    // Git passes a buffer path and consumes "<buffer>.sig", so the sidecar is what
+    // has to survive. Passing "-" alongside the path is rejected outright.
+    let sig_path = {
+        let mut p = inv.buffer.clone().into_os_string();
+        p.push(".sig");
+        PathBuf::from(p)
+    };
+    // A stale sidecar from an interrupted run would otherwise be read back as if it
+    // were this signature.
+    let _ = std::fs::remove_file(&sig_path);
+
+    let status = Command::new("ssh-keygen")
+        .arg("-Y")
+        .arg("sign")
+        .arg("-n")
+        .arg(&inv.namespace)
+        .arg("-f")
+        .arg(pub_file.path())
+        .arg(&inv.buffer)
+        // No trailing "-". ssh-keygen rejects it alongside a buffer path
+        // ("Cannot sign mix of paths and standard input"), and it is not wanted
+        // anyway: with a path argument ssh-keygen writes "<buffer>.sig", which is
+        // exactly where git reads the signature from. Confirmed by spying on git's
+        // own invocation of ssh-keygen: it passes -f <pub> <buffer> and reads
+        // "<buffer>.sig" afterwards.
+        .env("SSH_AUTH_SOCK", &sock)
+        .env_remove("SSH_AGENT_PID")
+        // stdout is deliberately NOT redirected. Doing so was the actual cause of
+        // every commit verifying as bad, isolated by minimal reproduction:
+        //
+        //   program -> ssh-keygen, stdout redirected   %G? = B
+        //   program -> ssh-keygen, stdout left alone   %G? = G
+        //
+        // ssh-keygen writes the signature to stdout and git consumes it there. The
+        // redirect was added only to silence the "Signing file ..." progress line,
+        // and it silently discarded the signature along with it.
+        .status()
+        .context("failed to run ssh-keygen")?;
+
+    // ssh-keygen wrote the signature to stdout, which is where git reads it. The
+    // only remaining work is to stop the temporary agent.
+    let _ = kill_agent(agent_pid.as_deref());
+    Ok(status.code().unwrap_or(1))
+}
+
+/// A file that deletes itself, on success or on any early return.
+///
+/// A private key has to touch the filesystem for `ssh-keygen` to read it: the
+/// `-f /dev/stdin` route fails its permission check (the pipe is 0660 and cannot be
+/// tightened), and without `-f` the tool prompts on the terminal. Since a file is
+/// unavoidable, the exposure is bounded to the signer's lifetime and the deletion
+/// is guaranteed by Drop rather than by an explicit call that an error path could
+/// skip.
+struct TempSecret {
+    path: PathBuf,
+}
+
+impl TempSecret {
+    fn write(contents: &str) -> Result<Self> {
+        let path = std::env::temp_dir().join(format!(
+            "gitvault-sign-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, contents)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempSecret {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Derive a public key from private key material, via a self-deleting temp file.
+///
+/// `ssh-keygen -y` needs a readable path; the stdin routes do not work. See
+/// `TempSecret`.
+pub fn public_key_of_material(private: &str, passphrase: Option<&str>) -> Result<String> {
+    let secret = TempSecret::write(private)?;
+    // `ssh-keygen -y` needs the passphrase for an encrypted key and has no agent to
+    // ask, so it is supplied through SSH_ASKPASS. Without this it prompts on a
+    // terminal it does not have and the derivation fails.
+    let askpass = match passphrase {
+        Some(p) => Some(crate::ssh::askpass_script(p)?),
+        None => None,
+    };
+    let mut cmd = Command::new("ssh-keygen");
+    cmd.arg("-y").arg("-f").arg(secret.path());
+    if let Some(path) = &askpass {
+        cmd.env("SSH_ASKPASS", path)
+            .env("SSH_ASKPASS_REQUIRE", "force")
+            .env("DISPLAY", ":0");
+    }
+    let out = cmd.output().context("failed to run ssh-keygen -y")?;
+    if let Some(path) = &askpass {
+        let _ = std::fs::remove_file(path);
+    }
+    if !out.status.success() {
+        bail!(
+            "could not derive the public key: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let body = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if body.is_empty() {
+        bail!("ssh-keygen produced an empty public key");
+    }
+    Ok(body)
+}
+
+/// Read the loaded key's public half back out of the agent.
+///
+/// Deriving it with `ssh-keygen -y` instead would fail for an encrypted key: that
+/// command needs the passphrase and has no way to ask the agent. Reading it from
+/// the agent avoids decrypting anything a second time.
+fn public_key_from_agent(sock: &str, expected_fingerprint: &str) -> Result<String> {
+    let out = Command::new("ssh-add")
+        .arg("-L")
+        .env("SSH_AUTH_SOCK", sock)
+        .output()
+        .context("failed to run ssh-add -L")?;
+    if !out.status.success() {
+        bail!(
+            "could not list agent keys: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let key = text
+        .lines()
+        .find(|l| l.starts_with("ssh-ed25519 ") || l.starts_with("ssh-rsa "))
+        .map(str::to_string)
+        .ok_or_else(|| {
+            anyhow::anyhow!("the temporary agent holds no usable key (wanted {expected_fingerprint})")
+        })?;
+    Ok(format!("{key}\n"))
+}
+
+fn start_agent() -> Result<(String, Option<String>)> {
+    let agent = Command::new("ssh-agent")
+        .arg("-s")
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("failed to start a temporary ssh-agent")?;
+    let out = agent.wait_with_output()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let sock = crate::ssh::extract_agent_var(&text, "SSH_AUTH_SOCK")
+        .ok_or_else(|| anyhow::anyhow!("ssh-agent did not report SSH_AUTH_SOCK"))?;
+    let pid = crate::ssh::extract_agent_var(&text, "SSH_AGENT_PID");
+    Ok((sock, pid))
+}
+
+fn load_key(sock: &str, key: &str, passphrase: Option<&str>) -> Result<()> {
+    let askpass = match passphrase {
+        Some(p) => Some(crate::ssh::askpass_script(p)?),
+        None => None,
+    };
+    let mut cmd = Command::new("ssh-add");
+    cmd.arg("-")
+        .env("SSH_AUTH_SOCK", sock)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    if let Some(path) = &askpass {
+        cmd.env("SSH_ASKPASS", path)
+            .env("SSH_ASKPASS_REQUIRE", "force")
+            .env("DISPLAY", ":0");
+    } else {
+        // Without askpass, ssh-add prompts on the terminal, and anything arriving on
+        // stdin is consumed as the answer - including the key material piped in
+        // below. Measured: "Error loading key (stdin): invalid format". An
+        // unencrypted key must never be fed to a prompting ssh-add.
+        bail!(
+            "no passphrase is held for this key, so ssh-add would prompt and consume \
+             the piped key as the answer\n  \
+             re-import with the passphrase: gitvault auth import-key <account> <file>"
+        );
+    }
+    let mut child = cmd.spawn().context("failed to run ssh-add")?;
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no stdin"))?;
+        stdin.write_all(key.as_bytes())?;
+    }
+    let out = child.wait_with_output()?;
+    if let Some(path) = &askpass {
+        let _ = std::fs::remove_file(path);
+    }
+    if !out.status.success() {
+        bail!(
+            "could not load the signing key: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn kill_agent(pid: Option<&str>) -> Result<()> {
+    if let Some(pid) = pid {
+        let _ = Command::new("kill").arg(pid).status();
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn a(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parses_the_shape_git_uses() {
+        let inv = parse(&a(&[
+            "-Y",
+            "sign",
+            "-n",
+            "git",
+            "-f",
+            "/tmp/key.pub",
+            "/tmp/.git_signing_buffer_abc",
+        ]))
+        .unwrap();
+        assert_eq!(inv.namespace, "git");
+        assert_eq!(inv.key.as_deref(), Some("/tmp/key.pub"));
+        assert_eq!(inv.buffer, PathBuf::from("/tmp/.git_signing_buffer_abc"));
+    }
+
+    #[test]
+    fn verification_requests_are_not_treated_as_signing() {
+        // Regression: git invokes gpg.ssh.program for -Y find-principals,
+        // -Y check-novalidate and -Y verify as well. Answering those as signing
+        // requests left git without a verification result, and every commit reported
+        // %G? = B even though the signature was valid byte for byte.
+        for a in [
+            vec!["-Y", "find-principals", "-f", "signers", "-s", "sig"],
+            vec!["-Y", "check-novalidate", "-n", "git", "-s", "sig"],
+            vec!["-Y", "verify", "-n", "git", "-f", "signers", "-I", "p", "-s", "sig"],
+        ] {
+            let args: Vec<String> = a.iter().map(|s| s.to_string()).collect();
+            assert!(
+                !is_signing_request(&args),
+                "{:?} must be passed through to ssh-keygen",
+                a
+            );
+        }
+        let signing: Vec<String> = ["-Y", "sign", "-n", "git", "-f", "k", "buf"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(is_signing_request(&signing));
+    }
+
+    #[test]
+    fn parses_the_form_with_a_git_supplied_key_and_dash_u() {
+        // Regression: this is the shape git actually used, and the earlier parser
+        // took the -f value as the buffer, so it signed the key file instead of the
+        // commit. ssh-keygen accepted it and wrote to <key>.sig, leaving stdout
+        // empty and every commit unverifiable.
+        let inv = parse(&a(&[
+            "-Y",
+            "sign",
+            "-n",
+            "git",
+            "-f",
+            "/tmp/.git_signing_key_tmpABC",
+            "-U",
+            "/tmp/.git_signing_buffer_tmpXYZ",
+        ]))
+        .unwrap();
+        assert_eq!(inv.namespace, "git");
+        assert_eq!(inv.key.as_deref(), Some("/tmp/.git_signing_key_tmpABC"));
+        assert_eq!(
+            inv.buffer,
+            PathBuf::from("/tmp/.git_signing_buffer_tmpXYZ"),
+            "the buffer is the last positional, not the value of -f"
+        );
+    }
+
+    #[test]
+    fn parses_the_form_without_dash_u() {
+        let inv = parse(&a(&[
+            "-Y",
+            "sign",
+            "-n",
+            "git",
+            "-f",
+            "/tmp/key.pub",
+            "/tmp/buffer",
+        ]))
+        .unwrap();
+        assert_eq!(inv.key.as_deref(), Some("/tmp/key.pub"));
+        assert_eq!(inv.buffer, PathBuf::from("/tmp/buffer"));
+    }
+
+    #[test]
+    fn defaults_the_namespace_when_absent() {
+        let inv = parse(&a(&["-Y", "sign", "/tmp/buffer"])).unwrap();
+        assert_eq!(inv.namespace, "git");
+        assert_eq!(inv.buffer, PathBuf::from("/tmp/buffer"));
+    }
+
+    #[test]
+    fn the_signer_invocation_is_correct() {
+        // Regression guard for the defect that made every commit verify as bad.
+        //
+        // ssh-keygen writes the signature to stdout and git reads it there, so
+        // redirecting stdout discards the signature. Isolated by minimal
+        // reproduction: the same setup gives %G? = B with the redirect and G without
+        // it, with no GitVault code involved either way.
+        //
+        // The other two constraints were measured directly:
+        //   sign <pub> <buffer> -    -> "Cannot sign mix of paths and standard input"
+        //   ssh-add -                -> correct, reads the key from stdin
+        let code: String = include_str!("sign.rs")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Just the signer's argument list, from its -n flag to the next .context().
+        let signer = code
+            .split(r#".arg(&inv.namespace)"#)
+            .nth(1)
+            .and_then(|rest| rest.split(".context(").next())
+            .unwrap_or_else(|| panic!("could not locate the signer invocation"));
+
+        assert!(
+            !signer.contains(".stdout(Stdio::null())"),
+            "stdout must not be redirected on the signer: the signature goes there"
+        );
+        assert!(
+            !signer.contains(r#".arg("-")"#),
+            "passing \"-\" alongside a buffer path makes ssh-keygen refuse to sign"
+        );
+    }
+
+    #[test]
+    fn a_missing_buffer_is_an_error() {
+        // Signing without knowing what to sign must not fall through to signing
+        // something else.
+        assert!(parse(&a(&["-Y", "sign", "-n", "git"])).is_err());
+    }
+}
