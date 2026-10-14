@@ -600,7 +600,6 @@ fn context_for(
     cfg: &config::Config,
     event: &str,
     directory: &PathBuf,
-    args: Vec<String>,
     release_tag: Option<String>,
 ) -> anyhow::Result<checkers::Context> {
     let repo = git::Repo::discover(directory)?;
@@ -634,11 +633,9 @@ fn context_for(
         repo_slug: repo.slug(),
         identity: outcome.identity.clone(),
         account: outcome.account.clone(),
-        reason: outcome.reason.clone(),
         via_default: outcome.via_default,
         expected_email: outcome.expected_email.clone(),
         actual_email: outcome.actual_email.clone(),
-        args,
         stdin,
         pr_base: None,
         pr_head: None,
@@ -651,12 +648,12 @@ fn context_for(
 fn cmd_hook(
     config: Option<&PathBuf>,
     event: &str,
-    args: &[String],
+    _args: &[String],
 ) -> anyhow::Result<ExitCode> {
     let cfg = config::Config::load(config)?;
     // git runs hooks with cwd set to the top level of the working tree, so "."
     // resolves correctly and no directory argument is needed from the hook shim.
-    let ctx = context_for(&cfg, event, &PathBuf::from("."), args.to_vec(), None)?;
+    let ctx = context_for(&cfg, event, &PathBuf::from("."), None)?;
     let report = checkers::run_all(&cfg, &ctx, None)?;
     report.print(event);
     Ok(report.exit_code())
@@ -735,7 +732,7 @@ fn cmd_check(
     tag: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     let cfg = config::Config::load(config)?;
-    let ctx = context_for(&cfg, event, directory, Vec::new(), tag.map(str::to_string))?;
+    let ctx = context_for(&cfg, event, directory, tag.map(str::to_string))?;
     let report = checkers::run_all(&cfg, &ctx, only)?;
     report.print(event);
     Ok(report.exit_code())
@@ -952,7 +949,7 @@ fn cmd_pr(
             // paid for twice; content that reached the remote from elsewhere is
             // reviewed here before the request proposes it. The checker resolves
             // base/head in the local repository, the only place the content exists.
-            let mut ctx = context_for(&cfg, "pr", &PathBuf::from("."), Vec::new(), None).map_err(|_| {
+            let mut ctx = context_for(&cfg, "pr", &PathBuf::from("."), None).map_err(|_| {
                 anyhow::anyhow!(
                     "reviewing a pull request needs a checkout of the repository; \
                      push the branch through GitVault, or run this from its working tree"
@@ -1003,7 +1000,7 @@ fn cmd_pr(
             // permanent record as creating. The head may not be checked out
             // here, so the checker is told the request number and fetches the
             // head itself; nothing reaches GitHub until it passes.
-            let mut ctx = context_for(&cfg, "pr", &PathBuf::from("."), Vec::new(), None).map_err(|_| {
+            let mut ctx = context_for(&cfg, "pr", &PathBuf::from("."), None).map_err(|_| {
                 anyhow::anyhow!(
                     "reviewing a merge request needs a checkout of the repository; \
                      run this from its working tree"
@@ -1223,7 +1220,7 @@ fn cmd_release(
     // does not depend on the vault, and a refusal must be possible even where
     // the vault is locked. Nothing reaches GitHub until the registry passes.
     if let ReleaseCommand::Create { tag, .. } = &command {
-        let ctx = context_for(&cfg, "release", &PathBuf::from("."), Vec::new(), Some(tag.clone()))
+        let ctx = context_for(&cfg, "release", &PathBuf::from("."), Some(tag.clone()))
             .map_err(|_| {
                 anyhow::anyhow!(
                     "reviewing a release needs a checkout with the tagged commit; \

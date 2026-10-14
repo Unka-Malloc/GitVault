@@ -82,27 +82,37 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// The biometric helper's fixed location.
+fn default_helper() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    Path::new(&home)
+        .join(".local")
+        .join("bin")
+        .join("gitvault-touchid")
+}
+
 /// Ask macOS for a biometric confirmation.
 ///
 /// Returns Ok only on an explicit success. A missing helper, an unavailable sensor
 /// and a cancelled prompt are all failures: none of them may be mistaken for
 /// approval.
 pub fn require_biometric(reason: &str) -> Result<()> {
-    let helper = std::env::var("GITVAULT_TOUCHID")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            Path::new(&home)
-                .join(".local")
-                .join("bin")
-                .join("gitvault-touchid")
-        });
+    // The helper path is a fixed location in release builds: a helper path a
+    // caller could rewrite is a confirmation the caller can self-answer, which
+    // would reduce "a human was present" to a timer. GITVAULT_TOUCHID remains a
+    // test hook in debug builds only.
+    let helper = if cfg!(debug_assertions) {
+        std::env::var("GITVAULT_TOUCHID")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| default_helper())
+    } else {
+        default_helper()
+    };
 
     if !helper.exists() {
         bail!(
             "biometric helper not found at {}\n  \
-             install it so the unlock gate can confirm a human is present\n  \
-             (set GITVAULT_TOUCHID to use a different path)",
+             install it so the unlock gate can confirm a human is present",
             helper.display()
         );
     }

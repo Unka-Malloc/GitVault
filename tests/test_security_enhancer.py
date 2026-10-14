@@ -81,6 +81,25 @@ class SecurityEnhancerTests(unittest.TestCase):
 
     # -- range resolution ---------------------------------------------------
 
+    def test_a_receipt_from_an_earlier_contract_is_not_reused(self):
+        # The judged items are part of the reuse key: a pass under a receipt
+        # with no recorded items cannot answer for a review that never ran.
+        runs = self.profile / "security-enhancer-runs" / "old"
+        runs.mkdir(parents=True)
+        runtime = se.declared_runtime(self.settings)
+        receipt = self.report() | {"gate_status": "passed", "provider": runtime["provider"],
+                                   "model": runtime["model"], "reasoning": runtime["effort"],
+                                   "review_base": self.base, "review_head": self.head}
+        se.write_json(runs / "report.json", receipt)
+        self.assertFalse(se.audited(self.settings, self.base, self.head, runtime),
+                         "a receipt with no recorded items predates the contract and cannot answer for it")
+        se.write_json(runs / "report.json",
+                      receipt | {"review_items": [d for d in se.DOMAINS if d != "secret_handling"]})
+        self.assertFalse(se.audited(self.settings, self.base, self.head, runtime),
+                         "a receipt that never judged every item cannot stand in for a review of it")
+        se.write_json(runs / "report.json", receipt | {"review_items": list(se.DOMAINS)})
+        self.assertTrue(se.audited(self.settings, self.base, self.head, runtime))
+
     def test_release_range_is_the_previous_release_to_this_one(self):
         # A release commit is normally already on the default branch, so a
         # merge-base against it would describe an empty range. The content a
@@ -315,12 +334,17 @@ class SecurityEnhancerTests(unittest.TestCase):
             proc.wait(15)
 
     def test_credential_containers_are_unreadable(self):
-        for path in (".env", ".env.example", ".dev.vars", "secrets/x.json", "credentials.json",
-                     "id_rsa.pem", "store.db", "notes.sqlite", ".ssh/config", ".npmrc",
-                     "../outside", "/etc/passwd"):
+        for path in (".env", ".env.local", ".env.production", ".dev.vars", ".dev.vars.production",
+                     "secrets/x.json", "credentials.json", "id_rsa.pem", "store.db", "notes.sqlite",
+                     ".ssh/config", ".npmrc", "../outside", "/etc/passwd"):
             with self.assertRaises(ValueError):
                 se.safe_path(path)
         self.assertEqual(se.safe_path(".github/workflows/deploy.yml"), ".github/workflows/deploy.yml")
+
+    def test_env_templates_stay_reviewable(self):
+        for path in (".env.example", ".env.sample", ".env.template", ".env.dist",
+                     ".dev.vars.example", "config/.env.example"):
+            self.assertEqual(se.safe_path(path), path)
 
     def test_submit_requires_seven_domain_coverage(self):
         run_dir = self.root / "submit"

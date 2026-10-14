@@ -26,6 +26,27 @@ use crate::vault::Vault;
 
 pub const API_ROOT: &str = "https://api.github.com";
 
+/// Resolve a request path to the URL the token will be sent to.
+///
+/// A relative path always lands under API_ROOT. An absolute URL is accepted
+/// only when its origin is API_ROOT exactly - `https://api.github.com/...` -
+/// because the account token rides in the Authorization header of whatever
+/// this returns. Any other absolute URL is refused before a credential is
+/// read: passing one through would hand the token to a host the caller picked.
+pub fn request_url(path: &str) -> Result<String> {
+    if let Some(rest) = path.strip_prefix(API_ROOT) {
+        if rest.is_empty() || rest.starts_with('/') {
+            return Ok(path.to_string());
+        }
+        // api.github.com.evil.example and similar prefix look-alikes.
+        bail!("refusing an absolute URL outside the API origin: {path}");
+    }
+    if path.contains("://") {
+        bail!("refusing an absolute URL outside the API origin: {path}");
+    }
+    Ok(format!("{API_ROOT}/{}", path.trim_start_matches('/')))
+}
+
 /// Where the operation is aimed. A repository context is what makes policy
 /// possible; without one there is no owner to check and issuance is refused
 /// unless an identity is named explicitly.
@@ -33,24 +54,6 @@ pub const API_ROOT: &str = "https://api.github.com";
 pub enum Target {
     Repo(String),
     Identity(String),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Access {
-    Read,
-    Write,
-}
-
-/// Classify an HTTP method.
-///
-/// Retained for reporting and for future risk-based policy. It deliberately does
-/// NOT soften the unlock requirement: reads of private repositories are not
-/// harmless, so both classes need an open window.
-pub fn access_for_method(method: &str) -> Access {
-    match method.to_ascii_uppercase().as_str() {
-        "GET" | "HEAD" | "OPTIONS" => Access::Read,
-        _ => Access::Write,
-    }
 }
 
 pub struct Request {
@@ -71,7 +74,7 @@ pub struct Request {
 /// allowlist and the explicit-rule requirement say who *may*. A read of a public
 /// resource still goes through this, because the account used is part of the
 /// permanent record either way.
-fn authorize(cfg: &Config, target: &Target, access: Access, vault: &Vault) -> Result<String> {
+fn authorize(cfg: &Config, target: &Target, vault: &Vault) -> Result<String> {
     let (account, token) = match target {
         Target::Repo(slug) => {
             let repo = Repo::for_slug(slug);
@@ -104,7 +107,6 @@ fn authorize(cfg: &Config, target: &Target, access: Access, vault: &Vault) -> Re
             // The window is asked for here, at the moment credentials are used -
             // never before. Checkers run first and cost the time they cost; a
             // window opened before them would expire during the audit.
-            let _ = access;
             unlock::ensure_open(
                 vault,
                 &format!("GitVault: confirm to authenticate {account} to the GitHub API"),
@@ -137,25 +139,22 @@ fn authorize(cfg: &Config, target: &Target, access: Access, vault: &Vault) -> Re
         }
     };
 
-    let _ = access;
     Ok(format!("{account}\u{0}{token}"))
 }
 
 /// Authorize, send the request and return the HTTP status and response body.
 /// Output policy (printing, jq, error reporting) is the caller's choice.
 fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, String)> {
-    let access = access_for_method(&req.method);
-    let resolved = authorize(cfg, &req.target, access, vault)?;
+    // The request path is validated before any credential is touched: an
+    // absolute URL under a different origin would carry the account token to a
+    // host the caller chose. Relative paths always resolve under API_ROOT.
+    let mut url = request_url(&req.path)?;
+
+    let resolved = authorize(cfg, &req.target, vault)?;
     let (account, token) = resolved
         .split_once('\u{0}')
         .ok_or_else(|| anyhow::anyhow!("internal: malformed authorization"))?;
     let _ = account;
-
-    let mut url = if req.path.starts_with("http") {
-        req.path.clone()
-    } else {
-        format!("{API_ROOT}/{}", req.path.trim_start_matches('/'))
-    };
 
     let mut args: Vec<String> = vec![
         "-sS".into(),
@@ -448,14 +447,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn read_and_write_are_classified_correctly() {
-        assert_eq!(access_for_method("GET"), Access::Read);
-        assert_eq!(access_for_method("get"), Access::Read);
-        assert_eq!(access_for_method("HEAD"), Access::Read);
-        assert_eq!(access_for_method("POST"), Access::Write);
-        assert_eq!(access_for_method("PATCH"), Access::Write);
-        assert_eq!(access_for_method("DELETE"), Access::Write);
-        assert_eq!(access_for_method("PUT"), Access::Write);
+    fn request_url_keeps_the_token_on_the_api_origin() {
+        assert_eq!(request_url("user").unwrap(), "https://api.github.com/user");
+        assert_eq!(request_url("/repos/a/b").unwrap(), "https://api.github.com/repos/a/b");
+        assert_eq!(
+            request_url("https://api.github.com/user").unwrap(),
+            "https://api.github.com/user"
+        );
+        for hostile in [
+            "https://evil.example/user",
+            "http://api.github.com/user",
+            "https://api.github.com.evil.example/user",
+            "https://api.github.com@evil.example/",
+        ] {
+            assert!(request_url(hostile).is_err(), "must refuse {hostile}");
+        }
     }
 
     #[test]

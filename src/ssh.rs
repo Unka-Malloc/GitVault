@@ -149,7 +149,7 @@ pub fn run(cfg: &Config, vault: &Vault, args: &[String]) -> Result<i32> {
     let passphrase = vault.passphrase_for(&account);
 
     // A throwaway agent holds the key in memory. Nothing is written to disk.
-    let mut agent = Command::new("ssh-agent")
+    let agent = Command::new("ssh-agent")
         .arg("-s")
         .stdout(Stdio::piped())
         .spawn()

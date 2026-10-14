@@ -136,11 +136,6 @@ pub fn cmd_remove(
                 .join(", ")
         );
     }
-    if matches!(what, RemoveWhat::Keys) && entry.token.is_some() && !matches!(what, RemoveWhat::All) {
-        // Removing keys while a token remains is fine and expected; say so rather
-        // than surprising the caller.
-    }
-
     let mut removed = Vec::new();
     if let Some(e) = store.accounts.get_mut(account) {
         if remove_token && e.token.take().is_some() {

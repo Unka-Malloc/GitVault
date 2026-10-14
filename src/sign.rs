@@ -10,9 +10,14 @@
 //! repository is identified here: the SSH agent protocol carries no such context,
 //! but the process environment does.
 //!
-//! The private key is read from the vault and loaded into a throwaway agent, so no
-//! key file needs to exist. `ssh-keygen -Y sign -f <public-key>` signs with the
-//! agent's private key, verified before relying on it.
+//! The private key is read from the vault and loaded into a throwaway agent, so
+//! the signing path writes no key file. `ssh-keygen -Y sign -f <public-key>`
+//! signs with the agent's private key, verified before relying on it.
+//!
+//! One exception: `public_key_of_material` (used when only the public half is
+//! needed and no agent exists yet) writes the private key to a 0700/0600
+//! temporary file for `ssh-keygen -y`, and that file is removed when its guard
+//! drops. Signing a commit never takes that path.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -173,7 +178,7 @@ pub fn run(cfg: &Config, vault: &Vault, args: &[String], cwd: &PathBuf) -> Resul
     }
 
     // Signing itself uses the agent; `-f` only needs a public key, which holds no
-    // secret. The private key's temporary file lives inside this guard and is
+    // secret. The public key's temporary file lives inside this guard and is
     // removed even if any step below fails.
     let pub_text = public_key_from_agent(&sock, &crate::vault::Store::fingerprint(&key))?;
     let pub_file = TempSecret::write(&pub_text)?;

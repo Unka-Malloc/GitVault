@@ -42,7 +42,7 @@ window is a permission, not a possession:
   is decrypted inside the gitvault process and piped to `curl` on an anonymous
   stdin pipe as the `Authorization` header. It appears in no argv, no
   environment variable, no file. The caller receives the API response only.
-- **SSH** (`gitvault ssh`, invoked by git over `GIT_SSH_COMMAND`): the private
+- **SSH** (`gitvault ssh`, invoked by git via `core.sshCommand`): the private
   key is decrypted inside gitvault and fed to a throwaway `ssh-agent` on a
   private socket; the real `ssh` sees only `SSH_AUTH_SOCK`. The passphrase is
   handed to `ssh-add` through an `SSH_ASKPASS` script deleted after use — never
@@ -75,9 +75,15 @@ from the work tree, no user site-packages, no environment `PYTHONPATH`.
 
 `git push --no-verify` bypasses the git `pre-push` hook — git offers no counter
 to it, so the push hook alone is a convenience. The boundaries that cannot be
-bypassed are the ones GitVault controls: `pr`, `release`, `api`, `repo`,
-`issue` and `ssh` all run the registry before any credential is unlocked and
-refuse without contacting GitHub.
+bypassed are the ones GitVault controls: `pr create`, `pr merge` and
+`release create` run the checker registry before any credential is unlocked
+and refuse without contacting GitHub.
+
+The remaining commands — `api`, `repo`, `issue` and `ssh` — are gated by
+identity routing and the unlock window only; they do **not** run registered
+checkers. A direct `gitvault api` write therefore reaches GitHub after the
+identity and unlock gates, not after an audit. Treat them as credential-broker
+operations, not audited publication paths.
 
 ## Run records
 

@@ -230,11 +230,17 @@ class SustainableMaintainerTests(unittest.TestCase):
             proc.wait(15)
 
     def test_credential_containers_are_unreadable(self):
-        for path in (".env", ".env.example", ".dev.vars", "secrets/x.json", "credentials.json",
-                     "id_rsa.pem", "store.db", "notes.sqlite", ".ssh/config", "../outside", "/etc/passwd"):
+        for path in (".env", ".env.local", ".env.production", ".dev.vars", ".dev.vars.production",
+                     "secrets/x.json", "credentials.json", "id_rsa.pem", "store.db", "notes.sqlite",
+                     ".ssh/config", "../outside", "/etc/passwd"):
             with self.assertRaises(ValueError):
                 sm.safe_path(path)
         self.assertEqual(sm.safe_path("src/app.js"), "src/app.js")
+
+    def test_env_templates_stay_reviewable(self):
+        for path in (".env.example", ".env.sample", ".env.template", ".env.dist",
+                     ".dev.vars.example", "config/.env.example"):
+            self.assertEqual(sm.safe_path(path), path)
 
     def test_submit_requires_every_domain(self):
         run_dir = self.root / "run2"

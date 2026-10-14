@@ -34,7 +34,9 @@ import time
 # not collide on a top-level module name like `stage1`.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "agent-profiles"))
-from security_ranges import ranges as review_ranges  # noqa: E402
+# The push/PR/release range contract is shared by every checker: one
+# module, copied into each payload by install.py.
+from review_ranges import ranges as review_ranges  # noqa: E402
 import security_stage1 as stage1  # noqa: E402
 # profile_sync is imported lazily in main(): --serve-tools never touches it,
 # so the bridge works even where the library is not beside the plugin.
@@ -52,6 +54,9 @@ SENSITIVE_PARTS = {".git", ".ssh", ".aws", ".env", "secrets", "credentials", "lo
 SENSITIVE_SUFFIXES = {".pem", ".key", ".p12", ".pfx", ".db", ".sqlite", ".sqlite3",
                       ".log", ".jsonl", ".enc", ".tfstate", ".kdbx"}
 SENSITIVE_PREFIXES = (".env", ".dev.vars")
+# Templates are reviewable: an example file is exactly where a reviewer
+# must look for a real value someone forgot to placeholder.
+TEMPLATE_NAMES = {".env.example", ".env.sample", ".env.template", ".env.dist", ".dev.vars.example"}
 
 
 def sanitize(text):
@@ -80,7 +85,8 @@ def safe_path(path):
     p = PurePosixPath(path)
     lowering = [x.lower() for x in p.parts]
     if (not path or p.is_absolute() or ".." in p.parts
-            or any(x in SENSITIVE_PARTS or x.startswith(SENSITIVE_PREFIXES) for x in lowering)
+            or any(x in SENSITIVE_PARTS or (x not in TEMPLATE_NAMES and x.startswith(SENSITIVE_PREFIXES))
+                for x in lowering)
             or p.suffix.lower() in SENSITIVE_SUFFIXES):
         raise ValueError("Sensitive or invalid path; contents are unavailable to the reviewer")
     return path
@@ -239,13 +245,18 @@ class Review:
 
 def audited(settings, base, head, runtime):
     """A previous passing review of exactly this range: the static stage still
-    runs every time, but the semantic stage is not paid for twice."""
+    runs every time, but the semantic stage is not paid for twice.
+
+    The judged items are part of the key. A receipt written under an earlier
+    contract did not answer the questions this run asks, so reusing it would
+    let a new coverage item go unanswered while the range reports as passed."""
     for report_path in sorted((Path(settings["profile"]) / "security-enhancer-runs").glob("*/report.json")):
         try:
             report = json.loads(report_path.read_text())
         except ValueError:
             continue
         if (report.get("review_base") == base and report.get("review_head") == head
+                and report.get("review_items") == list(DOMAINS)
                 and report.get("gate_status") == "passed"
                 and report.get("provider") == runtime["provider"] and report.get("model") == runtime["model"]
                 and report.get("reasoning") == runtime["effort"]):
@@ -392,6 +403,7 @@ def review_range(repo, settings, target, summary, stage_summaries, runtime, spaw
         report["review_base"] = base
         report["review_head"] = head
         report["review_kind"] = target["kind"]
+        report["review_items"] = list(DOMAINS)
         report["stage1"] = {"ranges": stage_summaries}
         if target["fallback"]:
             report["fallback"] = target["fallback"]

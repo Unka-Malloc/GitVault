@@ -163,10 +163,6 @@ impl Store {
             .signing_key = Some(key.to_string());
     }
 
-    pub fn remove(&mut self, account: &str) -> bool {
-        self.accounts.remove(account).is_some()
-    }
-
     /// Drop an entry once nothing is held for it, so a listing does not show an
     /// account with no material behind it.
     pub fn prune(&mut self, account: &str) {
@@ -471,14 +467,6 @@ mod tests {
         assert_eq!(back.get("acme-bot"), Some("token-a"));
         assert_eq!(back.get("alice"), Some("token-b"));
         assert_eq!(back.get("missing"), None);
-    }
-
-    #[test]
-    fn remove_reports_whether_something_was_removed() {
-        let mut s = Store::default();
-        s.insert("a", "t");
-        assert!(s.remove("a"));
-        assert!(!s.remove("a"));
     }
 
     #[test]

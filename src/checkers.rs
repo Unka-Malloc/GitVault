@@ -20,7 +20,6 @@
 //!
 //! Adding capability means adding a registry entry, not editing this file.
 
-use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -41,10 +40,6 @@ pub struct Context {
     pub repo_slug: Option<String>,
     pub identity: String,
     pub account: Option<String>,
-    /// Why this identity was chosen, e.g. `rules.owners['acme']` or
-    /// `rules.default`. Carried so the gate can tell a deliberate rule from a
-    /// fallback; the API, SSH and signing paths already make that distinction.
-    pub reason: String,
     /// The identity came from `rules.default` rather than a rule about this
     /// repository. Mirrored from the identity outcome for the same reason it is
     /// a field there: a display string is not a policy decision.
@@ -53,8 +48,6 @@ pub struct Context {
     pub expected_email: Option<String>,
     /// What git will actually stamp. Attribution follows this one.
     pub actual_email: Option<String>,
-    /// Arguments git passed to the hook.
-    pub args: Vec<String>,
     /// For pre-push: the ref lines git supplies on stdin.
     pub stdin: Option<String>,
     /// For `pr`: the branch the request targets and the branch it proposes, as
@@ -263,7 +256,7 @@ pub fn run_all(cfg: &Config, ctx: &Context, only: Option<&str>) -> Result<Report
     Ok(report)
 }
 
-fn run_one(cfg: &Config, ctx: &Context, checker: &Checker) -> CheckerOutcome {
+fn run_one(_cfg: &Config, ctx: &Context, checker: &Checker) -> CheckerOutcome {
     let started = std::time::Instant::now();
     let fail = |why: String| CheckerOutcome {
         name: checker.name.clone(),
@@ -461,16 +454,6 @@ fn tempdir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Environment variables a checker is allowed to see, for documentation and tests.
-pub fn inherited_env_allowlist() -> BTreeMap<&'static str, &'static str> {
-    BTreeMap::from([
-        ("PATH", "locate the checker binary"),
-        ("HOME", "checkers may need their own config"),
-        ("LANG", "stable encoding"),
-        ("TMPDIR", "scratch space"),
-    ])
-}
-
 #[cfg(test)]
 mod tests {
     use super::Context;
@@ -483,11 +466,9 @@ mod tests {
             repo_slug: Some("Owner/Repo".into()),
             identity: "personal".into(),
             account: None,
-            reason: "rules.owners[Owner]".into(),
             via_default: false,
             expected_email: Some("maintainer@example.invalid".into()),
             actual_email: Some("maintainer@example.invalid".into()),
-            args: Vec::new(),
             stdin: None,
             pr_base: Some("main".into()),
             pr_head: Some("feature".into()),

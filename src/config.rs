@@ -161,7 +161,10 @@ fn default_severity() -> Severity {
 }
 
 fn default_timeout() -> u64 {
-    120
+    // No wall-clock deadline unless the operator asks for one: a deadline that
+    // fires mid-review discards work that was already paid for, and the default
+    // should never silently buy that outcome.
+    0
 }
 
 fn default_event() -> Vec<String> {
@@ -240,11 +243,6 @@ impl Config {
                 );
             }
         }
-        let known_accounts: std::collections::BTreeSet<&str> = self
-            .identities
-            .values()
-            .filter_map(|i| i.account.as_deref())
-            .collect();
         if let Some(default) = &self.rules.default {
             if !self.identities.contains_key(default) {
                 bail!("rules.default names unknown identity '{default}'");
@@ -282,12 +280,12 @@ mod tests {
     const BASE: &str = r#"
 [identities.acme]
 name = "acme Maintainer"
-email = "acme@outlook.com"
+email = "acme@example.invalid"
 account = "acme-dev"
 
 [identities.personal]
 name = "A. User"
-email = "unka.malloc@outlook.com"
+email = "personal@example.invalid"
 
 [rules.owners]
 acme = "acme"
@@ -371,7 +369,7 @@ command = ["/bin/true"]
 
     #[test]
     fn rejects_a_malformed_email() {
-        let bad = BASE.replace("acme@outlook.com", "not-an-email");
+        let bad = BASE.replace("acme@example.invalid", "not-an-email");
         assert!(parse(&bad).is_err());
     }
 
@@ -382,7 +380,7 @@ command = ["/bin/true"]
         for bad in [
             BASE.replace("[rules]", "[rules]\nunknown_knob = true"),
             BASE.replace("severity = \"advisory\"", "severity = \"advisory\"\nsevverity = \"blocking\""),
-            BASE.replace("email = \"acme@outlook.com\"", "email = \"acme@outlook.com\"\nworkspace = \"/tmp\""),
+            BASE.replace("email = \"acme@example.invalid\"", "email = \"acme@example.invalid\"\nworkspace = \"/tmp\""),
         ] {
             assert!(parse(&bad).is_err(), "an unknown key must be refused: {bad}");
         }

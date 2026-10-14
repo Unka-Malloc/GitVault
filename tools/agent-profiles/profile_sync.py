@@ -1,15 +1,18 @@
-"""Local profile sync: what the dev site published, and whether this machine still matches.
+"""Local profile sync: what the registry published, and whether this machine still matches.
 
-The prompts and skills an agent runs on live in the Development site's profile
-registry, versioned by git tag. This module is the machine's side of that
-contract, and it lives in the installed payload so the checker itself can use it:
+The prompts and skills an agent runs on live in a profile registry, versioned
+by git tag. `GITVAULT_PROFILES_URL` points a machine at that registry; the
+default is a loopback endpoint for a local development registry. This module
+is the machine's side of that contract, and it lives in the installed payload
+so the checker itself can use it:
 
-  * `pull` fetches one published version over the local dashboard, verifies every
-    file hash and the whole-version manifest before writing anything, then records
-    what it wrote in `installation.json`;
+  * `pull` fetches one published version, verifies every file hash and the
+    whole-version manifest before writing anything, then records what it wrote
+    in `installation.json`. A non-loopback registry must be https: the bundle
+    decides what the agent runs, so the channel has to be authenticated;
   * `assert_synced` re-hashes the local documents at checker startup. A local
-    edit that the dev site never saw is a drift, and a drifted prompt refuses the
-    operation: "the dev site is the only source" has to be executable, not
+    edit the registry never saw is a drift, and a drifted prompt refuses the
+    operation: "the registry is the only source" has to be executable, not
     aspirational.
 
 Being *behind* is not drift. A machine that has not pulled the newest version is
@@ -21,14 +24,16 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import urllib.parse
 import urllib.request
 
 DOCUMENTS = ("policy.md", "SKILL.md")
 REFERENCES = "documents.json"
 # profile.json carries the declared runtime (provider/model/effort): the
-# checker reads its synced copy, so the dev site is the only source for what
+# checker reads its synced copy, so the registry is the only source for what
 # the agent runs on, exactly like the prompt and skill documents.
 SYNCED = (*DOCUMENTS, REFERENCES, "profile.json")
+# The default endpoint is a local development registry on loopback.
 DEFAULT_URL = "http://127.0.0.1:8891"
 
 
@@ -41,12 +46,23 @@ def manifest(files):
     return sha256("".join(f"{name}\t{sha256(files[name])}\n" for name in sorted(files)))
 
 
+def _check_url(url):
+    """The bundle decides what the agent runs, so the channel must be
+    authenticated anywhere it can be intercepted. A loopback http endpoint is
+    the local development registry; any other origin is https or refused."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme == "https" or parts.hostname in {"127.0.0.1", "::1", "localhost"}:
+        return
+    raise ValueError(f"profile registry outside loopback must be reached over https: {url}")
+
+
 def pull(agent, skill_dir, url=DEFAULT_URL, tag=None):
     """Fetch a published profile version and install it into the skill directory.
 
     Every hash is checked before the first byte is written, so a truncated or
     tampered download leaves the previous version in place.
     """
+    _check_url(url)
     endpoint = f"{url.rstrip('/')}/api/gitvault/profiles/{agent}/bundle"
     if tag:
         endpoint += f"?tag={tag}"
@@ -94,5 +110,5 @@ def assert_synced(installation):
     changed = drift(installation)
     if changed:
         raise ValueError(
-            "the local prompt copy no longer matches what the dev site published "
+            "the local prompt copy no longer matches what the registry published "
             f"({', '.join(changed)}); run `python3 tools/<agent>/install.py --pull` to sync")

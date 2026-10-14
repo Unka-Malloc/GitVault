@@ -24,11 +24,15 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "agent-profiles"))
+# The push/PR/release range contract is shared by every checker: one module,
+# copied into each payload by install.py.
+from review_ranges import ranges as review_ranges  # noqa: E402
 # profile_sync is imported lazily in main(): --serve-tools never touches it,
 # so the bridge works even where the library is not beside the plugin.
 
 ROOT = Path(__file__).resolve().parent
 DOMAINS = ("sql", "storage", "network", "compute", "cloudflare", "vps")
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"  # a snapshot review diffs against it
 SENSITIVE_PARTS = {".git", ".ssh", ".aws", ".env", "secrets", "credentials", "logs", "runtime-data", ".dev.vars", ".netrc", ".npmrc", "credentials.json", "secrets.json"}
 SENSITIVE_SUFFIXES = {".pem", ".key", ".p12", ".pfx", ".db", ".sqlite", ".sqlite3", ".log", ".jsonl", ".enc", ".tfstate"}
 # Tracked dotenv templates are reviewable documentation, not credential
@@ -146,8 +150,10 @@ class Review:
             if path not in self.changed:
                 raise ValueError("Path is not part of this commit")
             if path not in self.diffs:
+                # A snapshot review has no base commit: every change is a new
+                # file, which is what diffing the empty tree produces.
                 raw = git(self.repo, "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
-                          "--no-color", "--unified=5", self.base, self.tree, "--", path).stdout.decode("utf-8", "replace")
+                          "--no-color", "--unified=5", self.base or EMPTY_TREE, self.tree, "--", path).stdout.decode("utf-8", "replace")
                 self.diffs[path] = sanitize_source(raw)
             diff = self.diffs[path]
             start = max(0, int(args.get("offset", 0)))
@@ -173,6 +179,8 @@ class Review:
                     raise ValueError("Only regular tracked source files can be read")
                 blob = entry[2]
             else:
+                if not self.base:
+                    raise ValueError("This snapshot has no base revision; every path is new")
                 blob = f"{self.base}:{path}"
                 if git(self.repo, "cat-file", "-e", blob, check=False).returncode:
                     raise ValueError("Path does not exist in the base revision; the change adds it")
@@ -393,94 +401,22 @@ def _rev(repo, *args):
     return out.stdout.decode().strip() if out.returncode == 0 else ""
 
 
-def _empty_tree(repo):
-    return subprocess.run(["git", "-C", str(repo), "hash-object", "-t", "tree", "--stdin", "-w"],
-                          input=b"", capture_output=True, check=True).stdout.decode().strip()
-
-
-def _merge_base(repo, left, right):
-    out = git(repo, "merge-base", left, right, check=False)
-    return out.stdout.decode().strip() if out.returncode == 0 else ""
-
-
-def _published_elsewhere(repo, commit):
-    """True when a remote-tracking ref already contains the commit."""
-    out = git(repo, "for-each-ref", "--count=1", "--contains", commit,
-              "--format=%(refname)", "refs/remotes", check=False)
-    return bool(out.stdout.strip())
-
-
-def _short_ref(name):
-    return name.removeprefix("refs/heads/") if name else name
-
-
-def _base_for(repo, head, published_tip=None, base_ref=None):
-    """The commit the review diffs against: what the outgoing content adds to
-    what is already published. A pushed ref diffs against its remote tip (or
-    their merge base after a rewrite); a new ref or a pull request diffs
-    against its base branch, as known locally. A repository with no
-    remote-tracking refs to compare against reviews from the empty tree, which
-    over-reviews rather than under-reviews."""
-    candidates = []
-    if published_tip and published_tip.strip("0"):
-        candidates.append(published_tip)
-    for ref in ((f"refs/remotes/origin/{_short_ref(base_ref)}" if base_ref else None), base_ref,
-                "refs/remotes/origin/HEAD"):
-        if ref and _rev(repo, "--verify", ref):
-            candidates.append(ref)
-    for candidate in candidates:
-        shared = _merge_base(repo, head, candidate)
-        if shared:
-            return shared
-    return _empty_tree(repo)
-
-
-def review_ranges(repo):
-    """The content this operation is about to publish, from the GitVault
-    context: the refs a push carries, or the range a pull request proposes.
-    Returns [] when everything in the operation is already published."""
-    if os.environ.get("GITVAULT_EVENT") == "pr":
-        head_ref = os.environ.get("GITVAULT_PR_HEAD", "").strip()
-        base_ref = os.environ.get("GITVAULT_PR_BASE", "").strip()
-        head = (_rev(repo, "--verify", f"{head_ref}^{{commit}}")
-                or _rev(repo, "--verify", f"refs/remotes/origin/{_short_ref(head_ref)}^{{commit}}"))
-        if not head:
-            raise ValueError("The pull request head is not available locally; push the branch through GitVault first")
-        return [{"kind": "pr", "label": f"pull request {head_ref} → {base_ref or 'default'}",
-                 "base": _base_for(repo, head, base_ref=base_ref), "head": head, "ref": None}]
-    ranges = []
-    for line in os.environ.get("GITVAULT_PUSH_REFS", "").splitlines():
-        fields = line.split()
-        if len(fields) != 4:
-            continue
-        local_ref, local_sha, _remote_ref, remote_sha = fields
-        if not local_sha.strip("0"):
-            continue  # a deletion publishes nothing
-        head = _rev(repo, "--verify", f"{local_sha}^{{commit}}")
-        if not head or _published_elsewhere(repo, head):
-            continue  # tags and already-published tips add no unreviewed content
-        ranges.append({"kind": "push", "label": f"push {local_ref}",
-                       "base": _base_for(repo, head, published_tip=remote_sha), "head": head, "ref": local_ref})
-    deduped, seen = [], set()
-    for item in ranges:
-        if (item["base"], item["head"]) in seen:
-            continue
-        seen.add((item["base"], item["head"]))
-        deduped.append(item)
-    return deduped
-
-
 def audited(settings, base, head, runtime):
     """A previous passing review of exactly this range satisfies the boundary:
-    the same content cannot become public twice, and a push that already paid
-    for the review must not pay again at pull-request time. The verdict only
-    carries when it came from the currently declared runtime."""
+    the same content cannot become public twice, and a range that already paid
+    for the review is not paid for again. The verdict only carries when it
+    came from the currently declared runtime.
+
+    The judged items are part of the key. A receipt written under an earlier
+    contract did not answer the questions this run asks, so reusing it would
+    let a new coverage item go unanswered while the range reports as passed."""
     for report_path in sorted((Path(settings["profile"]) / "money-saver-runs").glob("*/report.json")):
         try:
             report = json.loads(report_path.read_text())
         except ValueError:
             continue
         if (report.get("review_base") == base and report.get("review_head") == head
+                and report.get("review_items") == list(DOMAINS)
                 and report.get("gate_status") == "passed"
                 and report.get("provider") == runtime["provider"] and report.get("model") == runtime["model"]
                 and report.get("reasoning") == runtime["effort"]):
@@ -569,7 +505,8 @@ def review_range(repo, settings, target, runtime, spawn=subprocess.run):
     head = target["head"]
     base = target["base"]
     tree = _rev(repo, f"{head}^{{tree}}")
-    changed = git(repo, "diff", "--name-only", "--no-renames", "-z", base, tree).stdout.decode().rstrip("\0").split("\0")
+    changed = git(repo, "diff", "--name-only", "--no-renames", "-z",
+                  base or EMPTY_TREE, tree).stdout.decode().rstrip("\0").split("\0")
     changed = [p for p in changed if p]
     profile = Path(settings["profile"])
     runs = profile / "money-saver-runs"
@@ -591,6 +528,7 @@ def review_range(repo, settings, target, runtime, spawn=subprocess.run):
         report["review_base"] = base
         report["review_head"] = head
         report["review_kind"] = target["kind"]
+        report["review_items"] = list(DOMAINS)
         write_json(report_path, report)
         print(f"Money Saver: {report['verdict']} — {sanitize(report['summary'])}")
         for finding in report["findings"]:
@@ -622,8 +560,8 @@ def run(repo, settings, spawn=subprocess.run):
         print("Money Saver: nothing unpublished in this operation; no review needed")
         return 0
     for target in ranges:
-        if target["kind"] == "pr" and audited(settings, target["base"], target["head"], runtime):
-            print(f"Money Saver: {target['label']} already passed its push audit "
+        if audited(settings, target["base"], target["head"], runtime):
+            print(f"Money Saver: {target['label']} already passed its semantic review "
                   f"({target['head'][:12]}); reusing that verdict")
             continue
         if review_range(repo, settings, target, runtime, spawn):

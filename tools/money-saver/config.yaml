@@ -1,8 +1,4 @@
-model:
-  default: deepseek/deepseek-v4.1-flash
-  provider: example
 agent:
-  reasoning_effort: high
   coding_context: "off"
   environment_probe: false
   bot_mode_protocol: false

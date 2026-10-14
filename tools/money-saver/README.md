@@ -97,39 +97,36 @@ They do not deploy, mutate services, query production or automatically repeat a
 failed audit. Resume a failed full audit with `audit.py --resume <run-directory>`:
 the same snapshot, Pi session, read evidence, official document
 cache and latest draft are retained. A successful report cannot be re-audited by
-this command. Normal commit review continues to use only the exact staged tree.
-Report schemas specify coverage/status fields, project keys and every finding
-field so the model can produce the correct format without repeated guessing.
+this command. Normal publication review continues to use only the operation's
+resolved range. Report schemas specify coverage/status fields, project keys
+and every finding field so the model can produce the correct format without
+repeated guessing.
 
 ## Gate checks
 
 | Check | Purpose and failure behavior |
 | --- | --- |
-| Git snapshot and partial index | Read exactly the staged tree; refuse an unreadable/unmerged index. |
-| Source access | Only Git objects; reject credential/runtime containers and traversal; never follow worktree symlinks. |
+| Range resolution | Review exactly what the operation publishes: each pushed ref's unpublished range, a pull request's base..head, deduplicated; an already-published tip is not re-reviewed. |
+| Verdict reuse | A prior passing receipt for the same base..head, the same declared provider/model/effort and the same judged items stands; anything else is paid for again. |
+| Source access | Only immutable Git objects; reject credential/runtime containers and traversal; never follow worktree symlinks. |
 | Official catalog | Only operator-supplied public URLs; refuse cross-authority redirects; reuse one fetch per page. |
 | Findings contract | Require concrete location, impact, before/after units, remedy, validation and retrieved sources. |
 | Coverage | A pass requires all changed diffs and all six cost domains accounted for, with no blocker or unknown applicable coverage. |
 | Single submission | Accept one verdict per run; no cached prior approvals. |
-| Pi completion | Require successful engine exit and a structured verdict; provider errors/interruption refuse the commit. |
-| Index stability | Compare Git's native tree ID once at completion; changed staged content requires a new review. |
+| Pi completion | Require successful engine exit and a structured verdict; provider errors/interruption refuse the publication. |
+| Ref stability | A pushed ref that moved during review refuses the publication. |
 | Report status | A model verdict is pending until the engine and snapshot checks pass; interrupted runs remain refused. |
 | Full-audit originals and scope | Require original request read, every selected project accounted for and real inspected source locations; no unstated coverage pass. |
 
 ## Privacy verification
 
-No live model request was sent during implementation verification.
-
-| File and line in inspected agent source | Rule | Sanitized content/category | Judgment and basis | Impact and treatment |
-| --- | --- | --- | --- | --- |
-| `agent/system_prompt.py:789` | Machine identifiers | `Active agent profile … [LOCAL_PATH]` | Actual default prompt injection observed offline; no external transmission | Dedicated `CostAuditAgent` system prompt omits profile paths; outbound prompt contract passes. |
-| `agent/prompt_builder.py:1019` | Machine identifiers | `User home directory: [LOCAL_PATH]` | Actual default prompt injection observed offline; no external transmission | Same dedicated prompt excludes host/home details. |
-| `agent/prompt_builder.py:1027` | Machine identifiers | `Scratch directory: [LOCAL_PATH]` | Actual default prompt injection observed offline; no external transmission | Same dedicated prompt excludes scratch paths; private scope is available only to local tools. |
-| `tests/test_money_saver.py:108` | Credential/machine patterns | Synthetic credential, local-path and private-IP shapes; reserved example email | False positive as a real disclosure: generated test inputs | Retained to verify redaction; no real values used. |
-| `tools/money-saver/__init__.py:41` | Source endpoint/account data | `[ENDPOINT]`, `[IP_ADDRESS]`, `[IDENTIFIER]`, unquoted secret assignments | Synthetic fixtures exposed a missing protection category in staged-source handling; no actual leaked value was identified | Staged and full-service contexts now use the same source sanitizer; official report citations remain readable. |
-
-The source sanitizer tests use synthetic placeholders, not genuine credentials or
-customer records. Existing unrelated repository content is outside this review.
+No live model request was sent during implementation verification. The default
+agent runtime's system prompt was observed to inject machine identifiers
+(profile, home and scratch paths); the dedicated review prompt omits them, and
+the outbound prompt contract passes with no external transmission of local
+paths. Source-sanitizer tests use synthetic placeholders — generated
+credential, local-path and private-IP shapes — not genuine credentials or
+customer records.
 
 ## Syncing a published profile
 
