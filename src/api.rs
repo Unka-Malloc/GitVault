@@ -75,7 +75,7 @@ pub struct Request {
 /// resource still goes through this, because the account used is part of the
 /// permanent record either way.
 fn authorize(cfg: &Config, target: &Target, vault: &Vault) -> Result<String> {
-    let (account, token) = match target {
+    let token = match target {
         Target::Repo(slug) => {
             let repo = Repo::for_slug(slug);
             // Credentials follow the operator's rules, never repository content:
@@ -116,8 +116,7 @@ fn authorize(cfg: &Config, target: &Target, vault: &Vault) -> Result<String> {
                 false,
                 None,
             )?;
-            let token = vault.token_for(&account)?;
-            (account, token)
+            vault.token_for(&account)?
         }
         Target::Identity(key) => {
             let id = cfg
@@ -137,12 +136,11 @@ fn authorize(cfg: &Config, target: &Target, vault: &Vault) -> Result<String> {
                 false,
                 None,
             )?;
-            let token = vault.token_for(&account)?;
-            (account, token)
+            vault.token_for(&account)?
         }
     };
 
-    Ok(format!("{account}\u{0}{token}"))
+    Ok(token)
 }
 
 /// Authorize, send the request and return the HTTP status and response body.
@@ -153,11 +151,7 @@ fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, String)> 
     // host the caller chose. Relative paths always resolve under API_ROOT.
     let mut url = request_url(&req.path)?;
 
-    let resolved = authorize(cfg, &req.target, vault)?;
-    let (account, token) = resolved
-        .split_once('\u{0}')
-        .ok_or_else(|| anyhow::anyhow!("internal: malformed authorization"))?;
-    let _ = account;
+    let token = authorize(cfg, &req.target, vault)?;
 
     let mut args: Vec<String> = vec![
         "-sS".into(),

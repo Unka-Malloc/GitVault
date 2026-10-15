@@ -71,10 +71,10 @@ def tool_plan(review):
     extension manifest and the `--serve-tools` dispatch table."""
     return [
         ("security_context",
-         "Inspect the immutable outgoing range. Start with inventory (it lists the surfaces the "
-         "static stage already reported), then diff every changed file to its end; read is 400 "
-         "lines with start; find is a literal search over the range. Credential containers are "
-         "unavailable by design.",
+         f"Inspect the immutable outgoing range. Start with inventory (it lists the surfaces the "
+         f"static stage already reported), then diff every changed file to its end; read is "
+         f"{engine.READ_PAGE_LINES} lines with start; find is a literal search over the range. "
+         "Credential containers are unavailable by design.",
          {"operation": {"type": "string", "enum": ["inventory", "list", "diff", "read", "find"]},
           "path": {"type": "string"}, "pattern": {"type": "string"}, "text": {"type": "string"},
           "start": {"type": "integer"}, "offset": {"type": "integer"},

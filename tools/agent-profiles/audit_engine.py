@@ -49,6 +49,13 @@ EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"  # a snapshot review dif
 MAX_RUNS = 200
 MAX_AGE_SECS = 90 * 24 * 60 * 60
 
+# The pagination contract the tools and their descriptions share. Named once
+# so a size change cannot leave a tool description promising a page the code
+# no longer serves.
+READ_PAGE_LINES = 400      # lines per `read` page
+DIFF_PAGE_CHARS = 20000    # characters per `diff` page
+FIND_PAGE = 100            # matches per `find` reply
+
 
 def prune_runs(runs_dir, keep=MAX_RUNS, max_age_secs=MAX_AGE_SECS):
     """Drop run directories beyond the retention window. Called once per gate
@@ -266,7 +273,7 @@ class Review:
             start = max(0, int(args.get("offset", 0)))
             if start > self.diff_progress.get(path, 0):
                 raise ValueError("Read the preceding diff page before advancing")
-            end = min(len(diff), start + 20000)
+            end = min(len(diff), start + DIFF_PAGE_CHARS)
             self.diff_progress[path] = max(end, self.diff_progress.get(path, 0))
             if self.diff_progress[path] == len(diff):
                 self.reviewed.add(path)
@@ -296,7 +303,7 @@ class Review:
                 return {"binary": True, "bytes": len(raw)}
             lines = sanitize_source(raw.decode("utf-8", "replace")).splitlines()
             start = max(1, int(args.get("start", 1)))
-            end = min(len(lines), start + 399)
+            end = min(len(lines), start - 1 + READ_PAGE_LINES)
             return {"total_lines": len(lines),
                     "content": "\n".join(f"{i+1}: {lines[i]}" for i in range(start - 1, end))}
         if operation == "find":
@@ -315,7 +322,7 @@ class Review:
                 except ValueError:
                     continue
                 matches.append(sanitize_source(f"{path}:{line}"))
-            return {"matches": matches[:100], "more": len(matches) > 100}
+            return {"matches": matches[:FIND_PAGE], "more": len(matches) > FIND_PAGE}
         raise ValueError("Unknown context operation")
 
     def submit_extra(self, report, verdict):
@@ -401,7 +408,13 @@ class CheckerSpec:
         self.make_review = make_review
         self.task = task
         self.stage1 = stage1
-        self.stage1_lines = stage1_lines or (lambda summary: [])
+        # The per-hit refusal lines the refused report lists. Shared because a
+        # second copy in one payload would silently stop tracking a summary
+        # field the other added.
+        self.stage1_lines = stage1_lines or (lambda summary: [
+            f"{hit['path']}{':' + str(hit['line']) if hit.get('line') else ''} "
+            f"{hit.get('rule', summary['refused'])}"
+            for hit in summary.get("hits", [])])
         self.stage_label = stage_label
         self.refusal = refusal
         self.session = session
@@ -532,6 +545,18 @@ def review_range(repo, settings, target, summary, stage_summaries, runtime, spec
     changed = git(repo, "diff", "--name-only", "--no-renames", "-z",
                   base or EMPTY_TREE, tree).stdout.decode().rstrip("\0").split("\0")
     changed = [p for p in changed if p]
+    # A path the tool surface refuses is a review that can never complete:
+    # "every changed diff reviewed" could not hold even after paying for the
+    # semantic stage. Refuse it here, the same way the deterministic stages
+    # refuse — naming the path, never its content. This is the same verdict
+    # the paid review would return, reached before it costs a token.
+    for path in changed:
+        try:
+            safe_path(path)
+        except ValueError:
+            raise ValueError(
+                f"The range contains '{path}', a path the review contract excludes; "
+                "no review could ever pass it, so the publication is refused locally")
     profile = Path(settings["profile"])
     runs = profile / spec.runs_dir
     runs.mkdir(parents=True, exist_ok=True, mode=0o700)

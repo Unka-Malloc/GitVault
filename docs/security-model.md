@@ -45,6 +45,16 @@ window is a permission, not a possession:
   directly bypasses it, which is why the vault key alone is not treated as
   the security boundary — the boundary is that operations, not secrets, are
   what the credential holders receive.
+- **The keychain write itself is an accepted limitation.** The vault key is
+  stored with `security add-generic-password -w`, so the key bytes occupy the
+  command's argv for the duration of that one call — observable by anything
+  that can read the process table, on the same footing as reading the
+  keychain item afterwards. The window is narrow (first `auth init`, or a
+  later save where the item is missing), and the platform's argv-free write
+  path (SecItemAdd) needs a bundled helper the CLI does not ship; it is
+  recorded here so the "no credential in argv" claim below stays qualified:
+  it holds for every credential the vault *hands out*, not for the one write
+  that seeds it.
 
 ## Credentials never cross the process boundary
 
@@ -87,8 +97,12 @@ tree, so a repository cannot edit the terms it is judged by. The engine:
 - runs every checker for the event and reports all results — no short-circuit
   on the first refusal.
 
-The Python checkers run under `-I` (isolated mode): no `sys.path` shadowing
-from the work tree, no user site-packages, no environment `PYTHONPATH`.
+The bundled Python checkers are registered with `python3 -I` (isolated mode):
+no `sys.path` shadowing from the work tree, no user site-packages, no
+environment `PYTHONPATH`. A custom `kind = "python"` entry instead gets the
+engine's portable floor — `-P` and `PYTHONSAFEPATH=1`, which stop `sys.path`
+shadowing but leave user site-packages and `PYTHONPATH` alone; register the
+command with `-I` itself when the stronger isolation is wanted.
 
 `git push --no-verify` bypasses the git `pre-push` hook — git offers no counter
 to it, so the push hook alone is a convenience. The boundaries that cannot be

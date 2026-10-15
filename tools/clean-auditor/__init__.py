@@ -80,9 +80,9 @@ def tool_plan(review):
     extension manifest and the `--serve-tools` dispatch table."""
     return [
         ("clean_context",
-         "Inspect the immutable outgoing range. Start with inventory, then diff every changed "
-         "file to its end; read is 400 lines with start; find is a literal search over the range. "
-         "Credential containers are unavailable by design.",
+         f"Inspect the immutable outgoing range. Start with inventory, then diff every changed "
+         f"file to its end; read is {engine.READ_PAGE_LINES} lines with start; find is a literal "
+         "search over the range. Credential containers are unavailable by design.",
          {"operation": {"type": "string", "enum": ["inventory", "list", "diff", "read", "find"]},
           "path": {"type": "string"}, "pattern": {"type": "string"}, "text": {"type": "string"},
           "start": {"type": "integer"}, "offset": {"type": "integer"},
@@ -101,21 +101,20 @@ def tool_plan(review):
 
 
 def _stage1(repo, targets):
-    # The withheld-name list can exempt one repository by name, so the slug is
-    # still resolved; a remote that is a local path (a sandbox, a mirror) is
-    # simply not a repository any exemption can name.
+    """The deterministic audit: withheld names and credential shapes.
+
+    The withheld list lives in the checker installation, outside any
+    repository - a repository cannot unwithhold a name by committing a file
+    that names it. Names are matched case-insensitively on whole words; a hit
+    is reported by file and line, never by the name itself. The list's owner
+    may still publish: the name simply must not appear in what ships.
+
+    The repository's own origin remote decides which list applies - a mirror
+    of a withheld project still withholds its names, because the origin slug
+    still resolves; a remote that is a local path (a sandbox, a mirror) is
+    simply not a repository any exemption can name.
+    """
     return stage1.audit_all(repo, targets, stage1.withheld_names(repo_slug=origin_slug(repo)))
-
-
-def _stage1_lines(summary):
-    # Locations only: a withheld name is never repeated back, not even to
-    # the person who wrote it.
-    lines = []
-    for hit in summary.get("hits", []):
-        line = f":{hit['line']}" if hit.get("line") else ""
-        lines.append(f"{hit['path']}{line} {hit.get('rule', summary['refused'])}")
-    return lines
-
 
 
 SPEC = engine.CheckerSpec(
@@ -128,10 +127,11 @@ SPEC = engine.CheckerSpec(
     task=lambda review: (
         "Review the outgoing changes with the Clean Auditor tools and submit one final "
         "verdict: start with inventory, read every changed diff to its end, then judge all "
-        "six domains. No arbitrary turn or time limit applies."),
+        "six domains and both standing items — whether the project's tooling keeps its data "
+        "out of the range, and whether its parameters live in configuration rather than code. "
+        "No arbitrary turn or time limit applies."),
     root=ROOT,
     stage1=_stage1,
-    stage1_lines=_stage1_lines,
     refusal="The deterministic audit refused this operation; nothing was published",
     scope_extra=lambda target, summary: {"kind": target["kind"]},
 )

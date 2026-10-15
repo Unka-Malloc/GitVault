@@ -71,8 +71,8 @@ def tool_plan(review):
     extension manifest and the `--serve-tools` dispatch table."""
     return [
         ("maintainer_context",
-         "Inspect the immutable outgoing range. Start with inventory, then diff every changed "
-         "file to its end; read is 400 lines with start and revision; list globs the snapshot; "
+         f"Inspect the immutable outgoing range. Start with inventory, then diff every changed "
+         f"file to its end; read is {engine.READ_PAGE_LINES} lines with start and revision; list globs the snapshot; "
          "find is a literal search over the range — use it to locate the original a change "
          "duplicates, the callers a contract serves, or the documentation a decision should "
          "update. Credential containers are unavailable by design.",
@@ -92,15 +92,6 @@ def tool_plan(review):
     ]
 
 
-def _stage1_lines(summary):
-    lines = []
-    for hit in summary.get("hits", []):
-        line = f":{hit['line']}" if hit.get("line") else ""
-        lines.append(f"{hit['path']}{line} {hit.get('rule', summary['refused'])}")
-    return lines
-
-
-
 SPEC = engine.CheckerSpec(
     name="sustainable-maintainer",
     label="Sustainable Maintainer",
@@ -114,7 +105,6 @@ SPEC = engine.CheckerSpec(
         "judge all six domains. No arbitrary turn or time limit applies."),
     root=ROOT,
     stage1=lambda repo, targets: stage1.audit_all(repo, targets),
-    stage1_lines=_stage1_lines,
     refusal="The deterministic audit refused this operation; nothing was published",
     scope_extra=lambda target, summary: {"kind": target["kind"]},
 )

@@ -79,6 +79,11 @@ class OfficialRedirects(HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+#: Characters per `document` page — the same pagination contract as the
+#: engine's tools, for a page source only this checker serves.
+DOC_PAGE_CHARS = 24000
+
+
 class Review(engine.Review):
     """Money Saver's review object: the engine's machinery plus the official
     documentation catalog, the `document` tool and the submission fields that
@@ -118,7 +123,7 @@ class Review(engine.Review):
             self.docs[name] = {"url": url, "accessed": dt.date.today().isoformat(), "content": raw}
         doc = self.docs[name]
         start = max(0, int(args.get("offset", 0)))
-        return {**doc, "content": doc["content"][start:start+24000], "total_characters": len(doc["content"]), "offset": start}
+        return {**doc, "content": doc["content"][start:start+DOC_PAGE_CHARS], "total_characters": len(doc["content"]), "offset": start}
 
     def submit_extra(self, report, verdict):
         fetched = {d["url"] for d in self.docs.values()}
@@ -150,7 +155,7 @@ def tool_plan(review):
         "title": {"type": "string"},
         "sources": {"type": "array", "items": {"type": "string", "enum": list(review.catalog.values())}}})
     return [
-        ("money_context", "Inspect immutable source. Start with inventory for review mode and scope. Commit mode requires every changed diff; full mode requires original_request and per-project coverage. read is 400 lines with start; find/list use pattern glob and offset pagination. Full-mode find supports literal alternatives separated by |.",
+        ("money_context", f"Inspect immutable source. Start with inventory for review mode and scope. Commit mode requires every changed diff; full mode requires original_request and per-project coverage. read is {engine.READ_PAGE_LINES} lines with start; find/list use pattern glob and offset pagination. Full-mode find supports literal alternatives separated by |.",
          {"operation": {"type":"string", "enum":["inventory","original_request","list","diff","read","find"]},
           "path":{"type":"string"}, "pattern":{"type":"string"}, "text":{"type":"string"},
           "start":{"type":"integer"}, "offset":{"type":"integer"}, "revision":{"type":"string", "enum":["staged","base"]}}, ["operation"], review.context),

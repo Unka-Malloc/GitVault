@@ -40,11 +40,14 @@ def _profile_config(source, agent):
 
 
 def config_file():
-    """The registry file the binary actually reads: the same rule
-    config.rs::config_dir applies — $XDG_CONFIG_HOME/gitvault when the
-    variable names a location, ~/.config/gitvault otherwise. Resolving it
-    here rather than hardcoding ~/.config is what keeps 'installed' and
-    'the gate actually runs' the same statement on every machine."""
+    """The registry file the binary actually reads: the same precedence
+    config.rs applies — $GITVAULT_CONFIG when set, then
+    $XDG_CONFIG_HOME/gitvault, then ~/.config/gitvault. Resolving it here
+    rather than hardcoding ~/.config is what keeps 'installed' and 'the gate
+    actually runs' the same statement on every machine."""
+    explicit = os.environ.get("GITVAULT_CONFIG", "").strip()
+    if explicit:
+        return Path(explicit)
     base = os.environ.get("XDG_CONFIG_HOME", "").strip()
     return (Path(base) if base else Path.home() / ".config") / "gitvault" / "config.toml"
 

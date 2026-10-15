@@ -62,6 +62,30 @@ class AuditEngineTests(unittest.TestCase):
         self.assertIn('"audit_engine.py"', text,
                       "the shared library list must carry the engine to installed payloads")
 
+    def test_plugin_manifest_lists_the_tools_the_plan_serves(self):
+        # plugin.yaml declares what the checker provides; tool_plan is what it
+        # actually serves. The manifest is a second copy of that list, and the
+        # drift the engine exists to prevent starts exactly here.
+        import tempfile
+        for name, module in self.checkers.items():
+            with self.subTest(checker=name):
+                manifest = (REPO / "tools" / name / "plugin.yaml").read_text()
+                listed = [line.strip()[2:] for line in manifest.splitlines()
+                          if line.strip().startswith("- ")]
+                run_dir = Path(tempfile.mkdtemp(prefix="gv-plan-"))
+                try:
+                    tree = audit_engine.git(REPO, "rev-parse", "HEAD^{tree}").stdout.decode().strip()
+                    audit_engine.write_json(
+                        run_dir / "scope.json",
+                        {"repo": str(REPO), "tree": tree, "base": "",
+                         "changed": [], "kind": "push"})
+                    served = [spec[0] for spec in
+                              module.tool_plan(module.SPEC.make_review(run_dir))]
+                finally:
+                    import shutil
+                    shutil.rmtree(run_dir, ignore_errors=True)
+                self.assertEqual(listed, served)
+
     def test_receipt_reuse_contract_lives_in_one_place(self):
         # `audited` is the receipt contract: every checker's copy must be the
         # engine's, bound to its own spec.

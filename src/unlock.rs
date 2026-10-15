@@ -4,13 +4,14 @@
 //! this design that an automated process cannot satisfy, which is what makes the
 //! window mean something rather than being a self-imposed delay.
 //!
-//! Three properties, each with a reason:
+//! Four properties, each with a reason:
 //!
 //! 1. **Bound to the boot session.** The window is recorded on disk, so without
 //!    this it would survive a reboot. A window opened before a restart must not
 //!    still be open after one.
 //! 2. **Bounded in time.** A window that never closed would make the confirmation
-//!    a one-time ceremony. `GITVAULT_UNLOCK_TTL` sets the length.
+//!    a one-time ceremony. `gitvault unlock --ttl` sets the length; the
+//!    `GITVAULT_UNLOCK_TTL` environment override exists only in debug builds.
 //! 3. **Integrity-bound to the vault key.** The record carries an HMAC keyed on
 //!    the vault key, so a file nobody confirmed is void. Forging one requires
 //!    silently reading the vault key - the same capability as reading the vault
