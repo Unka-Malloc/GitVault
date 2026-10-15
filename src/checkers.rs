@@ -17,6 +17,10 @@
 //!   ambient credentials or steering variables cannot reach a checker.
 //! * **Fail-closed.** A blocking checker that is missing, times out, or exits
 //!   non-zero stops the action.
+//! * **Concurrent reads, serial writes.** Checkers run in parallel against the
+//!   same repository snapshot - they only read it. Each still gets its own
+//!   neutral directory, and outcomes are collected back in registry order so
+//!   the report and run record stay deterministic and single-writer.
 //!
 //! Adding capability means adding a registry entry, not editing this file.
 
@@ -254,16 +258,43 @@ pub fn run_all(cfg: &Config, ctx: &Context, only: Option<&str>) -> Result<Report
         }
     }
 
-    for checker in selected {
-        report.outcomes.push(run_one(cfg, ctx, checker));
-    }
+    // Run the checkers concurrently: they only read the shared snapshot, while
+    // joining in registry order keeps the report deterministic and the run
+    // record single-writer. The safe-path probe runs once here rather than once
+    // per thread.
+    let safe_path = python_safe_path_flag();
+    let mut outcomes: Vec<CheckerOutcome> = std::thread::scope(|s| {
+        selected
+            .iter()
+            .map(|&checker| s.spawn(move || run_one(cfg, ctx, checker, safe_path)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .zip(selected.iter())
+            .map(|(handle, checker)| {
+                handle.join().unwrap_or_else(|_| CheckerOutcome {
+                    name: checker.name.clone(),
+                    severity: checker.severity,
+                    outcome: OutcomeKind::CouldNotRun("checker thread panicked".into()),
+                    duration_ms: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                })
+            })
+            .collect()
+    });
+    report.outcomes.append(&mut outcomes);
     if let Some(run) = run {
         records::finish(cfg, run, ctx, &report);
     }
     Ok(report)
 }
 
-fn run_one(_cfg: &Config, ctx: &Context, checker: &Checker) -> CheckerOutcome {
+fn run_one(
+    _cfg: &Config,
+    ctx: &Context,
+    checker: &Checker,
+    safe_path: Option<&'static str>,
+) -> CheckerOutcome {
     let started = std::time::Instant::now();
     let fail = |why: String| CheckerOutcome {
         name: checker.name.clone(),
@@ -286,14 +317,16 @@ fn run_one(_cfg: &Config, ctx: &Context, checker: &Checker) -> CheckerOutcome {
     // Language-specific hardening, applied by the engine so the registry entry
     // cannot forget it.
     if checker.kind == Kind::Python {
-        match python_safe_path_flag() {
+        match safe_path {
             Some(flag) => args.insert(0, flag.to_string()),
             None => { /* PYTHONSAFEPATH is set in the environment below */ }
         }
     }
 
-    // Neutral cwd. This is the load-bearing line of the whole module.
-    let neutral = match tempdir() {
+    // Neutral cwd. This is the load-bearing line of the whole module - and with
+    // checkers running concurrently it must be unique per checker, or the
+    // cleanup below would remove a sibling's working directory mid-review.
+    let neutral = match tempdir(&checker.name) {
         Ok(d) => d,
         Err(e) => return fail(format!("no neutral working directory: {e}")),
     };
@@ -453,9 +486,16 @@ fn python_safe_path_flag() -> Option<&'static str> {
     if text.trim() == "True" { Some("-P") } else { None }
 }
 
-fn tempdir() -> Result<PathBuf> {
+fn tempdir(tag: &str) -> Result<PathBuf> {
     let base = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into());
-    let dir = PathBuf::from(base).join(format!("gitvault-checker-{}", std::process::id()));
+    let tag: String = tag
+        .chars()
+        .map(|c| if c == '/' || c == '\\' { '-' } else { c })
+        .collect();
+    let dir = PathBuf::from(base).join(format!(
+        "gitvault-checker-{}-{tag}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("cannot create {}", dir.display()))?;
     Ok(dir)
