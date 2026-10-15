@@ -33,16 +33,21 @@ from audit_engine import git as _git
 # The expressions are handed to `git grep -E` and then re-checked in Python, so
 # they stay inside what POSIX extended regular expressions and `re` both accept:
 # no non-capturing groups, no `\b`, no `\d`.
+#
+# A token shape only counts at an identifier edge: without the left boundary,
+# `task-resource-…` and `task_live_…` read as `sk-…`/`sk_live_…` keys, and every
+# task-, request- or check-id would refuse as a credential.
+_EDGE = r"(^|[^A-Za-z0-9_-])"
 CREDENTIAL_RULES = (
     ("private-key-block", r"-----BEGIN ([A-Z0-9]+ )?PRIVATE KEY-----"),
-    ("aws-access-key", r"(AKIA|ASIA)[A-Z0-9]{16}"),
-    ("github-token", r"(gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})"),
-    ("anthropic-key", r"sk-ant-[A-Za-z0-9_-]{20,}"),
-    ("google-api-key", r"AIza[A-Za-z0-9_-]{35}"),
-    ("openai-key", r"sk-[A-Za-z0-9_-]{20,}"),
-    ("slack-token", r"xox[baprs]-[A-Za-z0-9-]{10,}"),
-    ("stripe-key", r"(sk|rk)_(live|test)_[A-Za-z0-9]{20,}"),
-    ("json-web-token", r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
+    ("aws-access-key", _EDGE + r"(AKIA|ASIA)[A-Z0-9]{16}"),
+    ("github-token", _EDGE + r"(gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})"),
+    ("anthropic-key", _EDGE + r"sk-ant-[A-Za-z0-9_-]{20,}"),
+    ("google-api-key", _EDGE + r"AIza[A-Za-z0-9_-]{35}"),
+    ("openai-key", _EDGE + r"sk-[A-Za-z0-9_-]{20,}"),
+    ("slack-token", _EDGE + r"xox[baprs]-[A-Za-z0-9-]{10,}"),
+    ("stripe-key", _EDGE + r"(sk|rk)_(live|test)_[A-Za-z0-9]{20,}"),
+    ("json-web-token", _EDGE + r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
 )
 
 # Names that must never reach published content, read from a file that lives
