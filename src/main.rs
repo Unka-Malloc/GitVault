@@ -8,6 +8,7 @@
 mod api;
 mod auth;
 mod checkers;
+mod configsig;
 mod records;
 mod config;
 mod git;
@@ -20,7 +21,9 @@ mod vault;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::os::unix::fs::PermissionsExt;
 
+use anyhow::Context as _;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -114,6 +117,24 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+
+    /// Inspect or bless the configuration itself.
+    ///
+    /// Once `config.pub` is root-owned, every GitVault surface refuses an
+    /// unsigned configuration. Editing the file stays a plain edit; blessing it
+    /// is the gated step.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
+
+    /// Deploy GitVault on this machine and hand its enforcement surface to root.
+    ///
+    /// Lays down the binary, the hook dispatchers and - when a configuration
+    /// signing anchor exists - transfers the binaries, the hooks directory and
+    /// the anchor to root ownership. The configuration file itself stays
+    /// user-writable: editing it is allowed, but only a signed version loads.
+    Install,
 
     /// Make an authenticated GitHub API request.
     ///
@@ -220,6 +241,28 @@ enum Command {
         #[arg(long, short = 'R', global = true)]
         repo: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Create the configuration signing key and publish the verification anchor.
+    ///
+    /// The private key goes into the vault; its public half lands in
+    /// `config.pub` beside the configuration, where `gitvault install` later
+    /// transfers it to root ownership - that ownership is what arms
+    /// verification.
+    Keygen,
+
+    /// Sign the current configuration file after editing it.
+    ///
+    /// Editing `config.toml` stays a plain file edit; this command is the
+    /// ceremony that makes the edit loadable again, gated by the same human
+    /// confirmation as releasing a credential.
+    Sign,
+
+    /// Report the configuration's signature state. Fails when enforcement is
+    /// armed and the signature is missing or wrong.
+    Verify,
 }
 
 #[derive(Subcommand)]
@@ -478,6 +521,8 @@ fn main() -> ExitCode {
         Command::Unlock { ttl } => cmd_unlock(ttl),
         Command::Lock => cmd_lock(),
         Command::Status { json } => cmd_status(json),
+        Command::Config { command } => cmd_config(cli.config.as_ref(), command),
+        Command::Install => cmd_install(),
         Command::Api {
             path,
             method,
@@ -856,6 +901,282 @@ fn cmd_status(json: bool) -> anyhow::Result<ExitCode> {
             } else {
                 "locked".to_string()
             }
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_config(config: Option<&PathBuf>, command: ConfigCommand) -> anyhow::Result<ExitCode> {
+    match command {
+        ConfigCommand::Keygen => cmd_config_keygen(),
+        ConfigCommand::Sign => cmd_config_sign(config),
+        ConfigCommand::Verify => cmd_config_verify(config),
+    }
+}
+
+/// Create the configuration signing key: the private half goes into the vault,
+/// the public half becomes the verification anchor.
+///
+/// The unlock gate is what makes this a governance act rather than a file
+/// write: minting the key that attests the routing table costs a human
+/// confirmation, the same as releasing a credential does.
+fn cmd_config_keygen() -> anyhow::Result<ExitCode> {
+    let vault = vault::Vault::open()?;
+    unlock::ensure_open(
+        &vault,
+        "GitVault: confirm to create a configuration signing key",
+        false,
+        None,
+    )?;
+    let (private, anchor_line) = configsig::keygen()?;
+    vault.set_config_key(&private)?;
+
+    let anchor = configsig::anchor_path();
+    if let Some(parent) = anchor.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&anchor, &anchor_line)
+        .with_context(|| format!("cannot write {}", anchor.display()))?;
+
+    println!("configuration signing key stored in the vault");
+    println!("verification anchor written: {}", anchor.display());
+    match configsig::anchor_state(&anchor) {
+        configsig::Anchor::Anchored => println!("enforcement armed (anchor is root-owned)"),
+        _ => println!(
+            "enforcement is NOT armed yet: the anchor must be root-owned\n  \
+             run `gitvault install`, or: sudo chown root:wheel {}",
+            anchor.display()
+        ),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Bless the current configuration: editing the file is free, loading it is not.
+fn cmd_config_sign(config: Option<&PathBuf>) -> anyhow::Result<ExitCode> {
+    let path = config
+        .cloned()
+        .unwrap_or_else(config::Config::default_path);
+    if !path.exists() {
+        anyhow::bail!("nothing to sign at {}", path.display());
+    }
+    let vault = vault::Vault::open()?;
+    unlock::ensure_open(
+        &vault,
+        "GitVault: confirm to bless the GitVault configuration",
+        false,
+        None,
+    )?;
+    let key = vault.config_key()?;
+    let sig = configsig::sign(&path, &key)?;
+    println!("signed {} -> {}", path.display(), sig.display());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Report the attestation state. Read-only: it may advise, never gate.
+fn cmd_config_verify(config: Option<&PathBuf>) -> anyhow::Result<ExitCode> {
+    let path = config
+        .cloned()
+        .unwrap_or_else(config::Config::default_path);
+    let anchor = configsig::anchor_path();
+    match configsig::anchor_state(&anchor) {
+        configsig::Anchor::Absent => {
+            println!("enforcement: inactive (no anchor at {})", anchor.display());
+            println!("bootstrap: gitvault config keygen && gitvault install");
+        }
+        configsig::Anchor::Unanchored => {
+            println!(
+                "enforcement: INACTIVE ({} is not root-owned - it anchors nothing)",
+                anchor.display()
+            );
+            println!("fix: gitvault install");
+        }
+        configsig::Anchor::Anchored => {
+            println!("enforcement: armed (anchor root-owned)");
+            match configsig::verify(&path) {
+                Ok(()) => println!("signature: valid for {}", path.display()),
+                Err(e) => {
+                    eprintln!("signature: INVALID - {e:#}");
+                    return Ok(ExitCode::FAILURE);
+                }
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Provision this machine: deploy the binary beside it, lay down the hook
+/// dispatchers, then hand the enforcement surface to root.
+///
+/// The privileged step is one `sudo` run inside this command. What lands under
+/// root: the binaries, the hooks directory and - when present - the signature
+/// anchor. What deliberately stays user-owned: `config.toml` (edits are
+/// allowed, only unsigned loads are refused) and `config.toml.sig` (rewritten
+/// by every `gitvault config sign`).
+fn cmd_install() -> anyhow::Result<ExitCode> {
+    let home = PathBuf::from(std::env::var("HOME").context("HOME is not set")?);
+    let bin_dir = home.join(".local/bin");
+    let hooks = home.join(".git-hooks");
+    std::fs::create_dir_all(&bin_dir)?;
+    std::fs::create_dir_all(&hooks)?;
+
+    // The enforcement surface this run will immobilise: everything the steps
+    // below lay down, plus sibling helpers that exist already.
+    let target = bin_dir.join("gitvault");
+    let sign_wrapper = bin_dir.join("gitvault-sign");
+    let mut immobilise: Vec<PathBuf> = vec![target.clone(), sign_wrapper.clone()];
+    let touchid = bin_dir.join("gitvault-touchid");
+    if touchid.exists() {
+        immobilise.push(touchid.clone());
+    }
+    immobilise.push(hooks.clone());
+    let anchor = configsig::anchor_path();
+    let anchor_armed = anchor.exists();
+
+    // Release what a previous install froze and hand the files back to this
+    // user, so the copies below can replace them. Self-healing too: binaries
+    // root-owned by an earlier install are refused by AppleSystemPolicy, so
+    // they must return to user ownership before anything runs or is copied
+    // over them. Missing flags and missing paths are expected here.
+    let _ = std::process::Command::new("sudo")
+        .args(["chflags", "-R", "noschg"])
+        .args(&immobilise)
+        .status();
+    let user = std::env::var("USER").context("USER is not set")?;
+    let status = std::process::Command::new("sudo")
+        .args(["chown", "-R", &format!("{user}:staff")])
+        .args(&immobilise)
+        .status()
+        .context("failed to run sudo chown")?;
+    if !status.success() {
+        anyhow::bail!("sudo chown failed; the enforcement surface stays locked");
+    }
+
+    // 1. Deploy the binary next to any sibling helpers. An existing target is
+    //    REMOVED first: fs::copy overwrites in place, preserving the inode - and
+    //    the kernel's provenance record with it. A file that was ever executed
+    //    while root-owned is poisoned permanently ("Killed: 9"); restoring
+    //    ownership and clearing xattrs do not revive it. A fresh inode carries
+    //    a clean record, and that is the only cure.
+    let exe = std::env::current_exe().context("cannot locate the running binary")?;
+    if target.exists() {
+        std::fs::remove_file(&target).with_context(|| {
+            format!(
+                "cannot remove {} before reinstall - is it still schg-flagged?",
+                target.display()
+            )
+        })?;
+    }
+    std::fs::copy(&exe, &target).with_context(|| {
+        format!("cannot install {} to {}", exe.display(), target.display())
+    })?;
+    if !sign_wrapper.exists() {
+        std::fs::write(
+            &sign_wrapper,
+            "#!/bin/sh\n# git needs gpg.ssh.program to be one executable path.\nexec \"$HOME/.local/bin/gitvault\" sign \"$@\"\n",
+        )?;
+    }
+    // The touchid helper is a Mach-O too: if an earlier run left it poisoned,
+    // a rewrite onto a fresh inode cures it the same way.
+    if touchid.exists() {
+        let bytes = std::fs::read(&touchid)
+            .with_context(|| format!("cannot read {}", touchid.display()))?;
+        let mode = touchid
+            .metadata()
+            .map(|m| m.permissions())
+            .unwrap_or_else(|_| std::fs::Permissions::from_mode(0o755));
+        std::fs::remove_file(&touchid)
+            .with_context(|| format!("cannot refresh {}", touchid.display()))?;
+        std::fs::write(&touchid, &bytes)
+            .with_context(|| format!("cannot rewrite {}", touchid.display()))?;
+        std::fs::set_permissions(&touchid, mode)?;
+    }
+
+    // 2. Hook dispatchers, written only when missing: an existing dispatcher is
+    //    an operator's file, not something a reinstall may overwrite.
+    let dispatch = hooks.join("_dispatch");
+    if !dispatch.exists() {
+        std::fs::write(
+            &dispatch,
+            "#!/usr/bin/env bash\n\
+             set -u\n\
+             HOOK=\"${1:?hook name required}\"; shift || true\n\
+             GITVAULT_BIN=\"${GITVAULT_BIN:-$HOME/.local/bin/gitvault}\"\n\
+             if [ ! -x \"$GITVAULT_BIN\" ]; then\n\
+             \x20 printf 'gitvault: not installed; refusing the action\\n' >&2\n\
+             \x20 exit 1\n\
+             fi\n\
+             if [ \"${GIT_IDENTITY_GUARD_CHAINED:-0}\" != \"1\" ]; then\n\
+             \x20 \"$GITVAULT_BIN\" hook \"$HOOK\" || exit $?\n\
+             fi\n\
+             REPO_LOCAL_HOOK=\"$(git rev-parse --show-toplevel 2>/dev/null || true)/.githooks/$HOOK\"\n\
+             if [ -x \"$REPO_LOCAL_HOOK\" ]; then\n\
+             \x20 export GIT_IDENTITY_GUARD_CHAINED=1\n\
+             \x20 \"$REPO_LOCAL_HOOK\" \"$@\"; exit $?\n\
+             fi\n\
+             exit 0\n",
+        )?;
+    }
+    for event in [
+        "pre-commit",
+        "pre-push",
+        "commit-msg",
+        "prepare-commit-msg",
+        "pre-applypatch",
+    ] {
+        let stub = hooks.join(event);
+        if !stub.exists() {
+            std::fs::write(
+                &stub,
+                format!("#!/usr/bin/env bash\nexec \"$HOME/.git-hooks/_dispatch\" {event} \"$@\"\n"),
+            )?;
+        }
+    }
+
+    // 3. Immobilise the enforcement surface. Two mechanisms, chosen by what the
+    //    kernel actually enforces:
+    //
+    //    - Executables and the hooks directory get the SYSTEM IMMUTABLE flag
+    //      (schg): ownership stays with the user so AppleSystemPolicy still
+    //      launches the adhoc-signed binary, but content cannot be modified or
+    //      removed without sudo. chowning a user-built binary to root instead
+    //      gets it killed at exec - "load code signature error 2" - because the
+    //      system provenance record still says a user process created it.
+    //    - The signature anchor goes to root ownership: anchor_state() only
+    //      trusts a root-owned public key, which is the property that makes the
+    //      trust root un-repointable. Ownership was already restored to the
+    //      invoking user above, before the copies.
+    let status = std::process::Command::new("sudo")
+        .args(["chflags", "-R", "schg"])
+        .args(&immobilise)
+        .status()
+        .context("failed to invoke sudo - enter the login password when asked")?;
+    if !status.success() {
+        anyhow::bail!("sudo chflags failed; nothing below was applied");
+    }
+    let mut anchor_ok = false;
+    if anchor_armed {
+        let status = std::process::Command::new("sudo")
+            .args(["chown", "root:wheel"])
+            .arg(&anchor)
+            .status()
+            .context("failed to run sudo chown on the anchor")?;
+        anchor_ok = status.success();
+        if !anchor_ok {
+            anyhow::bail!("sudo chown of the anchor failed");
+        }
+    }
+
+    println!("installed to {}", bin_dir.display());
+    println!("enforcement surface is immutable (schg):");
+    for p in &immobilise {
+        println!("  {}", p.display());
+    }
+    if anchor_armed && anchor_ok {
+        println!("signature enforcement: armed ({} is root-owned)", anchor.display());
+    } else {
+        println!(
+            "signature enforcement: inactive - no anchor yet\n  \
+             next: gitvault config keygen && gitvault config sign && gitvault install"
         );
     }
     Ok(ExitCode::SUCCESS)

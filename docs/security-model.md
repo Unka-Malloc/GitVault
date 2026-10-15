@@ -131,3 +131,33 @@ Audit-agent prompts (`policy.md`, `SKILL.md`, `profile.json`) are synced from a
 profile registry and hash-checked. A local edit to a synced document makes the
 checker refuse to run until it is synced again — a prompt edited on this
 machine is not the prompt that was reviewed.
+
+## Configuration attestation
+
+`config.toml` is a routing table, not a secret: which repository resolves to
+which identity, backed by which account. What it requires is **integrity**, so
+the control is a signature, not encryption.
+
+- **Signing key in the vault.** `gitvault config keygen` creates an ed25519
+  pair; the private half is stored in `vault.enc` beside the credentials, so
+  producing a signature costs the same biometric-gated window as releasing a
+  key. `gitvault config sign` re-blesses the file after an intended edit.
+- **Public anchor, root-owned.** `config.pub` (an allowed-signers line, one
+  `gitvault-config` principal) sits beside the configuration, but it only
+  counts while root owns it. A same-user process can rewrite `config.toml`
+  freely; it can neither re-sign it nor repoint the anchor. `gitvault install`
+  performs the one privileged step: it transfers the anchor to `root:wheel`
+  and sets the system-immutable flag on the binaries and the hooks directory,
+  which resists the same owner without changing how the kernel launches them
+  (a user-built binary chowned to root is refused by AppleSystemPolicy).
+- **Reads stay free, writes are a ceremony.** Every `Config::load` verifies
+  the signature when enforcement is armed and fails closed on a missing or
+  invalid sidecar. `gitvault config verify` reports the state for an operator.
+- **Honest residual.** This does not change the keychain note above: a
+  determined same-user process can read the vault key silently and could, in
+  principle, decrypt the vault, extract the signing key, and forge a
+  signature. The attestation removes casual and accidental mutation and makes
+  tampering require a purpose-built attack rather than a text edit; it is not
+  a Secure-Enclave-grade boundary. `gitvault config keygen` inside an open
+  unlock window is, like every other gated operation, silent — the window is
+  the unit of human confirmation.

@@ -58,7 +58,7 @@ fn fixture(checker: &str) -> Fixture {
     std::fs::write(
         &hook,
         format!(
-            "#!/bin/sh\nexec '{}' --config '{}' hook prepare-commit-msg\n",
+            "#!/bin/sh\nGITVAULT_UNSIGNED_OK=1 exec '{}' --config '{}' hook prepare-commit-msg\n",
             env!("CARGO_BIN_EXE_gitvault"),
             root.join("config.toml").display()
         ),
@@ -117,6 +117,7 @@ fn pull_request_event_runs_registered_checkers() {
     );
     std::fs::write(root.join("config.toml"), cfg).unwrap();
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_gitvault"))
+        .env("GITVAULT_UNSIGNED_OK", "1")
         .args([
             "--config",
             root.join("config.toml").to_str().unwrap(),
@@ -180,6 +181,7 @@ fn release_event_runs_registered_checkers_with_the_tag() {
     let root = fixture.0.clone();
     let marker = root.join("ran");
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_gitvault"))
+        .env("GITVAULT_UNSIGNED_OK", "1")
         .args([
             "--config", root.join("config.toml").to_str().unwrap(),
             "check", "--event", "release", "--tag", "v1.0.0", "--directory", root.to_str().unwrap(),
@@ -198,6 +200,7 @@ fn release_create_is_refused_before_any_credential_is_touched() {
     let fixture = publication_fixture("'release'", true);
     let root = fixture.0.clone();
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_gitvault"))
+        .env("GITVAULT_UNSIGNED_OK", "1")
         .args([
             "--config", root.join("config.toml").to_str().unwrap(),
             "release", "create", "v1.0.0", "--repo", "Owner/Name",
@@ -219,6 +222,7 @@ fn merge_is_refused_before_the_api_call() {
     let fixture = publication_fixture("'pr'", true);
     let root = fixture.0.clone();
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_gitvault"))
+        .env("GITVAULT_UNSIGNED_OK", "1")
         .args([
             "--config", root.join("config.toml").to_str().unwrap(),
             "pr", "merge", "7", "--repo", "Owner/Name",
@@ -241,6 +245,7 @@ fn a_run_is_recorded_without_this_machines_paths() {
     let fixture = publication_fixture("'pr'", false);
     let root = fixture.0.clone();
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_gitvault"))
+        .env("GITVAULT_UNSIGNED_OK", "1")
         .args([
             "--config", root.join("config.toml").to_str().unwrap(),
             "check", "--event", "pr", "--directory", root.to_str().unwrap(),
@@ -261,6 +266,7 @@ fn a_run_is_recorded_without_this_machines_paths() {
 
     // `records` reads the same store without opening the vault or the network.
     let listed = std::process::Command::new(env!("CARGO_BIN_EXE_gitvault"))
+        .env("GITVAULT_UNSIGNED_OK", "1")
         .args([
             "--config", root.join("config.toml").to_str().unwrap(),
             "records", "list", "--json",

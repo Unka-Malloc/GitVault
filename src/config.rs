@@ -222,6 +222,9 @@ impl Config {
         config_dir().join("config.toml")
     }
 
+    /// The gate every operational surface funnels through: once `config.pub`
+    /// is root-owned, the file is attested or refused - a routing table anyone
+    /// can silently rewrite is no table at all.
     pub fn load(explicit: Option<&PathBuf>) -> Result<Self> {
         let path = match explicit {
             Some(p) => p.clone(),
@@ -233,7 +236,14 @@ impl Config {
                 path.display()
             );
         }
-        let raw = std::fs::read_to_string(&path)
+        crate::configsig::verify(&path)?;
+        Self::load_path(&path)
+    }
+
+    /// Parse and validate a file without consulting the signature anchor. The
+    /// parser's own tests exercise this; every command path must use `load`.
+    fn load_path(path: &Path) -> Result<Self> {
+        let raw = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read {}", path.display()))?;
         let cfg: Config = toml::from_str(&raw)
             .with_context(|| format!("invalid configuration in {}", path.display()))?;
@@ -342,7 +352,7 @@ command = ["/bin/true"]
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         std::fs::write(&path, s).unwrap();
-        let loaded = Config::load(Some(&path));
+        let loaded = Config::load_path(&path);
         let _ = std::fs::remove_dir_all(&dir);
         loaded
     }

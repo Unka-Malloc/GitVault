@@ -422,6 +422,9 @@ mod tests {
         });
     }
 
+    // GITVAULT_TOUCHID is a debug-only hook; in a release build the helper path
+    // is fixed, so pointing the variable at a missing file asserts nothing.
+    #[cfg(debug_assertions)]
     #[test]
     fn a_missing_biometric_helper_is_a_failure_not_a_pass() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

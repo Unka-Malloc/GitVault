@@ -23,7 +23,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use chacha20poly1305::aead::{Aead, KeyInit};
-use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use serde::{Deserialize, Serialize};
 
 const MAGIC: &[u8; 8] = b"GITVLT01";
@@ -124,11 +124,20 @@ pub struct Store {
     /// account name -> held material
     #[serde(default)]
     pub accounts: BTreeMap<String, Entry>,
+    /// OpenSSH private key that signs the configuration file. Blessing a routing
+    /// change must cost the same human confirmation as releasing a credential,
+    /// so the key lives here rather than on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_key: Option<String>,
 }
 
 impl Store {
     pub fn get(&self, account: &str) -> Option<&str> {
         self.accounts.get(account).and_then(|e| e.token.as_deref())
+    }
+
+    pub fn set_config_key(&mut self, key: &str) {
+        self.config_key = Some(key.to_string());
     }
 
     pub fn entry(&self, account: &str) -> Option<&Entry> {
@@ -273,6 +282,22 @@ impl Vault {
             })
     }
 
+    /// The configuration signing key, or an error naming the fix.
+    pub fn config_key(&self) -> Result<String> {
+        self.load()?.config_key.clone().ok_or_else(|| {
+            anyhow!(
+                "no configuration signing key held\n  run: gitvault config keygen"
+            )
+        })
+    }
+
+    /// Store (or rotate) the configuration signing key.
+    pub fn set_config_key(&self, key: &str) -> Result<()> {
+        let mut store = self.load()?;
+        store.set_config_key(key);
+        self.save(&store)
+    }
+
     /// The token for an account, or an error naming the fix.
     ///
     /// Callers inside this crate use it to perform an operation. It is
@@ -300,10 +325,14 @@ impl Vault {
         if &blob[..MAGIC.len()] != MAGIC {
             bail!("vault file has an unrecognised format: {}", self.path.display());
         }
-        let nonce = Nonce::from_slice(&blob[MAGIC.len()..MAGIC.len() + NONCE_LEN]);
+        let nonce: &Nonce = blob[MAGIC.len()..MAGIC.len() + NONCE_LEN]
+            .try_into()
+            .expect("a NONCE_LEN window is NONCE_LEN bytes");
         let ciphertext = &blob[MAGIC.len() + NONCE_LEN..];
         let key = self.encryption_key()?;
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let cipher = ChaCha20Poly1305::new(
+            (&key[..]).try_into().expect("a vault key is KEY_LEN bytes"),
+        );
         let plain = cipher
             .decrypt(nonce, ciphertext)
             .map_err(|_| anyhow!("vault could not be decrypted (wrong key or corrupted file)"))?;
@@ -324,12 +353,14 @@ impl Vault {
     pub fn save(&self, store: &Store) -> Result<()> {
         let key = self.encryption_key_or_create()?;
         let plain = serde_json::to_vec(store)?;
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key));
+        let cipher = ChaCha20Poly1305::new(
+            (&key[..]).try_into().expect("a vault key is KEY_LEN bytes"),
+        );
         // A fresh random nonce per write. ChaCha20-Poly1305 requires nonce
         // uniqueness under a given key, and the key is long-lived, so it is
         // generated here rather than derived.
         let nonce_bytes: [u8; NONCE_LEN] = rand::random();
-        let nonce = Nonce::from_slice(&nonce_bytes);
+        let nonce: &Nonce = (&nonce_bytes[..]).try_into().expect("NONCE_LEN bytes");
         let ciphertext = cipher
             .encrypt(nonce, plain.as_slice())
             .map_err(|_| anyhow!("vault encryption failed"))?;
