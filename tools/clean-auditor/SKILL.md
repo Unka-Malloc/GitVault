@@ -15,12 +15,14 @@ modifies anything.
 
 A refusal is a verdict, not an obstacle:
 
-- **deterministic refusal** (stage one): a shape it can prove — a credential,
-  a machine path, an internal address, a structural policy violation. The scan
-  runs locally, prints category counts and never prints the matched value.
-- **semantic refusal** (stage two): the six domains and the two standing items —
-  tooling hygiene and hardcoded parameters — judged by an isolated Pi
-  conversation with a fresh context each run.
+- **deterministic refusal** (stage one): a credential shape or a withheld
+  name, either of which may hide behind a credential-container path. The
+  scan runs locally, prints category counts and never prints the matched
+  value.
+- **semantic refusal** (stage two): the six domains and the two standing
+  items — tooling hygiene and hardcoded parameters, including machine
+  paths and internal addresses — judged by an isolated Pi conversation
+  with a fresh context each run.
 
 Repair the change (remove or generalize the content), then publish again. Do
 not re-word the finding away and do not add a skip: the checker reads no

@@ -151,7 +151,7 @@ def install_payload(source, target, agent, payload, skill_docs):
         destination.symlink_to(shared / name)
 
 
-def install(source, agent, payload, events, banner, title, skill_docs):
+def install(source, agent, payload, events, banner, skill_docs):
     home = Path.home()
     pi = shutil.which("pi")
     python = shutil.which("python3")
@@ -250,4 +250,4 @@ def main(source, agent, payload, events, banner, title, skill_docs=("SKILL.md", 
     elif sys.argv[1:]:
         raise SystemExit("Usage: install.py [--update | --pull [TAG]]")
     else:
-        install(source, agent, payload, events, banner, title, skill_docs)
+        install(source, agent, payload, events, banner, skill_docs)

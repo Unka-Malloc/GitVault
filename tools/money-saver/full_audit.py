@@ -5,6 +5,10 @@ import json
 from pathlib import Path
 import re
 
+import audit_engine
+
+LIST_PAGE = 200  # paths per `list` reply
+
 
 def make_review(base_class, run_dir, domains):
     class FullReview(base_class):
@@ -50,8 +54,8 @@ def make_review(base_class, run_dir, domains):
             if operation == "list":
                 paths = [p for p in [*self.files, *self.aliases] if fnmatch.fnmatchcase(p, args.get("pattern", "*"))]
                 offset = max(0, int(args.get("offset", 0)))
-                return {"paths": paths[offset:offset+200], "total": len(paths),
-                        "next_offset": offset+200 if offset+200 < len(paths) else None}
+                return {"paths": paths[offset:offset+LIST_PAGE], "total": len(paths),
+                        "next_offset": offset+LIST_PAGE if offset+LIST_PAGE < len(paths) else None}
             if operation == "read":
                 path = args["path"]
                 actual = self.aliases.get(path, path)
@@ -59,7 +63,7 @@ def make_review(base_class, run_dir, domains):
                     raise ValueError("Path is outside the selected source snapshot")
                 lines = self.files[actual].splitlines()
                 start = max(1, int(args.get("start", 1)))
-                end = min(len(lines), start+399)
+                end = min(len(lines), start - 1 + audit_engine.READ_PAGE_LINES)
                 self.reads.add(path)
                 self.event("read", path)
                 return {"source_reused_from":actual if actual != path else None, "total_lines":len(lines), "content":"\n".join(f"{i+1}: {lines[i]}" for i in range(start-1, end)),
@@ -85,8 +89,8 @@ def make_review(base_class, run_dir, domains):
                         if any(n.lower() in line.lower() for n in needles):
                             matches.append(f"{path}:{i}: {line}")
                 offset = max(0, int(args.get("offset", 0)))
-                return {"matches":matches[offset:offset+100], "total":len(matches),
-                        "next_offset":offset+100 if offset+100 < len(matches) else None}
+                return {"matches":matches[offset:offset+audit_engine.FIND_PAGE], "total":len(matches),
+                        "next_offset":offset+audit_engine.FIND_PAGE if offset+audit_engine.FIND_PAGE < len(matches) else None}
             raise ValueError("Full audits use inventory/original_request/list/read/find")
 
         def document(self, args):

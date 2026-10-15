@@ -1075,6 +1075,8 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
             "#!/bin/sh\n# git needs gpg.ssh.program to be one executable path.\nexec \"$HOME/.local/bin/gitvault\" sign \"$@\"\n",
         )?;
     }
+    std::fs::set_permissions(&sign_wrapper, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("cannot make {} executable", sign_wrapper.display()))?;
     // The touchid helper is a Mach-O too: if an earlier run left it poisoned,
     // a rewrite onto a fresh inode cures it the same way.
     if touchid.exists() {
@@ -1116,6 +1118,11 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
              exit 0\n",
         )?;
     }
+    // Scripts land mode 0644 from fs::write; a hook git cannot execute is a
+    // gate that silently does not run, so the executable bit is enforced on
+    // every install, not only on first write.
+    std::fs::set_permissions(&dispatch, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("cannot make {} executable", dispatch.display()))?;
     for event in [
         "pre-commit",
         "pre-push",
@@ -1130,6 +1137,8 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
                 format!("#!/usr/bin/env bash\nexec \"$HOME/.git-hooks/_dispatch\" {event} \"$@\"\n"),
             )?;
         }
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("cannot make {} executable", stub.display()))?;
     }
 
     // 3. Immobilise the enforcement surface. Two mechanisms, chosen by what the

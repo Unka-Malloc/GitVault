@@ -122,8 +122,9 @@ def review_existing(output, settings):
     ms.write_json(output / "status.json", {"state":"running", "projects":list(data["projects"]), "files":len(data["files"])})
     try:
         usage, duration_ms = ms.pi_review(output, settings, runtime)
-    except ValueError:
+    except ValueError as exc:
         ms.write_json(output / "status.json", {"state":"failed", "report_exists":(output / "report.json").exists()})
+        print("Money Saver full audit failed: " + ms.sanitize(str(exc)), file=sys.stderr)
         return 1
     report_file = output / "report.json"
     report = json.loads(report_file.read_text())

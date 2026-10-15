@@ -114,7 +114,13 @@ exists — review `.githooks/` after cloning as you would `Makefile` or CI
 scripts.
 
 `git push --no-verify` bypasses the git `pre-push` hook — git offers no counter
-to it, so the push hook alone is a convenience. The boundaries that cannot be
+to it, so the push hook alone is a convenience. Two environment variables on
+the hook chain are bypasses of the same class and are listed here so the list
+is complete: `GITVAULT_BIN` substitutes the dispatcher's gateway binary, and
+`GIT_IDENTITY_GUARD_CHAINED=1` skips the gateway call entirely (it exists as
+the chain's own recursion guard). Neither reaches `pr`/`release`, whose
+checker runs happen inside the `gitvault` process before any credential is
+unlocked. The boundaries that cannot be
 bypassed are the ones GitVault controls: `pr create`, `pr merge` and
 `release create` run the checker registry before any credential is unlocked
 and refuse without contacting GitHub.

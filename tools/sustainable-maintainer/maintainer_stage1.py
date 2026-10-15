@@ -112,8 +112,8 @@ def audit(repo, target):
             hits.append({"path": path, "line": line, "rule": "conflict-marker"})
     return {
         "label": target["label"], "scope": target["scope"], "fallback": target["fallback"],
-        "status": "refused" if hits else "clear",
-        "findings": [f"stage1 hygiene: {hit['rule']} at {hit['path']}" for hit in hits],
+        "status": "refused" if hits else "clean",
+        "findings": len(hits),
         "hits": hits,
         "refused": hits[0]["rule"] if hits else "",
     }
