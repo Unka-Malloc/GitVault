@@ -20,6 +20,12 @@ import tomllib
 
 import profile_sync
 
+# The two well-known roots every checker lives under. Named once so the
+# layout cannot drift across the functions that build paths beneath them.
+PROFILE_ROOT = Path.home() / ".hermes" / "profiles"
+SKILL_ROOT = Path.home() / ".agents" / "skills"
+CREDENTIAL_FILE = Path.home() / ".hermes" / ".env"
+
 
 def register(config_file, name, block):
     """Add this checker's registry entry, or replace it in place.
@@ -66,7 +72,7 @@ def _synced(target):
 
 
 def _installation(agent):
-    target = Path.home() / f".hermes/profiles/{agent}/plugins/{agent}"
+    target = PROFILE_ROOT / agent / "plugins" / agent
     settings = target / "installation.json"
     if not settings.is_file():
         raise SystemExit(f"{agent} is not installed")
@@ -82,7 +88,7 @@ def install_payload(source, target, agent, payload, skill_docs):
     audit_engine contract.
     """
     home = Path.home()
-    shared = home / f".agents/skills/{agent}"
+    shared = SKILL_ROOT / agent
     shared.mkdir(parents=True, exist_ok=True)
     # Documents are the profile registry's to publish: this repository's
     # copies are the seed for a machine that has never pulled. Once a version
@@ -91,7 +97,7 @@ def install_payload(source, target, agent, payload, skill_docs):
         for name in skill_docs:
             shutil.copyfile(source / name, shared / name)
     for directory in [*home.glob(".*/skills"), *home.glob(".config/*/skills"),
-                      *home.glob(".hermes/profiles/*/skills")]:
+                      *PROFILE_ROOT.glob("*/skills")]:
         if not directory.is_dir() or directory.resolve() == shared.parent.resolve():
             continue
         link = directory / agent
@@ -126,7 +132,7 @@ def install(source, agent, payload, events, banner, title, skill_docs):
     python = shutil.which("python3")
     if not pi or not python:
         raise SystemExit("Pi and Python 3.11+ are required")
-    profile = home / f".hermes/profiles/{agent}"
+    profile = PROFILE_ROOT / agent
     target = profile / "plugins" / agent
     config_file = home / ".config/gitvault/config.toml"
     if not profile.exists():
@@ -144,8 +150,8 @@ def install(source, agent, payload, events, banner, title, skill_docs):
     (profile / "config.yaml").chmod(0o600)
     previous = json.loads((target / "installation.json").read_text()) if (target / "installation.json").is_file() else {}
     settings = {"pi": pi, "python": python, "profile": str(profile),
-                "credential_file": str(home / ".hermes/.env"),
-                "skill_dir": str(home / f".agents/skills/{agent}")}
+                "credential_file": str(CREDENTIAL_FILE),
+                "skill_dir": str(SKILL_ROOT / agent)}
     # Installing again does not un-sync anything: the profile the registry
     # published is still what this machine runs on.
     if previous.get("synced"):
@@ -164,7 +170,7 @@ def install(source, agent, payload, events, banner, title, skill_docs):
 
 def pull(agent):
     settings_path, settings = _installation(agent)
-    skill_dir = settings.get("skill_dir") or str(Path.home() / f".agents/skills/{agent}")
+    skill_dir = settings.get("skill_dir") or str(SKILL_ROOT / agent)
     result = profile_sync.pull(
         agent, skill_dir,
         os.environ.get("GITVAULT_PROFILES_URL", profile_sync.DEFAULT_URL),
@@ -180,7 +186,7 @@ def pull(agent):
 
 
 def update(source, agent, payload, title, skill_docs):
-    target = Path.home() / f".hermes/profiles/{agent}/plugins/{agent}"
+    target = PROFILE_ROOT / agent / "plugins" / agent
     if not (target / "installation.json").is_file():
         raise SystemExit(f"{title} is not installed")
     install_payload(source, target, agent, payload, skill_docs)

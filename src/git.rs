@@ -17,6 +17,11 @@ use anyhow::{Context, Result, bail};
 pub struct Repo {
     pub root: PathBuf,
     remote: Option<String>,
+    /// Whether this handle may state an identity expectation through
+    /// `.gitvault-identity`. Only a real working tree can carry the file; a
+    /// handle built from a slug names a different repository than the checkout
+    /// in front of us, so it must not inherit this directory's assertion.
+    pub assertion_allowed: bool,
 }
 
 impl Repo {
@@ -32,7 +37,11 @@ impl Repo {
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
-        Ok(Self { root, remote })
+        Ok(Self {
+            root,
+            remote,
+            assertion_allowed: true,
+        })
     }
 
     /// Build a Repo handle for a known `Owner/Name` slug, without a checkout.
@@ -44,6 +53,7 @@ impl Repo {
         Self {
             root: PathBuf::from("."),
             remote: Some(format!("git@github.com:{slug}.git")),
+            assertion_allowed: false,
         }
     }
 
@@ -53,6 +63,7 @@ impl Repo {
         Self {
             root: PathBuf::from(root),
             remote: remote.map(str::to_string),
+            assertion_allowed: true,
         }
     }
 
@@ -167,6 +178,7 @@ mod tests {
         Repo {
             root: PathBuf::from("/tmp/x"),
             remote: Some(remote.to_string()),
+            assertion_allowed: true,
         }
     }
 

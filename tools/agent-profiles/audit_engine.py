@@ -137,6 +137,36 @@ def declared_runtime(settings):
     return runtime
 
 
+_COVERAGE_ENTRY = {"type": "object", "properties": {
+    "status": {"type": "string", "enum": ["reviewed", "not-applicable", "unknown"]},
+    "reason": {"type": "string"}},
+    "required": ["status", "reason"], "additionalProperties": False}
+
+
+def coverage_schema(domains):
+    """The coverage object every submit contract carries: one literal,
+    generated per domain set, so four tool manifests cannot drift apart."""
+    return {"type": "object",
+            "properties": {name: _COVERAGE_ENTRY for name in domains},
+            "required": list(domains), "additionalProperties": False}
+
+
+def finding_schema(keys, extra_properties=None):
+    """The findings-entry contract, generated from the same key list the
+    validator enforces (``Review.finding_keys``) so the tool manifest and the
+    check cannot tell the model different contracts. ``extra_properties``
+    adds a checker's genuinely extra keys (e.g. a sources list) without
+    duplicating the shared ones."""
+    properties = {
+        key: ({"type": "integer", "minimum": 1} if key == "line" else {"type": "string"})
+        for key in keys}
+    properties["severity"] = {"type": "string", "enum": ["blocking", "advisory"]}
+    if extra_properties:
+        properties.update(extra_properties)
+    return {"type": "object", "properties": properties,
+            "required": list(keys), "additionalProperties": False}
+
+
 def credential(path, name):
     # Read only the named credential; never clone an entire personal .env.
     for line in Path(path).read_text().splitlines():
@@ -602,3 +632,22 @@ def main(spec):
         message = sanitize(str(exc)) if isinstance(exc, ValueError) else "Audit unavailable or interrupted; publication refused"
         print(f"{spec.label}: {message}", file=sys.stderr)
         return 1
+
+
+def bind(ns, spec):
+    """Install the standard checker entry points onto a checker module.
+
+    The public surface — ``audited``, ``pi_review``, ``review_range``, ``run``,
+    ``serve_tools``, ``main`` — is identical for every checker; generating it
+    from the SPEC keeps four modules from drifting into four copies of the
+    same forwarding block."""
+    ns["audited"] = lambda settings, base, head, runtime: \
+        audited(settings, base, head, runtime, spec)
+    ns["pi_review"] = lambda run_dir, settings, runtime, spawn=subprocess.run: \
+        pi_review(run_dir, settings, runtime, spec, spawn)
+    ns["review_range"] = lambda repo, settings, target, summary, stage_summaries, runtime, spawn=subprocess.run: \
+        review_range(repo, settings, target, summary, stage_summaries, runtime, spec, spawn)
+    ns["run"] = lambda repo, settings, spawn=subprocess.run: \
+        run(repo, settings, spec, spawn)
+    ns["serve_tools"] = lambda run_dir: serve_tools(run_dir, spec)
+    ns["main"] = lambda: main(spec)

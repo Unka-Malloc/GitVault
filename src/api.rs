@@ -78,7 +78,10 @@ fn authorize(cfg: &Config, target: &Target, vault: &Vault) -> Result<String> {
     let (account, token) = match target {
         Target::Repo(slug) => {
             let repo = Repo::for_slug(slug);
-            let outcome = identity::resolve(cfg, &repo, false)?;
+            // Credentials follow the operator's rules, never repository content:
+            // a `.gitvault-identity` file must not be able to pick which
+            // account's token is used, so the assertion is not consulted here.
+            let outcome = identity::resolve(cfg, &repo, true)?;
             let account = outcome
                 .account
                 .clone()
@@ -91,7 +94,7 @@ fn authorize(cfg: &Config, target: &Target, vault: &Vault) -> Result<String> {
                 bail!(
                     "refusing to act: no explicit rule for owner '{:?}'\n  \
                      resolved account : {account}\n  \
-                     add a rules.owners entry, or a .gitvault-identity assertion",
+                     add a rules.owners or rules.paths entry for this repository",
                     repo.owner().unwrap_or_default()
                 );
             }

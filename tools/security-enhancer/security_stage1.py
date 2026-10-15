@@ -208,8 +208,12 @@ SURFACE_LINE_RULES = [
     ("surface/dependency-url-source", lambda p: PurePosixPath(p).name.startswith("requirements")
      and p.endswith(".txt"),
      re.compile(r"^\s*(?:-e\s+)?(?:git\+|https?://)\S")),
+    # Only a git dependency is a URL source; a `path =` entry is a local
+    # directory, and flagging it invents a supply-chain surface that is not
+    # there. Both the table form (`git = "…"`) and the inline form
+    # (`dep = { git = "…" }`) count.
     ("surface/dependency-url-source", lambda p: PurePosixPath(p).name == "Cargo.toml",
-     re.compile(r"^\s*(?:git|path)\s*=")),
+     re.compile(r"(?:^|[\{\s])git\s*=\s*[\"']")),
     ("surface/dependency-url-source", lambda p: PurePosixPath(p).name == "go.mod",
      re.compile(r"^\s*replace\s+\S+\s+=>\s+\S*(?:\.\./|https?://|git@)")),
     ("surface/install-hook-added", lambda p: PurePosixPath(p).name == "package.json",

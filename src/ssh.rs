@@ -119,7 +119,10 @@ pub fn run(cfg: &Config, vault: &Vault, args: &[String]) -> Result<i32> {
     })?;
 
     let repo = Repo::for_slug(&slug);
-    let outcome = identity::resolve(cfg, &repo, false)?;
+    // Credentials follow the operator's rules, never repository content: an
+    // assertion file must not pick which account's key is used, so it is not
+    // consulted here.
+    let outcome = identity::resolve(cfg, &repo, true)?;
     let account = outcome
         .account
         .clone()

@@ -138,7 +138,10 @@ pub fn run(cfg: &Config, vault: &Vault, args: &[String], cwd: &PathBuf) -> Resul
     // policy to apply, and signing anyway would be signing as whoever happens to be
     // configured.
     let repo = Repo::discover(cwd)?;
-    let outcome = identity::resolve(cfg, &repo, false)?;
+    // Credentials follow the operator's rules, never repository content: an
+    // assertion file must not pick which account's signing key is used, so it
+    // is not consulted here.
+    let outcome = identity::resolve(cfg, &repo, true)?;
     let account = outcome
         .account
         .clone()

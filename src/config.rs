@@ -186,19 +186,28 @@ pub struct Config {
     pub record_dir: Option<PathBuf>,
 }
 
+/// The single authority for GitVault's configuration directory:
+/// `$XDG_CONFIG_HOME/gitvault` when set, `~/.config/gitvault` otherwise.
+/// Everything under it — config.toml, vault.enc, the unlock window record —
+/// derives from this one root so the on-disk layout cannot split across two
+/// conventions.
+pub fn config_dir() -> PathBuf {
+    std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            Path::new(&home).join(".config")
+        })
+        .join("gitvault")
+}
+
 impl Config {
     /// Default location, overridable by `--config` / `GITVAULT_CONFIG`.
     pub fn default_path() -> PathBuf {
         if let Ok(explicit) = std::env::var("GITVAULT_CONFIG") {
             return PathBuf::from(explicit);
         }
-        let base = std::env::var("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-                Path::new(&home).join(".config")
-            });
-        base.join("gitvault").join("config.toml")
+        config_dir().join("config.toml")
     }
 
     pub fn load(explicit: Option<&PathBuf>) -> Result<Self> {

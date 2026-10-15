@@ -27,7 +27,10 @@ removes:
 
 1. `.gitvault-identity` in the repository root - an **assertion**, not a
    selector. It cannot grant an identity the owner rules do not allow; a
-   mismatch is reported and the command exits non-zero.
+   mismatch is reported and the command exits non-zero. Because it is
+   repository content, every credential-issuing path (API, SSH, signing)
+   resolves with the assertion ignored - untrusted files never pick which
+   account's credentials are used.
 2. `rules.owners` matched against the **origin remote's owner**. Preferred over
    paths because it survives cloning elsewhere.
 3. `rules.paths` for repositories with no remote yet.

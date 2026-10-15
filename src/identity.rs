@@ -8,10 +8,11 @@
 //!   5. `rules.default`
 //!
 //! **The assertion is a contract, not a selector.** If `.gitvault-identity`
-//! names an identity, that identity is used - and the *remote owner rule is then
-//! still evaluated*, so a mismatch is reported rather than silently accepted.
-//! A repository can declare what it expects; it cannot grant itself an identity
-//! that the owner rules do not allow.
+//! disagrees with the remote owner rule, the rule wins and the mismatch is
+//! reported rather than honoured. A repository can declare what it expects; it
+//! cannot grant itself an identity the owner rules do not allow - which is why
+//! credential-issuing paths resolve with `ignore_assertion = true`, so untrusted
+//! repository content can never pick which account's credentials are used.
 
 use anyhow::{Result, bail};
 use serde_json::json;
@@ -58,6 +59,9 @@ impl Outcome {
 /// Read the repository's assertion file. A malformed or unknown assertion is a
 /// hard error: failing open here would defeat the purpose of having it.
 fn read_assertion(repo: &Repo, cfg: &Config) -> Result<Option<String>> {
+    if !repo.assertion_allowed {
+        return Ok(None);
+    }
     let path = repo.root.join(ASSERTION_FILE);
     if !path.exists() {
         return Ok(None);
@@ -102,13 +106,21 @@ pub fn resolve(cfg: &Config, repo: &Repo, ignore_assertion: bool) -> Result<Outc
         .cloned();
 
     let (chosen, reason, conflict, via_default) = if let Some(a) = assertion.clone() {
-        let conflict = match (&owner_rule, owner.as_deref()) {
-            (Some(rule), Some(o)) if rule != &a => Some(format!(
-                "{ASSERTION_FILE} asserts '{a}' but rules.owners maps '{o}' to '{rule}'"
-            )),
-            _ => None,
-        };
-        (a, format!("{ASSERTION_FILE} assertion"), conflict, false)
+        match (&owner_rule, owner.as_deref()) {
+            // The assertion is a contract, not a selector: a rule that disagrees
+            // wins the identity, and the mismatch is reported rather than
+            // honoured. Otherwise an untrusted file could grant this repository
+            // an identity the rules did not allow.
+            (Some(rule), Some(o)) if rule != &a => (
+                rule.clone(),
+                format!("rules.owners['{o}']"),
+                Some(format!(
+                    "{ASSERTION_FILE} asserts '{a}' but rules.owners maps '{o}' to '{rule}'"
+                )),
+                false,
+            ),
+            _ => (a, format!("{ASSERTION_FILE} assertion"), None, false),
+        }
     } else if let Some(rule) = owner_rule.clone() {
         (
             rule,
@@ -155,4 +167,127 @@ pub fn resolve(cfg: &Config, repo: &Repo, ignore_assertion: bool) -> Result<Outc
         conflict,
         assertion,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, Identity, PathRule, Rules};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    fn identity(name: &str) -> Identity {
+        Identity {
+            name: name.to_string(),
+            email: format!("{name}@example.test"),
+            account: Some(name.to_string()),
+            ssh_key: None,
+            signing_key: None,
+        }
+    }
+
+    fn cfg(owners: &[(&str, &str)], default: Option<&str>) -> Config {
+        Config {
+            identities: ["personal", "acme"]
+                .into_iter()
+                .map(|k| (k.to_string(), identity(k)))
+                .collect::<BTreeMap<_, _>>(),
+            rules: Rules {
+                owners: owners
+                    .iter()
+                    .map(|(o, i)| (o.to_string(), i.to_string()))
+                    .collect(),
+                paths: Vec::<PathRule>::new(),
+                default: default.map(str::to_string),
+            },
+            checkers: Vec::new(),
+            record_dir: None,
+        }
+    }
+
+    /// A working tree carrying a `.gitvault-identity` file.
+    struct AssertingTree {
+        root: PathBuf,
+    }
+
+    impl AssertingTree {
+        fn new(tag: &str, assertion: &str) -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("gv-identity-{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join(ASSERTION_FILE), format!("{assertion}\n")).unwrap();
+            Self { root }
+        }
+
+        fn repo(&self, remote: &str) -> Repo {
+            Repo::for_test(self.root.to_str().unwrap(), Some(remote))
+        }
+    }
+
+    impl Drop for AssertingTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn conflicting_assertion_loses_to_owner_rule() {
+        let tree = AssertingTree::new("conflict", "acme");
+        let repo = tree.repo("git@github.com:acme-org/repo.git");
+        let cfg = cfg(&[("acme-org", "personal")], None);
+        let outcome = resolve(&cfg, &repo, false).unwrap();
+        // The rule wins; the mismatch is reported, not honoured.
+        assert_eq!(outcome.identity, "personal");
+        assert!(outcome.conflict.is_some());
+        assert!(!outcome.via_default);
+        assert_eq!(outcome.assertion.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn consistent_assertion_is_honoured() {
+        let tree = AssertingTree::new("agree", "personal");
+        let repo = tree.repo("git@github.com:acme-org/repo.git");
+        let cfg = cfg(&[("acme-org", "personal")], None);
+        let outcome = resolve(&cfg, &repo, false).unwrap();
+        assert_eq!(outcome.identity, "personal");
+        assert!(outcome.conflict.is_none());
+    }
+
+    #[test]
+    fn assertion_cannot_route_credentials() {
+        let tree = AssertingTree::new("unrouted", "personal");
+        let repo = tree.repo("git@github.com:nobody/repo.git");
+        let cfg = cfg(&[], None);
+        // The check path may read the assertion as the declared expectation...
+        let outcome = resolve(&cfg, &repo, false).unwrap();
+        assert_eq!(outcome.identity, "personal");
+        // ...but a credential path resolves without it, and then there is no
+        // rule at all - which must fail rather than hand out an identity.
+        assert!(resolve(&cfg, &repo, true).is_err());
+    }
+
+    #[test]
+    fn slug_handles_carry_no_assertion() {
+        // `gitvault api --repo other/name` must never read this checkout's
+        // assertion file against a different repository.
+        let repo = Repo::for_slug("other/name");
+        assert!(!repo.assertion_allowed);
+        let cfg = cfg(&[("other", "acme")], None);
+        let outcome = resolve(&cfg, &repo, false).unwrap();
+        assert!(outcome.assertion.is_none());
+        assert_eq!(outcome.identity, "acme");
+    }
+
+    #[test]
+    fn unrouted_repository_falls_back_as_default() {
+        let tree = AssertingTree::new("default", "unknown-identity");
+        let repo = tree.repo("git@github.com:nobody/repo.git");
+        let cfg = cfg(&[], Some("personal"));
+        // The assertion names an unknown identity: a hard error even though a
+        // default exists, because failing open would defeat the file's purpose.
+        assert!(resolve(&cfg, &repo, false).is_err());
+        let outcome = resolve(&cfg, &repo, true).unwrap();
+        assert!(outcome.via_default);
+        assert_eq!(outcome.identity, "personal");
+    }
 }

@@ -16,7 +16,6 @@ import datetime as dt
 from html.parser import HTMLParser
 import json
 from pathlib import Path
-import subprocess
 import sys
 from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -147,18 +146,9 @@ def _review_for(run_dir):
 def tool_plan(review):
     """The checker's tool surface as data: the same list feeds the Pi
     extension manifest and the `--serve-tools` dispatch table."""
-    coverage_schema = {"type":"object", "properties":{
-        "status":{"type":"string", "enum":["reviewed","not-applicable","unknown"]},
-        "reason":{"type":"string"}}, "required":["status","reason"], "additionalProperties":False}
-    finding_keys = ["file","line","severity","evidence","impact","before_after","remedy","validation","sources"]
-    finding_schema = {"type":"object", "properties":{
-        **{key:{"type":"string"} for key in finding_keys if key not in {"line","severity","sources"}},
-        "title":{"type":"string"}, "line":{"type":"integer", "minimum":1},
-        "severity":{"type":"string", "enum":["blocking","advisory"]},
-        "sources":{"type":"array", "items":{"type":"string", "enum":list(review.catalog.values())}}},
-        "required":finding_keys, "additionalProperties":False}
-    projects_schema = {"type":"object", "properties":{name:coverage_schema for name in getattr(review,"projects",{})},
-                       "required":list(getattr(review,"projects",{})), "additionalProperties":False}
+    finding_schema = engine.finding_schema(Review.finding_keys, {
+        "title": {"type": "string"},
+        "sources": {"type": "array", "items": {"type": "string", "enum": list(review.catalog.values())}}})
     return [
         ("money_context", "Inspect immutable source. Start with inventory for review mode and scope. Commit mode requires every changed diff; full mode requires original_request and per-project coverage. read is 400 lines with start; find/list use pattern glob and offset pagination. Full-mode find supports literal alternatives separated by |.",
          {"operation": {"type":"string", "enum":["inventory","original_request","list","diff","read","find"]},
@@ -168,9 +158,9 @@ def tool_plan(review):
          {"name":{"type":"string", "enum":[*review.catalog, *review.catalog.values()]}, "offset":{"type":"integer"}}, ["name"], review.document),
         ("money_submit_review", "Submit the final cost decision once. Follow the Money Saver policy's evidence and coverage contract.",
          {"verdict":{"type":"string", "enum":["pass","block","incomplete"]}, "summary":{"type":"string"},
-          "coverage":{"type":"object", "properties":{name:coverage_schema for name in DOMAINS}, "required":list(DOMAINS), "additionalProperties":False},
+          "coverage": engine.coverage_schema(DOMAINS),
           "findings":{"type":"array", "items":finding_schema},
-          "projects":projects_schema,
+          "projects":engine.coverage_schema(getattr(review, "projects", ())),
           "unknowns":{"type":"array", "items":{"type":"string"}}},
          ["verdict","summary","coverage","findings","unknowns"] + (["projects"] if hasattr(review,"projects") else []), review.submit),
     ]
@@ -195,28 +185,7 @@ SPEC = engine.CheckerSpec(
 )
 
 
-def audited(settings, base, head, runtime):
-    return engine.audited(settings, base, head, runtime, SPEC)
-
-
-def pi_review(run_dir, settings, runtime, spawn=subprocess.run):
-    return engine.pi_review(run_dir, settings, runtime, SPEC, spawn)
-
-
-def review_range(repo, settings, target, runtime, spawn=subprocess.run):
-    return engine.review_range(repo, settings, target, None, (), runtime, SPEC, spawn)
-
-
-def run(repo, settings, spawn=subprocess.run):
-    return engine.run(repo, settings, SPEC, spawn)
-
-
-def serve_tools(run_dir):
-    return engine.serve_tools(run_dir, SPEC)
-
-
-def main():
-    return engine.main(SPEC)
+engine.bind(globals(), SPEC)
 
 
 if __name__ == "__main__":

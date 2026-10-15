@@ -20,7 +20,6 @@ contract: its domains, its surface reporting and its tool surface.
 from __future__ import annotations
 
 from pathlib import Path
-import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -70,14 +69,6 @@ class Review(engine.Review):
 def tool_plan(review):
     """The checker's tool surface as data: the same list feeds the Pi
     extension manifest and the `--serve-tools` dispatch table."""
-    coverage_schema = {"type": "object", "properties": {
-        "status": {"type": "string", "enum": ["reviewed", "not-applicable", "unknown"]},
-        "reason": {"type": "string"}}, "required": ["status", "reason"], "additionalProperties": False}
-    finding_keys = ["file", "line", "severity", "evidence", "impact", "remedy", "validation"]
-    finding_schema = {"type": "object", "properties": {
-        **{key: ({"type": "integer", "minimum": 1} if key == "line" else {"type": "string"}) for key in finding_keys},
-        "severity": {"type": "string", "enum": ["blocking", "advisory"]}},
-        "required": finding_keys, "additionalProperties": False}
     return [
         ("security_context",
          "Inspect the immutable outgoing range. Start with inventory (it lists the surfaces the "
@@ -93,9 +84,8 @@ def tool_plan(review):
          "Submit the final hardening verdict once, with all seven domains accounted for.",
          {"verdict": {"type": "string", "enum": ["pass", "block", "incomplete"]},
           "summary": {"type": "string"},
-          "coverage": {"type": "object", "properties": {name: coverage_schema for name in DOMAINS},
-                       "required": list(DOMAINS), "additionalProperties": False},
-          "findings": {"type": "array", "items": finding_schema},
+          "coverage": engine.coverage_schema(DOMAINS),
+          "findings": {"type": "array", "items": engine.finding_schema(Review.finding_keys)},
           "unknowns": {"type": "array", "items": {"type": "string"}}},
          ["verdict", "summary", "coverage", "findings", "unknowns"], review.submit),
     ]
@@ -136,28 +126,7 @@ SPEC = engine.CheckerSpec(
 )
 
 
-def audited(settings, base, head, runtime):
-    return engine.audited(settings, base, head, runtime, SPEC)
-
-
-def pi_review(run_dir, settings, runtime, spawn=subprocess.run):
-    return engine.pi_review(run_dir, settings, runtime, SPEC, spawn)
-
-
-def review_range(repo, settings, target, summary, stage_summaries, runtime, spawn=subprocess.run):
-    return engine.review_range(repo, settings, target, summary, stage_summaries, runtime, SPEC, spawn)
-
-
-def run(repo, settings, spawn=subprocess.run):
-    return engine.run(repo, settings, SPEC, spawn)
-
-
-def serve_tools(run_dir):
-    return engine.serve_tools(run_dir, SPEC)
-
-
-def main():
-    return engine.main(SPEC)
+engine.bind(globals(), SPEC)
 
 
 if __name__ == "__main__":

@@ -197,8 +197,7 @@ impl Vault {
         if let Ok(explicit) = std::env::var("GITVAULT_VAULT_PATH") {
             return PathBuf::from(explicit);
         }
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        Path::new(&home).join(".config").join("gitvault").join("vault.enc")
+        crate::config::config_dir().join("vault.enc")
     }
 
     pub fn open() -> Result<Self> {
@@ -345,23 +344,7 @@ impl Vault {
         // chmod ~/.config (owned by the user, shared with every other tool) and
         // it fails outright when the parent is not ours to chmod, as /tmp is not.
         if let Some(parent) = self.path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent)?;
-                // Walk down from the first directory we created.
-                let mut created = Vec::new();
-                let mut cur = Some(parent);
-                while let Some(dir) = cur {
-                    if dir.exists() {
-                        created.push(dir.to_path_buf());
-                        cur = dir.parent();
-                    } else {
-                        break;
-                    }
-                }
-                for dir in created.iter().rev() {
-                    let _ = set_mode(dir, 0o700);
-                }
-            }
+            create_hardened(parent)?;
         }
         // Write via a temp file in the same directory, then rename: a partial
         // write must never be able to destroy every stored credential.
@@ -448,6 +431,35 @@ fn keychain_set(service: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Create `dir` and every missing ancestor, then apply 0700 to only the
+/// directories this call created.
+///
+/// The missing set is collected *before* creation: walking upward from `dir`,
+/// the walk stops at the first ancestor that already exists, so a pre-existing
+/// parent - ~/.config, $HOME, /tmp - is never chmodded. A hardening failure is
+/// reported with the path it failed on, not swallowed: a directory left wider
+/// than 0700 is a real problem, not noise.
+fn create_hardened(dir: &Path) -> Result<()> {
+    if dir.exists() {
+        return Ok(());
+    }
+    let mut missing = Vec::new();
+    let mut cur = Some(dir);
+    while let Some(ancestor) = cur {
+        if ancestor.exists() {
+            break;
+        }
+        missing.push(ancestor.to_path_buf());
+        cur = ancestor.parent();
+    }
+    std::fs::create_dir_all(dir)?;
+    for ancestor in missing.iter().rev() {
+        set_mode(ancestor, 0o700)
+            .map_err(|e| anyhow!("cannot harden {}: {e:#}", ancestor.display()))?;
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -519,5 +531,30 @@ mod tests {
         // Either it fails on the missing key or on decryption; both are errors.
         assert!(v.load().is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardening_touches_only_directories_it_created() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        // base exists first, deliberately left at 0755 like $HOME or ~/.config.
+        let base = std::env::temp_dir().join(format!("gv-harden-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        set_mode(&base, 0o755).unwrap();
+
+        let nested = base.join("a").join("b");
+        create_hardened(&nested).unwrap();
+
+        assert_eq!(mode(&base), 0o755, "a pre-existing ancestor must keep its mode");
+        assert_eq!(mode(&base.join("a")), 0o700);
+        assert_eq!(mode(&nested), 0o700);
+
+        // A second call over the same tree is a no-op, not a re-chmod of base.
+        create_hardened(&nested).unwrap();
+        assert_eq!(mode(&base), 0o755);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

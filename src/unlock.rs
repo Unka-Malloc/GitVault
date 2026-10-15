@@ -54,11 +54,7 @@ pub fn state_path() -> PathBuf {
             return PathBuf::from(explicit);
         }
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    Path::new(&home)
-        .join(".config")
-        .join("gitvault")
-        .join("unlock-until")
+    crate::config::config_dir().join("unlock-until")
 }
 
 /// Seconds since the epoch at which this machine booted.

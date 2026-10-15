@@ -62,8 +62,8 @@ to understand and to modify next year.
 
 Credential containers are deliberately outside your tool surface: `.env`,
 `*.pem`, `*.key`, `*.p12`, `secrets/`, `credentials*`, `.ssh/**`, `*.db` and
-similar are judged by the deterministic stage before you run, and asking for
-them here will be refused. Never try to work around that.
+similar cannot be served to you — the audit engine refuses the request — and
+asking for one is never legitimate. Never try to work around that.
 
 ## The gate and the advice
 

@@ -76,10 +76,13 @@ them.
 
 ## Evidence and privacy
 
-The deterministic stage judges credential containers (`.env`, `*.pem`,
-`*.key`, `secrets/`, `credentials*`, `.ssh/**`, `*.db`) — they are never handed
-to the semantic stage, because a maintainability review never needs to read a
-key file. Receipts are sanitized before they are written; reports live under
+Credential containers (`.env`, `*.pem`, `*.key`, `secrets/`, `credentials*`,
+`.ssh/**`, `*.db`) are outside the review's tool surface entirely: the shared
+audit engine refuses to serve them to the model, because a maintainability
+review never needs to read a key file. The deterministic stage itself judges
+what hygiene never needs judgement — conflict markers, merge-tool artifacts
+and editor/OS junk. Receipts are sanitized before they are written; reports
+live under
 `~/.hermes/profiles/sustainable-maintainer/sustainable-maintainer-runs/` and
 the run scope file is deleted when the run ends.
 

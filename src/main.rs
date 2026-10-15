@@ -1385,7 +1385,10 @@ fn cmd_signing_key(
                 Some(slug) => git::Repo::for_slug(&slug),
                 None => git::Repo::discover(&std::env::current_dir()?)?,
             };
-            let outcome = identity::resolve(&cfg, &path, false)?;
+            // Same rule as every credential path: the assertion may state an
+            // expectation for the identity gate, it must not pick the account
+            // whose key material is used.
+            let outcome = identity::resolve(&cfg, &path, true)?;
             outcome.account.unwrap_or_default()
         }
     };
