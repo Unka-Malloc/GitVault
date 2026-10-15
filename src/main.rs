@@ -144,7 +144,9 @@ enum Command {
         #[arg(long, short = 'R')]
         repo: Option<String>,
         /// Act as this configured identity instead of resolving from a repository.
-        #[arg(long)]
+        /// Mutually exclusive with --repo: two selectors must never silently
+        /// disagree about whose credentials are used.
+        #[arg(long, conflicts_with = "repo")]
         identity: Option<String>,
         /// Print nothing on success.
         #[arg(long)]

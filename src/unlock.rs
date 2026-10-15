@@ -39,10 +39,18 @@ use anyhow::{Context, Result, bail};
 static CACHED: std::sync::Mutex<Option<(Vec<u8>, SystemTime)>> = std::sync::Mutex::new(None);
 
 pub fn default_ttl_secs() -> u64 {
-    std::env::var("GITVAULT_UNLOCK_TTL")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(900)
+    // The environment must not size the window: a same-user process could set
+    // an arbitrary TTL and one biometric confirmation would cover it forever.
+    // A person asking for a longer window passes `gitvault unlock --ttl`, an
+    // explicit act - the variable is a test hook in debug builds only.
+    if cfg!(debug_assertions) {
+        if let Ok(v) = std::env::var("GITVAULT_UNLOCK_TTL") {
+            if let Ok(secs) = v.parse() {
+                return secs;
+            }
+        }
+    }
+    900
 }
 
 pub fn state_path() -> PathBuf {

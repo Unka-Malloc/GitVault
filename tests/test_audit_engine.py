@@ -70,6 +70,27 @@ class AuditEngineTests(unittest.TestCase):
                 self.assertIsNotNone(module.SPEC)
                 self.assertEqual(module.SPEC.name, name)
 
+    def test_review_runs_are_bounded_like_the_rust_store(self):
+        # The convention both stores share: newest 200, nothing older than 90
+        # days. Without it every gate run scans and grows an unbounded archive.
+        import tempfile, time
+        runs = Path(tempfile.mkdtemp(prefix="gv-prune-"))
+        try:
+            fresh = [runs / f"review-{i:03d}" for i in range(5)]
+            for d in fresh:
+                d.mkdir()
+            old = runs / "review-ancient"
+            old.mkdir()
+            epoch = time.time() - audit_engine.MAX_AGE_SECS - 1
+            import os
+            os.utime(old, (epoch, epoch))
+            audit_engine.prune_runs(runs, keep=3)
+            survivors = sorted(p.name for p in runs.iterdir())
+            self.assertEqual(survivors, ["review-002", "review-003", "review-004"])
+        finally:
+            import shutil
+            shutil.rmtree(runs, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

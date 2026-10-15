@@ -97,11 +97,6 @@ def _stage1_lines(summary):
     return lines
 
 
-def _receipt_after(report, target, summary, summaries):
-    report["stage1"] = {"ranges": summaries}
-    if target["fallback"]:
-        report["fallback"] = target["fallback"]
-
 
 SPEC = engine.CheckerSpec(
     name="security-enhancer",
@@ -122,7 +117,6 @@ SPEC = engine.CheckerSpec(
     refusal="The static security checklist refused this operation; nothing was published",
     scope_extra=lambda target, summary: {"kind": target["kind"],
                                          "surfaces": (summary or {}).get("surfaces", [])},
-    receipt_after=_receipt_after,
 )
 
 

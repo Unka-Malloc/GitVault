@@ -46,7 +46,7 @@ The installer creates the checker's private home `~/.hermes/profiles/sustainable
 copies the payload (including the `pi-bridge.ts` extension that forwards Pi tool
 calls into the Python `--serve-tools` process), links the shared skill directory `~/.agents/skills/sustainable-maintainer`
 into every agent skill directory it finds, and registers (or replaces in place)
-this entry in `~/.config/gitvault/config.toml`:
+this entry in `$XDG_CONFIG_HOME/gitvault/config.toml` (or `~/.config/gitvault/config.toml`):
 
 ```toml
 [[checkers]]

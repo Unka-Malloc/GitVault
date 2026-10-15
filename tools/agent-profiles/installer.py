@@ -39,6 +39,16 @@ def _profile_config(source, agent):
             .replace("@AGENT@", agent))
 
 
+def config_file():
+    """The registry file the binary actually reads: the same rule
+    config.rs::config_dir applies — $XDG_CONFIG_HOME/gitvault when the
+    variable names a location, ~/.config/gitvault otherwise. Resolving it
+    here rather than hardcoding ~/.config is what keeps 'installed' and
+    'the gate actually runs' the same statement on every machine."""
+    base = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    return (Path(base) if base else Path.home() / ".config") / "gitvault" / "config.toml"
+
+
 def register(config_file, name, block):
     """Add this checker's registry entry, or replace it in place.
 
@@ -146,7 +156,7 @@ def install(source, agent, payload, events, banner, title, skill_docs):
         raise SystemExit("Pi and Python 3.11+ are required")
     profile = PROFILE_ROOT / agent
     target = profile / "plugins" / agent
-    config_file = home / ".config/gitvault/config.toml"
+    registry = config_file()
     if not profile.exists():
         # The profile directory is just the checker's private home now; Pi
         # needs no profile scaffolding.
@@ -175,9 +185,11 @@ def install(source, agent, payload, events, banner, title, skill_docs):
     block = (f'[[checkers]]\nname = "{agent}"\non = {json.dumps(list(events))}\nkind = "exec"\n'
              'severity = "blocking"\ntimeout_secs = 0\ncommand = '
              + json.dumps([python, "-I", str(target / "__init__.py"), "--repo", "{repo}"]) + '\n')
-    action = register(config_file, agent, block)
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.touch(exist_ok=True)
+    action = register(registry, agent, block)
     print(banner)
-    print(f"Registry entry {action} in {config_file}")
+    print(f"Registry entry {action} in {registry}")
 
 
 def pull(agent):

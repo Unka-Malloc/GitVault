@@ -16,10 +16,14 @@ generic-password item (`gitvault-vault-key`, overridable via
 
 `gitvault unlock` does not hand out anything. A biometric confirmation
 (`gitvault-touchid`, a small Swift helper over LocalAuthentication) opens a
-time-bounded window written to `~/.config/gitvault/unlock-until` — a timestamp,
+time-bounded window written to `$XDG_CONFIG_HOME/gitvault/unlock-until` (or
+`~/.config/gitvault/unlock-until`) — a timestamp,
 the machine's boot time (so a restored snapshot cannot resurrect an old
-window), and an HMAC tag keyed on the vault key. `GITVAULT_UNLOCK_TTL` sets
-the duration (default 900 s); `gitvault lock` closes it immediately.
+window), and an HMAC tag keyed on the vault key. The default duration is
+900 s; an operator wanting a longer window passes `gitvault unlock --ttl`,
+an explicit act — the environment cannot size it, because a same-user process
+must not stretch one confirmation indefinitely. `gitvault lock` closes the
+window immediately.
 
 During the window a caller may *ask* GitVault to perform an operation. The
 window is a permission, not a possession:
@@ -61,10 +65,17 @@ window is a permission, not a possession:
 - **Reads are gated too.** A read of a private repository returns its
   contents, so an open window is required for reads as well as writes; there
   is no free path through the only egress.
+- **Commit signing is deliberately not behind the window.** `gitvault sign`
+  uses the stored signing key without biometric confirmation: a commit is
+  local and reversible — amend, rebase and reset all discard it — so gating
+  evidence would only tax the human while the decision that makes the commit
+  permanent is the push, which is gated. The signing key still never leaves
+  the process; the exclusion is about the window, not the boundary.
 
 ## The audit boundary
 
-Checkers are a list in `~/.config/gitvault/config.toml` — outside every work
+Checkers are a list in `$XDG_CONFIG_HOME/gitvault/config.toml` (or
+`~/.config/gitvault/config.toml`) — outside every work
 tree, so a repository cannot edit the terms it is judged by. The engine:
 
 - runs each checker from a **neutral working directory** with a **curated

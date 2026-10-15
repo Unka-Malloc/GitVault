@@ -54,7 +54,7 @@ The installer creates the checker's private home
 `--serve-tools` process), links the shared
 skill directory `~/.agents/skills/security-enhancer` into every agent skill
 directory it finds, and registers (or replaces in place) this entry in
-`~/.config/gitvault/config.toml`:
+`$XDG_CONFIG_HOME/gitvault/config.toml` (or `~/.config/gitvault/config.toml`):
 
 ```toml
 [[checkers]]

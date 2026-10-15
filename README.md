@@ -81,8 +81,9 @@ gitvault records show RUN_ID [--json]
 gitvault hook pre-commit                     # wired as core.hooksPath
 ```
 
-Configuration defaults to `~/.config/gitvault/config.toml`; override with
-`--config` or `GITVAULT_CONFIG`. The file is parsed strictly: an unknown key is
+Configuration defaults to `$XDG_CONFIG_HOME/gitvault/config.toml` (or
+`~/.config/gitvault/config.toml` when `XDG_CONFIG_HOME` is unset); override
+with `--config` or `GITVAULT_CONFIG`. The file is parsed strictly: an unknown key is
 an error, not a silently ignored setting — a mistyped knob must not look like a
 gate that is on. (Top-level keys must appear before the first `[table]` header,
 as TOML requires.)

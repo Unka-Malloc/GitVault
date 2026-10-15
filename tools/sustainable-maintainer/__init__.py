@@ -100,11 +100,6 @@ def _stage1_lines(summary):
     return lines
 
 
-def _receipt_after(report, target, summary, summaries):
-    report["stage1"] = {"ranges": summaries}
-    if target["fallback"]:
-        report["fallback"] = target["fallback"]
-
 
 SPEC = engine.CheckerSpec(
     name="sustainable-maintainer",
@@ -122,7 +117,6 @@ SPEC = engine.CheckerSpec(
     stage1_lines=_stage1_lines,
     refusal="The deterministic audit refused this operation; nothing was published",
     scope_extra=lambda target, summary: {"kind": target["kind"]},
-    receipt_after=_receipt_after,
 )
 
 

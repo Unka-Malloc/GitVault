@@ -25,7 +25,6 @@
 //! alone runs on every local commit, and a record of "nothing was asked" would
 //! bury the runs that were.
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -53,6 +52,15 @@ pub fn run_dir(cfg: &Config) -> PathBuf {
         base.join("gitvault").join("runs")
     })
 }
+
+#[cfg(unix)]
+fn restrict(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+}
+
+#[cfg(not(unix))]
+fn restrict(_path: &Path, _mode: u32) {}
 
 fn epoch_secs() -> u64 {
     SystemTime::now()
@@ -225,7 +233,7 @@ pub fn begin(cfg: &Config, selected: usize) -> Option<Run> {
     }
     let dir = run_dir(cfg).join(format!("{:010}-{:04x}", epoch_secs(), rand::random::<u16>()));
     std::fs::create_dir_all(&dir).ok()?;
-    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    restrict(&dir, 0o700);
     Some(Run { id: dir.file_name()?.to_string_lossy().into_owned(), dir, started_ms: now_ms() })
 }
 
@@ -277,7 +285,7 @@ pub fn finish(cfg: &Config, run: Run, ctx: &Context, report: &Report) {
         .and_then(|text| std::fs::write(&path, text + "\n").map_err(anyhow::Error::from));
     match written {
         Ok(()) => {
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            restrict(&path, 0o600);
             prune(&run_dir(cfg));
         }
         Err(error) => eprintln!("gitvault: run record not written: {error}"),

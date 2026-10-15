@@ -40,6 +40,28 @@ from review_ranges import ranges as review_ranges  # noqa: E402
 
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"  # a snapshot review diffs against it
 
+# The retention window for review-run directories, the same convention the
+# Rust run-record store applies (src/records.rs): newest 200 survive, and
+# nothing older than 90 days. A dir holding report.json may be a reusable
+# receipt; one without it may still be a resumable Pi session — both kinds
+# live under the same bound. Losing a receipt costs a re-review, never a
+# wrong verdict.
+MAX_RUNS = 200
+MAX_AGE_SECS = 90 * 24 * 60 * 60
+
+
+def prune_runs(runs_dir, keep=MAX_RUNS, max_age_secs=MAX_AGE_SECS):
+    """Drop run directories beyond the retention window. Called once per gate
+    run, which is also what keeps the receipt scan in `audited` bounded."""
+    if not runs_dir.is_dir():
+        return
+    cutoff = time.time() - max_age_secs
+    dirs = sorted((d for d in runs_dir.iterdir() if d.is_dir()),
+                  key=lambda d: d.stat().st_mtime, reverse=True)
+    for rank, path in enumerate(dirs):
+        if rank >= keep or path.stat().st_mtime < cutoff:
+            shutil.rmtree(path, ignore_errors=True)
+
 # Credential containers and runtime stores are never handed to the semantic
 # layer: shipping a key file to a cloud model is itself the leak this gate
 # exists to prevent. The deterministic stage judges them instead.
@@ -384,11 +406,21 @@ class CheckerSpec:
         self.refusal = refusal
         self.session = session
         self.scope_extra = scope_extra or (lambda target, summary: {})
-        self.receipt_after = receipt_after or (lambda report, target, summary, summaries: None)
+        # The default receipt carries the deterministic stage's summaries and
+        # the fallback marker — one shape, written once, instead of three
+        # identical callbacks drifting apart.
+        self.receipt_after = receipt_after or _default_receipt_after
 
     @property
     def runs_dir(self):
         return f"{self.name}-runs"
+
+
+def _default_receipt_after(report, target, summary, summaries):
+    """The receipt fields every stage-1 checker stamps identically."""
+    report["stage1"] = {"ranges": summaries}
+    if target["fallback"]:
+        report["fallback"] = target["fallback"]
 
 
 def audited(settings, base, head, runtime, spec):
@@ -540,8 +572,10 @@ def review_range(repo, settings, target, summary, stage_summaries, runtime, spec
             if receipt.get("gate_status") == "pending":
                 receipt["gate_status"] = "refused"
                 write_json(report_path, receipt)
-        else:
+        elif not spec.session:
             shutil.rmtree(run_dir, ignore_errors=True)
+        # A session checker's unfinished dir is the resume point for
+        # `--continue`; deleting it would discard the paid work it holds.
 
 
 def run(repo, settings, spec, spawn=subprocess.run):
@@ -549,6 +583,7 @@ def run(repo, settings, spec, spawn=subprocess.run):
     a refused audit never touches the working tree."""
     repo = Path(repo).resolve()
     runtime = declared_runtime(settings)
+    prune_runs(Path(settings["profile"]) / spec.runs_dir)
     targets = review_ranges(repo)
     if not targets:
         print(f"{spec.label}: nothing unpublished in this operation; no review needed")
