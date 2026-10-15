@@ -53,6 +53,19 @@ impl Event {
             ),
         }
     }
+
+    /// The hook name this event is registered and invoked under.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::PreCommit => "pre-commit",
+            Self::PrePush => "pre-push",
+            Self::CommitMsg => "commit-msg",
+            Self::PrepareCommitMsg => "prepare-commit-msg",
+            Self::PreApplyPatch => "pre-applypatch",
+            Self::Pr => "pr",
+            Self::Release => "release",
+        }
+    }
 }
 
 /// A stable name for an identity. Contracts in `.gitvault-identity` and in test

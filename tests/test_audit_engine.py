@@ -94,6 +94,68 @@ class AuditEngineTests(unittest.TestCase):
                 self.assertIsNotNone(module.SPEC)
                 self.assertEqual(module.SPEC.name, name)
 
+    def test_an_interrupted_run_resumes_under_the_receipt_key(self):
+        # The money finding this pins: a session dir survives an interruption
+        # on purpose; the next gate run over the same range must continue it,
+        # not pay for a replay of the same conversation.
+        import tempfile, shutil
+        runs = Path(tempfile.mkdtemp(prefix="gv-resume-"))
+        try:
+            key = {"base": "a" * 40, "head": "b" * 40, "items": ["d1", "d2"],
+                   "provider": "p", "model": "m", "effort": "high"}
+            unfinished = runs / "review-unfinished"
+            unfinished.mkdir()
+            audit_engine.write_json(unfinished / "resume.json", key)
+            self.assertEqual(audit_engine.resume_dir(runs, key), unfinished)
+            # A settled run is a receipt, not a resume point.
+            (unfinished / "report.json").write_text("{}")
+            self.assertIsNone(audit_engine.resume_dir(runs, key))
+            (unfinished / "report.json").unlink()
+            # Any key element changing means a different review entirely.
+            for altered in ({**key, "head": "c" * 40}, {**key, "model": "other"},
+                            {**key, "items": ["d1"]}):
+                self.assertIsNone(audit_engine.resume_dir(runs, altered))
+        finally:
+            shutil.rmtree(runs, ignore_errors=True)
+
+    def test_prune_keeps_an_unfinished_session_but_drops_old_receipts(self):
+        # The resume point survives the rank bound; the age bound still applies
+        # because a session that stale is not worth continuing.
+        import tempfile, shutil, os, time
+        runs = Path(tempfile.mkdtemp(prefix="gv-prune2-"))
+        try:
+            now = time.time()
+            for i in range(4):
+                done = runs / f"review-done-{i}"
+                done.mkdir()
+                (done / "report.json").write_text("{}")
+                (done / "resume.json").write_text("{}")
+                os.utime(done, (now - i, now - i))
+            waiting = runs / "review-waiting"
+            waiting.mkdir()
+            (waiting / "resume.json").write_text("{}")
+            os.utime(waiting, (now - 10, now - 10))
+            audit_engine.prune_runs(runs, keep=2)
+            survivors = sorted(p.name for p in runs.iterdir())
+            self.assertIn("review-waiting", survivors)
+            self.assertEqual(len(survivors), 3)
+            epoch = time.time() - audit_engine.MAX_AGE_SECS - 1
+            os.utime(waiting, (epoch, epoch))
+            audit_engine.prune_runs(runs, keep=2)
+            self.assertNotIn("review-waiting", [p.name for p in runs.iterdir()])
+        finally:
+            shutil.rmtree(runs, ignore_errors=True)
+
+    def test_retention_window_matches_the_rust_store(self):
+        # records.rs and prune_runs are the same retention convention on two
+        # runtimes; a change on one side must not leave the other stale.
+        import re
+        text = (REPO / "src" / "records.rs").read_text()
+        max_runs = int(re.search(r"MAX_RUNS\s*:\s*\w+\s*=\s*(\d+)", text).group(1))
+        days = int(re.search(r"MAX_AGE_SECS\s*:\s*\w+\s*=\s*(\d+)\s*\*", text).group(1))
+        self.assertEqual(max_runs, audit_engine.MAX_RUNS)
+        self.assertEqual(days * 24 * 60 * 60, audit_engine.MAX_AGE_SECS)
+
     def test_review_runs_are_bounded_like_the_rust_store(self):
         # The convention both stores share: newest 200, nothing older than 90
         # days. Without it every gate run scans and grows an unbounded archive.

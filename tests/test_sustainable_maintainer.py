@@ -161,10 +161,9 @@ class SustainableMaintainerTests(unittest.TestCase):
 
     def stub_pi(self, calls):
         def stub(command, **kwargs):
-            # A review is a fresh, unsaved session every run: nothing from an
-            # earlier repository can leak into the judgement.
-            self.assertIn("--no-session", command)
-            self.assertNotIn("--continue", command)
+            # Sessions resume within the same range key; nothing from an
+            # earlier repository or range can leak into the judgement.
+            self.assertIn("--session-dir", command)
             self.assertEqual(command[0], self.settings["pi"])
             self.assertEqual(command[command.index("--provider") + 1], "example")
             self.assertIn(str(SOURCE / "pi-bridge.ts"), command)

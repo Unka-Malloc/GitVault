@@ -237,6 +237,13 @@ pub fn run_all(cfg: &Config, ctx: &Context, only: Option<&str>) -> Result<Report
         .into_iter()
         .filter(|c| only.is_none_or(|name| c.name == name))
         .collect();
+    if let Some(name) = only {
+        anyhow::ensure!(
+            !selected.is_empty(),
+            "no checker named '{name}' is registered for {}",
+            event.name()
+        );
+    }
     // The record spans the whole run, so it starts before the first checker.
     let run = records::begin(cfg, selected.len());
     let mut report = Report::default();

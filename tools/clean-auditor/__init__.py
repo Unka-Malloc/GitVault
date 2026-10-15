@@ -132,6 +132,7 @@ SPEC = engine.CheckerSpec(
         "No arbitrary turn or time limit applies."),
     root=ROOT,
     stage1=_stage1,
+    session=True,
     refusal="The deterministic audit refused this operation; nothing was published",
     scope_extra=lambda target, summary: {"kind": target["kind"]},
 )

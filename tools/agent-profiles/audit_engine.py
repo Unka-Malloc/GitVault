@@ -66,8 +66,15 @@ def prune_runs(runs_dir, keep=MAX_RUNS, max_age_secs=MAX_AGE_SECS):
     dirs = sorted((d for d in runs_dir.iterdir() if d.is_dir()),
                   key=lambda d: d.stat().st_mtime, reverse=True)
     for rank, path in enumerate(dirs):
-        if rank >= keep or path.stat().st_mtime < cutoff:
+        if path.stat().st_mtime < cutoff:
             shutil.rmtree(path, ignore_errors=True)
+        elif rank >= keep:
+            # An unfinished session run is a paid resume point: dropping it by
+            # rank would re-charge the range it could have continued. The age
+            # bound still applies - a session this stale is not worth resuming.
+            resumable = (path / "resume.json").exists() and not (path / "report.json").exists()
+            if not resumable:
+                shutil.rmtree(path, ignore_errors=True)
 
 # Credential containers and runtime stores are never handed to the semantic
 # layer: shipping a key file to a cloud model is itself the leak this gate
@@ -457,6 +464,21 @@ def audited(settings, base, head, runtime, spec):
     return False
 
 
+def resume_dir(runs, key):
+    """An unfinished run of exactly this range under this runtime, if one is
+    waiting to continue - the resume side of the key `audited` uses for
+    receipts. scope.json cannot serve as the key because it is removed when a
+    run ends; resume.json is written for that lookup and nothing else."""
+    for path in sorted(Path(runs).glob("*/resume.json")):
+        try:
+            candidate = json.loads(path.read_text())
+        except ValueError:
+            continue
+        if candidate == key and not (path.parent / "report.json").exists():
+            return path.parent
+    return None
+
+
 def pi_review(run_dir, settings, runtime, spec, spawn=subprocess.run):
     """Drive one Pi review of the scope in run_dir through the bridge
     extension: Pi owns only the conversation, the Python plugin owns the
@@ -481,7 +503,7 @@ def pi_review(run_dir, settings, runtime, spec, spawn=subprocess.run):
                "--provider", runtime["provider"], "--model", runtime["model"],
                "--thinking", runtime["effort"],
                "--extension", str(review.ROOT / "pi-bridge.ts"),
-               "--tools", ",".join(spec["name"] for spec in manifest),
+               "--tools", ",".join(entry["name"] for entry in manifest),
                "--system-prompt", prompt]
     if spec.session:
         command += ["--session-dir", str(run_dir)]
@@ -560,7 +582,21 @@ def review_range(repo, settings, target, summary, stage_summaries, runtime, spec
     profile = Path(settings["profile"])
     runs = profile / spec.runs_dir
     runs.mkdir(parents=True, exist_ok=True, mode=0o700)
-    run_dir = Path(tempfile.mkdtemp(prefix="review-", dir=runs))
+    # The same tuple `audited` keys receipts on: only a run of exactly this
+    # range under this runtime may be continued - a wider or different review
+    # starts a new session, never borrows a stranger's conversation.
+    resume_key = {"base": base, "head": head, "items": list(spec.domains),
+                  "provider": runtime["provider"], "model": runtime["model"],
+                  "effort": runtime["effort"]}
+    run_dir = resume_dir(runs, resume_key) if spec.session else None
+    if run_dir is None:
+        run_dir = Path(tempfile.mkdtemp(prefix="review-", dir=runs))
+        if spec.session:
+            write_json(run_dir / "resume.json", resume_key)
+    elif any(p.name not in {"scope.json", "resume.json"} for p in run_dir.iterdir()):
+        # A prior attempt left work in this dir: mark it so pi_review
+        # continues that conversation instead of replaying it.
+        (run_dir / "session.used").touch()
     # The receipt reads its provider/model/effort labels from this scope.
     write_json(run_dir / "scope.json", {"repo": str(repo), "tree": tree, "base": base,
                                         "changed": changed, "runtime": runtime,

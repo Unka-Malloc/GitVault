@@ -114,6 +114,7 @@ SPEC = engine.CheckerSpec(
     stage1=lambda repo, targets: stage1.audit_all(repo, targets),
     stage1_lines=_stage1_lines,
     stage_label="static",
+    session=True,
     refusal="The static security checklist refused this operation; nothing was published",
     scope_extra=lambda target, summary: {"kind": target["kind"],
                                          "surfaces": (summary or {}).get("surfaces", [])},

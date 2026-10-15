@@ -105,6 +105,7 @@ SPEC = engine.CheckerSpec(
         "judge all six domains. No arbitrary turn or time limit applies."),
     root=ROOT,
     stage1=lambda repo, targets: stage1.audit_all(repo, targets),
+    session=True,
     refusal="The deterministic audit refused this operation; nothing was published",
     scope_extra=lambda target, summary: {"kind": target["kind"]},
 )

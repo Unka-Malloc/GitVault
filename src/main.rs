@@ -648,6 +648,24 @@ fn context_for(
     })
 }
 
+/// The publication gate every GitHub-reaching operation must pass: run the
+/// checkers registered for the event, print the verdicts, and fail closed.
+/// One copy so a new publish path cannot quietly forget it.
+fn run_publication_gate(
+    cfg: &config::Config,
+    ctx: &checkers::Context,
+    event: &str,
+    operation: &str,
+) -> anyhow::Result<()> {
+    let report = checkers::run_all(cfg, ctx, None)?;
+    report.print(event);
+    anyhow::ensure!(
+        report.exit_code() == ExitCode::SUCCESS,
+        "a blocking checker refused this {operation}; nothing was sent to GitHub"
+    );
+    Ok(())
+}
+
 fn cmd_hook(
     config: Option<&PathBuf>,
     event: &str,
@@ -961,11 +979,7 @@ fn cmd_pr(
             })?;
             ctx.pr_base = Some(base.clone());
             ctx.pr_head = Some(head.clone());
-            let report = checkers::run_all(&cfg, &ctx, None)?;
-            report.print("pr");
-            if report.exit_code() != ExitCode::SUCCESS {
-                anyhow::bail!("a blocking checker refused this pull request; nothing was sent to GitHub");
-            }
+            run_publication_gate(&cfg, &ctx, "pr", "pull request")?;
             let mut f = vec![
                 ("title".to_string(), title),
                 ("head".to_string(), head),
@@ -1012,11 +1026,7 @@ fn cmd_pr(
                 )
             })?;
             ctx.pr_number = Some(number.to_string());
-            let report = checkers::run_all(&cfg, &ctx, None)?;
-            report.print("pr");
-            if report.exit_code() != ExitCode::SUCCESS {
-                anyhow::bail!("a blocking checker refused this merge; nothing was sent to GitHub");
-            }
+            run_publication_gate(&cfg, &ctx, "pr", "merge")?;
             let mut f = vec![("merge_method".to_string(), method)];
             if let Some(s) = subject {
                 f.push(("commit_title".to_string(), s));
@@ -1233,11 +1243,7 @@ fn cmd_release(
                      run this from the tagged working tree"
                 )
             })?;
-        let report = checkers::run_all(&cfg, &ctx, None)?;
-        report.print("release");
-        if report.exit_code() != ExitCode::SUCCESS {
-            anyhow::bail!("a blocking checker refused this release; nothing was sent to GitHub");
-        }
+        run_publication_gate(&cfg, &ctx, "release", "release")?;
     }
     let vault = vault::Vault::open()?;
     let slug = resolve_slug(repo)?;
@@ -1344,14 +1350,16 @@ fn cmd_ssh(config: Option<&PathBuf>, args: &[String]) -> anyhow::Result<ExitCode
 /// An empty line means "no passphrase". Reading it here rather than accepting it
 /// as an argument keeps it out of argv and out of shell history.
 fn read_optional_passphrase() -> anyhow::Result<Option<String>> {
+    use anyhow::Context as _;
     use std::io::BufRead;
     eprint!("passphrase for this key (empty if none): ");
     use std::io::Write;
     std::io::stderr().flush().ok();
     let mut line = String::new();
-    if std::io::stdin().lock().read_line(&mut line).is_err() {
-        return Ok(None);
-    }
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .context("could not read the key passphrase")?;
     let t = line.trim_end_matches(['\n', '\r']).to_string();
     Ok(if t.is_empty() { None } else { Some(t) })
 }
