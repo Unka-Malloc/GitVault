@@ -76,12 +76,11 @@ pub struct Identity {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rules {
-    /// Preferred: match on the remote's owning account. It survives being cloned
-    /// to a different path and does not depend on local directory layout.
+    /// Preferred: match on the remote's owning account -> the identities key
+    /// that may act on it. It survives being cloned to a different path and
+    /// does not depend on local directory layout.
     #[serde(default)]
     pub owners: BTreeMap<String, String>,
-    /// Owner -> the accounts that may act on it.
-    ///
     /// Fallback: match on a path prefix, for repositories with no remote yet.
     #[serde(default)]
     pub paths: Vec<PathRule>,

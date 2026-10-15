@@ -18,6 +18,8 @@ import os
 import subprocess
 
 
+# audit_engine imports this module, so importing the engine's identical `git`
+# back would be a real dependency cycle; this copy stays on purpose.
 def git(repo, *args, check=True):
     result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, check=False)
     if check and result.returncode:

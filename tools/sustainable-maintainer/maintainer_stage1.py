@@ -11,7 +11,8 @@ to a model.
 from __future__ import annotations
 
 import re
-import subprocess
+
+from audit_engine import git
 
 
 # Filenames that are residues of merge tooling, never of deliberate content.
@@ -44,10 +45,6 @@ BINARY_HINT = re.compile(
 MAX_FILE_BYTES = 2 * 1024 * 1024
 
 
-def git(repo, *args):
-    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, check=False)
-
-
 def outgoing_paths(repo, target):
     """Paths the operation introduces or modifies — what stage one judges."""
     if target["scope"] == "range":
@@ -55,13 +52,11 @@ def outgoing_paths(repo, target):
                   f"{target['base']}..{target['head']}")
     else:
         out = git(repo, "ls-tree", "-r", "-z", "--name-only", target["head"])
-    if out.returncode:
-        raise ValueError("Git could not read the review snapshot")
     return [path for path in out.stdout.decode(errors="replace").split("\0") if path]
 
 
 def blob(repo, head, path):
-    out = git(repo, "show", f"{head}:{path}")
+    out = git(repo, "show", f"{head}:{path}", check=False)
     if out.returncode or len(out.stdout) > MAX_FILE_BYTES or b"\0" in out.stdout[:8192]:
         return None
     return out.stdout

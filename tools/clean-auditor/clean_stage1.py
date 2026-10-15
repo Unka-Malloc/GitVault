@@ -24,7 +24,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import re
-import subprocess
+
+from audit_engine import git as _git
 
 # Shapes, not keywords. Ordered most specific first: a label is the first rule
 # that matches the line, and `sk-ant-...` is also an `sk-...`.
@@ -51,10 +52,6 @@ CREDENTIAL_RULES = (
 # CLEAN_AUDITOR_WITHHELD), never a repository file.
 WITHHELD_ENV = "CLEAN_AUDITOR_WITHHELD"
 WITHHELD_DEFAULT = ("gitvault", "withheld-names.txt")
-
-
-def _git(repo, *args):
-    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, check=False)
 
 
 def withheld_path():
@@ -128,7 +125,7 @@ def scan(repo, head, names=()):
     for _, expression, _ in patterns:
         argv += ["-e", expression]
     argv.append(head)
-    found = _git(repo, *argv)
+    found = _git(repo, *argv, check=False)
     if found.returncode not in (0, 1):
         raise ValueError("The deterministic scan could not read the outgoing revision")
 

@@ -950,9 +950,10 @@ fn cmd_pr(
             // paid for twice; content that reached the remote from elsewhere is
             // reviewed here before the request proposes it. The checker resolves
             // base/head in the local repository, the only place the content exists.
-            let mut ctx = context_for(&cfg, "pr", &PathBuf::from("."), None).map_err(|_| {
+            let mut ctx = context_for(&cfg, "pr", &PathBuf::from("."), None).map_err(|err| {
                 anyhow::anyhow!(
-                    "reviewing a pull request needs a checkout of the repository; \
+                    "reviewing a pull request needs a checkout of the repository\n  \
+                     {err:#}\n  \
                      push the branch through GitVault, or run this from its working tree"
                 )
             })?;
@@ -1001,9 +1002,10 @@ fn cmd_pr(
             // permanent record as creating. The head may not be checked out
             // here, so the checker is told the request number and fetches the
             // head itself; nothing reaches GitHub until it passes.
-            let mut ctx = context_for(&cfg, "pr", &PathBuf::from("."), None).map_err(|_| {
+            let mut ctx = context_for(&cfg, "pr", &PathBuf::from("."), None).map_err(|err| {
                 anyhow::anyhow!(
-                    "reviewing a merge request needs a checkout of the repository; \
+                    "reviewing a merge request needs a checkout of the repository\n  \
+                     {err:#}\n  \
                      run this from its working tree"
                 )
             })?;
@@ -1222,9 +1224,10 @@ fn cmd_release(
     // the vault is locked. Nothing reaches GitHub until the registry passes.
     if let ReleaseCommand::Create { tag, .. } = &command {
         let ctx = context_for(&cfg, "release", &PathBuf::from("."), Some(tag.clone()))
-            .map_err(|_| {
+            .map_err(|err| {
                 anyhow::anyhow!(
-                    "reviewing a release needs a checkout with the tagged commit; \
+                    "reviewing a release needs a checkout with the tagged commit\n  \
+                     {err:#}\n  \
                      run this from the tagged working tree"
                 )
             })?;

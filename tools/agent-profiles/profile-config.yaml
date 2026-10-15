@@ -1,3 +1,10 @@
+# The Pi profile configuration every GitVault audit checker runs on.
+#
+# Written to <profile>/config.yaml by the installer with the checker's own
+# name substituted into the two marked lines. The policy itself is shared:
+# a paid semantic review is never cut off by a clock, memory and compression
+# stay off so the verdict is formed from evidence alone, and the model gets
+# no ambient tool surface beyond what the bridge extension serves.
 agent:
   coding_context: "off"
   environment_probe: false
@@ -16,9 +23,9 @@ memory:
   nudge_interval: 0
 mcp_servers: {}
 plugins:
-  enabled: [security-enhancer]
+  enabled: [@AGENT@]
 platform_toolsets:
-  cli: [security_enhancer]
+  cli: [@AGENT_CLI@]
 terminal:
   backend: local
 display:

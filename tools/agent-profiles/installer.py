@@ -27,6 +27,18 @@ SKILL_ROOT = Path.home() / ".agents" / "skills"
 CREDENTIAL_FILE = Path.home() / ".hermes" / ".env"
 
 
+def _profile_config(source, agent):
+    """The shared profile configuration with this checker's name filled in.
+
+    The policy is one file under agent-profiles — the runtime that must never
+    drift (no review deadline, no memory, no compression) cannot end up with
+    a different setting in one checker's copy."""
+    template = (source.parent / "agent-profiles" / "profile-config.yaml").read_text()
+    return (template
+            .replace("@AGENT_CLI@", agent.replace("-", "_"))
+            .replace("@AGENT@", agent))
+
+
 def register(config_file, name, block):
     """Add this checker's registry entry, or replace it in place.
 
@@ -146,7 +158,7 @@ def install(source, agent, payload, events, banner, title, skill_docs):
     profile.chmod(0o700)
     target.mkdir(parents=True, mode=0o700, exist_ok=True)
     install_payload(source, target, agent, payload, skill_docs)
-    (profile / "config.yaml").write_text((source / "config.yaml").read_text())
+    (profile / "config.yaml").write_text(_profile_config(source, agent))
     (profile / "config.yaml").chmod(0o600)
     previous = json.loads((target / "installation.json").read_text()) if (target / "installation.json").is_file() else {}
     settings = {"pi": pi, "python": python, "profile": str(profile),
@@ -200,7 +212,7 @@ def update(source, agent, payload, title, skill_docs):
     # The seeded config is the fallback for a machine that never pulled;
     # an update refreshes it so it cannot strand on the old runtime.
     config = Path(settings["profile"]) / "config.yaml"
-    config.write_text((source / "config.yaml").read_text())
+    config.write_text(_profile_config(source, agent))
     config.chmod(0o600)
     settings_path.write_text(json.dumps(settings, indent=2) + "\n")
     settings_path.chmod(0o600)

@@ -378,6 +378,9 @@ impl Vault {
     }
 
     fn encryption_key_or_create(&self) -> Result<Vec<u8>> {
+        if let Some(key) = crate::unlock::cached_key() {
+            return Ok(key);
+        }
         if let Some(raw) = keychain_get(&keychain_service()) {
             if let Ok(k) = decode_key(&raw) {
                 return Ok(k);

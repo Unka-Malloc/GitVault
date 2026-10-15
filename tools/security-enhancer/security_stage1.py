@@ -24,8 +24,9 @@ build-arg value never lands in a log.
 from __future__ import annotations
 
 import re
-import subprocess
 from pathlib import PurePosixPath
+
+from audit_engine import git as _git
 
 MAX_SCAN_BYTES = 1024 * 1024
 SKIPPED_DIRS = {"node_modules", "vendor", "third_party", ".venv", "venv", "__pycache__",
@@ -82,13 +83,6 @@ SECRET_ARG = re.compile(r"(?i)^\s*(?:ARG|ENV)\s+([A-Za-z_][A-Za-z0-9_]*)"
 SECRET_NAME = re.compile(r"(?i)(SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_?KEY|CREDENTIAL|"
                          r"ACCESS_?KEY|CLIENT_?SECRET)")
 PLACEHOLDER = re.compile(r"(?i)(your|example|placeholder|changeme|<|\$\{|\$[A-Z_]|\{\{|x{4,}|\*{3,})")
-
-
-def _git(repo, *args, check=True):
-    result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, check=False)
-    if check and result.returncode:
-        raise ValueError("Git could not read the review snapshot")
-    return result
 
 
 def _is_prose(path):

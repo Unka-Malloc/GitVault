@@ -356,3 +356,96 @@ pub fn cmd_status(vault: &Vault, cfg: &Config, account: Option<&str>, json: bool
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A vault on a temporary path, backed by a process-cached key: no
+    /// keychain, no real vault file. All tests cache the same 32-byte key so
+    /// parallel runs never see each other's key material.
+    fn vault(tag: &str) -> (Vault, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("gv-auth-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::unlock::cache_key(&[7u8; 32], std::time::Duration::from_secs(60));
+        (Vault::open_at(dir.join("vault.enc")).unwrap(), dir)
+    }
+
+    fn store_with(token: bool, ssh: bool, signing: bool) -> Store {
+        let mut store = Store::default();
+        if token {
+            store.insert("acct", "tok");
+        }
+        if ssh {
+            store.set_ssh_key("acct", "SSH-KEY");
+        }
+        if signing {
+            store.set_signing_key("acct", "SIGN-KEY");
+        }
+        store
+    }
+
+    #[test]
+    fn removing_a_token_from_a_mixed_entry_is_refused() {
+        // The failure this scoped delete exists to prevent: a token that may
+        // not be re-derivable must never ride along with a key removal.
+        let (v, dir) = vault("mixed");
+        v.save(&store_with(true, true, false)).unwrap();
+        assert!(cmd_remove(&v, "acct", RemoveWhat::Token).is_err());
+        let e = v.load().unwrap().entry("acct").unwrap().clone();
+        assert!(e.token.is_some() && e.ssh_key.is_some(), "a refused removal must change nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn key_removal_keeps_the_token() {
+        let (v, dir) = vault("keys");
+        v.save(&store_with(true, true, true)).unwrap();
+        cmd_remove(&v, "acct", RemoveWhat::Keys).unwrap();
+        let e = v.load().unwrap().entry("acct").unwrap().clone();
+        assert!(e.token.is_some());
+        assert!(e.ssh_key.is_none() && e.signing_key.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removing_everything_prunes_the_entry() {
+        let (v, dir) = vault("all");
+        v.save(&store_with(true, true, false)).unwrap();
+        cmd_remove(&v, "acct", RemoveWhat::All).unwrap();
+        assert!(v.load().unwrap().entry("acct").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removing_a_lone_token_prunes_the_entry() {
+        let (v, dir) = vault("lone");
+        v.save(&store_with(true, false, false)).unwrap();
+        cmd_remove(&v, "acct", RemoveWhat::Token).unwrap();
+        assert!(v.load().unwrap().entry("acct").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removing_the_last_auth_key_drops_the_passphrase() {
+        let (v, dir) = vault("pass");
+        let mut store = store_with(true, true, false);
+        store.set_passphrase("acct", "pw");
+        v.save(&store).unwrap();
+        cmd_remove_key(&v, "acct", false).unwrap();
+        let e = v.load().unwrap().entry("acct").unwrap().clone();
+        assert!(e.ssh_key.is_none() && e.passphrase.is_none());
+        assert!(e.token.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_rejects_a_file_with_no_private_key_marker() {
+        let (v, dir) = vault("import");
+        let file = dir.join("not-a-key.txt");
+        std::fs::write(&file, "just some text").unwrap();
+        assert!(cmd_import_key(&v, "acct", &file, false, None).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
