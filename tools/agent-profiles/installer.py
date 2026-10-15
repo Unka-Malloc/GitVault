@@ -198,9 +198,16 @@ def install(source, agent, payload, events, banner, title, skill_docs):
 def pull(agent):
     settings_path, settings = _installation(agent)
     skill_dir = settings.get("skill_dir") or str(SKILL_ROOT / agent)
+    # The registry decides which prompt and runtime the checker runs on, so
+    # the channel must be a choice the operator made - not a default endpoint
+    # whatever happens to be listening on the port gets to fill.
+    url = os.environ.get("GITVAULT_PROFILES_URL", "").strip()
+    if not url:
+        raise SystemExit("GITVAULT_PROFILES_URL is not set; the profile registry "
+                         "is an explicit choice (the local development registry is "
+                         f"{profile_sync.DEFAULT_URL})")
     result = profile_sync.pull(
-        agent, skill_dir,
-        os.environ.get("GITVAULT_PROFILES_URL", profile_sync.DEFAULT_URL),
+        agent, skill_dir, url,
         sys.argv[2] if len(sys.argv) > 2 else None)
     # The drift check needs the directory it must re-hash, so the record
     # carries it: a version without its location is not a usable record.

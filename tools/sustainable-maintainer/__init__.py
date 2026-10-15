@@ -39,25 +39,6 @@ ROOT = Path(__file__).resolve().parent
 # preferences as findings.
 DOMAINS = ("structure", "contracts", "craft", "duplication", "tests", "evolution")
 
-# The engine's contract surface, re-exported for callers and tests that hold
-# this module.
-sanitize = engine.sanitize
-sanitize_source = engine.sanitize_source
-safe_path = engine.safe_path
-git = engine.git
-write_json = engine.write_json
-credential = engine.credential
-declared_runtime = engine.declared_runtime
-origin_slug = engine.origin_slug
-review_ranges = engine.review_ranges
-EMPTY_TREE = engine.EMPTY_TREE
-SENSITIVE_PARTS = engine.SENSITIVE_PARTS
-SENSITIVE_SUFFIXES = engine.SENSITIVE_SUFFIXES
-SENSITIVE_PREFIXES = engine.SENSITIVE_PREFIXES
-TEMPLATE_NAMES = engine.TEMPLATE_NAMES
-RUNTIME_VALUE = engine.RUNTIME_VALUE
-PI_THINKING = engine.PI_THINKING
-
 
 class Review(engine.Review):
     """Sustainable Maintainer's review object: the engine's machinery bound to
@@ -76,10 +57,7 @@ def tool_plan(review):
          "find is a literal search over the range — use it to locate the original a change "
          "duplicates, the callers a contract serves, or the documentation a decision should "
          "update. Credential containers are unavailable by design.",
-         {"operation": {"type": "string", "enum": ["inventory", "list", "diff", "read", "find"]},
-          "path": {"type": "string"}, "pattern": {"type": "string"}, "text": {"type": "string"},
-          "start": {"type": "integer"}, "offset": {"type": "integer"},
-          "revision": {"type": "string", "enum": ["outgoing", "base"]}},
+         engine.context_schema(["inventory", "list", "diff", "read", "find"]),
          ["operation"], review.context),
         ("maintainer_submit_review",
          "Submit the final maintainability verdict once, with every domain accounted for.",
@@ -105,7 +83,6 @@ SPEC = engine.CheckerSpec(
         "judge all six domains. No arbitrary turn or time limit applies."),
     root=ROOT,
     stage1=lambda repo, targets: stage1.audit_all(repo, targets),
-    session=True,
     refusal="The deterministic audit refused this operation; nothing was published",
     scope_extra=lambda target, summary: {"kind": target["kind"]},
 )

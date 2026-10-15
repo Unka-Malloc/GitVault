@@ -30,24 +30,6 @@ import audit_engine as engine  # noqa: E402
 ROOT = Path(__file__).resolve().parent
 DOMAINS = ("sql", "storage", "network", "compute", "cloudflare", "vps")
 
-# The engine's contract surface, re-exported for callers and tests that hold
-# this module.
-sanitize = engine.sanitize
-sanitize_source = engine.sanitize_source
-safe_path = engine.safe_path
-git = engine.git
-write_json = engine.write_json
-credential = engine.credential
-declared_runtime = engine.declared_runtime
-review_ranges = engine.review_ranges
-EMPTY_TREE = engine.EMPTY_TREE
-SENSITIVE_PARTS = engine.SENSITIVE_PARTS
-SENSITIVE_SUFFIXES = engine.SENSITIVE_SUFFIXES
-SENSITIVE_PREFIXES = engine.SENSITIVE_PREFIXES
-TEMPLATE_NAMES = engine.TEMPLATE_NAMES
-RUNTIME_VALUE = engine.RUNTIME_VALUE
-PI_THINKING = engine.PI_THINKING
-
 
 class PageText(HTMLParser):
     def __init__(self):
@@ -156,9 +138,8 @@ def tool_plan(review):
         "sources": {"type": "array", "items": {"type": "string", "enum": list(review.catalog.values())}}})
     return [
         ("money_context", f"Inspect immutable source. Start with inventory for review mode and scope. Commit mode requires every changed diff; full mode requires original_request and per-project coverage. read is {engine.READ_PAGE_LINES} lines with start; find/list use pattern glob and offset pagination. Full-mode find supports literal alternatives separated by |.",
-         {"operation": {"type":"string", "enum":["inventory","original_request","list","diff","read","find"]},
-          "path":{"type":"string"}, "pattern":{"type":"string"}, "text":{"type":"string"},
-          "start":{"type":"integer"}, "offset":{"type":"integer"}, "revision":{"type":"string", "enum":["staged","base"]}}, ["operation"], review.context),
+         engine.context_schema(["inventory", "original_request", "list", "diff", "read", "find"],
+                              ("staged", "base")), ["operation"], review.context),
         ("money_official_doc", "Fetch an official reference by exact catalog key or listed URL. Cached once per review; offset pages through the same response.",
          {"name":{"type":"string", "enum":[*review.catalog, *review.catalog.values()]}, "offset":{"type":"integer"}}, ["name"], review.document),
         ("money_submit_review", "Submit the final cost decision once. Follow the Money Saver policy's evidence and coverage contract.",
@@ -186,7 +167,6 @@ SPEC = engine.CheckerSpec(
         if review.state.get("mode") == "full-service" else
         "Review the outgoing changes using the Money Saver tools, then submit one final verdict."),
     root=ROOT,
-    session=True,
 )
 
 

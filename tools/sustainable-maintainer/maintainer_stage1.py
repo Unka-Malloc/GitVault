@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 
+import audit_engine
 from audit_engine import git
 
 
@@ -46,13 +47,11 @@ MAX_FILE_BYTES = 2 * 1024 * 1024
 
 
 def outgoing_paths(repo, target):
-    """Paths the operation introduces or modifies — what stage one judges."""
-    if target["scope"] == "range":
-        out = git(repo, "diff", "--name-only", "-z", "--diff-filter=AMR",
-                  f"{target['base']}..{target['head']}")
-    else:
-        out = git(repo, "ls-tree", "-r", "-z", "--name-only", target["head"])
-    return [path for path in out.stdout.decode(errors="replace").split("\0") if path]
+    """Paths the operation carries — what stage one judges. Delegated to the
+    shared engine so this stage and the paid stage always see the same set;
+    a diff-filter shortcut here once meant paths this stage cleared were not
+    the paths the model reviewed."""
+    return audit_engine.outgoing_paths(repo, target)
 
 
 def blob(repo, head, path):
@@ -82,10 +81,24 @@ def marker_lines(content):
     return sorted(sides + (equals if sides else []))
 
 
+def deleted_paths(repo, target):
+    """Paths the operation removes. Name-only enumeration cannot tell a
+    deletion from an addition, and a deletion is never a finding — a junk
+    name leaving the tree is the tree getting cleaner, not residue."""
+    if target["scope"] != "range":
+        return set()
+    out = git(repo, "diff", "--name-only", "--no-renames", "-z", "--diff-filter=D",
+              target["base"] or audit_engine.EMPTY_TREE, target["head"])
+    return {p for p in out.stdout.decode(errors="replace").split("\0") if p}
+
+
 def audit(repo, target):
     """Check one review target; return its summary, refusing on any hit."""
     hits = []
+    deleted = deleted_paths(repo, target)
     for path in outgoing_paths(repo, target):
+        if path in deleted:
+            continue
         rule = junk_name_hit(path)
         if rule:
             hits.append({"path": path, "line": 0, "rule": rule})

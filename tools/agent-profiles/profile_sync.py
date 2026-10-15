@@ -1,8 +1,9 @@
 """Local profile sync: what the registry published, and whether this machine still matches.
 
 The prompts and skills an agent runs on live in a profile registry, versioned
-by git tag. `GITVAULT_PROFILES_URL` points a machine at that registry; the
-default is a loopback endpoint for a local development registry. This module
+by git tag. `GITVAULT_PROFILES_URL` points a machine at that registry; it is
+an explicit choice, since whatever channel supplies the bundle is trusted
+with what the agent runs. This module
 is the machine's side of that contract, and it lives in the installed payload
 so the checker itself can use it:
 

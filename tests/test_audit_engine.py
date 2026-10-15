@@ -146,6 +146,24 @@ class AuditEngineTests(unittest.TestCase):
         finally:
             shutil.rmtree(runs, ignore_errors=True)
 
+    def test_local_path_markers_match_the_rust_store(self):
+        # records.rs::redact and sanitize() are one convention on two
+        # runtimes: a receipt or review payload must never describe this
+        # machine. The marker list is pinned textually - an edit on one side
+        # fails the other instead of silently diverging.
+        import re
+        text = (REPO / "src" / "records.rs").read_text()
+        markers = re.search(r"const MARKERS: \[&str; \d+\] = \[([^\]]+)\]", text).group(1)
+        rust = [m.strip().strip('"').replace("\\\\", "\\") for m in markers.split(",")]
+        self.assertEqual(list(audit_engine.LOCAL_PATH_MARKERS), rust)
+
+    def test_local_path_scrubbing_covers_temp_roots(self):
+        for sample in ("/var/folders/ab/cd/T/gitvault-checker-1/run",
+                       "/Users/who/x", "/home/who/x", "C:\\Users\\who\\x",
+                       "C:/Users/who/x"):
+            self.assertEqual(audit_engine.sanitize(f"see {sample} end"),
+                             "see [LOCAL_PATH] end")
+
     def test_retention_window_matches_the_rust_store(self):
         # records.rs and prune_runs are the same retention convention on two
         # runtimes; a change on one side must not leave the other stale.

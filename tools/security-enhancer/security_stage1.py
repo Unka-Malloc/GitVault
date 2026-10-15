@@ -26,6 +26,7 @@ from __future__ import annotations
 import re
 from pathlib import PurePosixPath
 
+import audit_engine
 from audit_engine import git as _git
 
 MAX_SCAN_BYTES = 1024 * 1024
@@ -97,12 +98,10 @@ def _skipped(path):
 
 
 def _changed_paths(repo, target):
-    if target["scope"] == "range":
-        listing = _git(repo, "diff", "--name-only", "--no-renames", target["base"], target["head"])
-    else:
-        listing = _git(repo, "ls-tree", "-r", "--name-only", target["head"])
-    return [line.strip() for line in listing.stdout.decode("utf-8", "replace").splitlines()
-            if line.strip()]
+    # Delegated to the shared engine: stage one and the paid stage must see
+    # the same path set - a newline-split listing once disagreed with the
+    # semantic stage's NUL-delimited one on names with newlines or quotes.
+    return audit_engine.outgoing_paths(repo, target)
 
 
 def _blob(repo, target, path):

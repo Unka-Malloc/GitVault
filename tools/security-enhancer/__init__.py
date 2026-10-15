@@ -34,24 +34,6 @@ ROOT = Path(__file__).resolve().parent
 DOMAINS = ("dependency_supply_chain", "ci_workflow_authority", "secret_handling",
            "transport_security", "authz_defaults", "container_runtime", "release_artifacts")
 
-# The engine's contract surface, re-exported for callers and tests that hold
-# this module.
-sanitize = engine.sanitize
-sanitize_source = engine.sanitize_source
-safe_path = engine.safe_path
-git = engine.git
-write_json = engine.write_json
-credential = engine.credential
-declared_runtime = engine.declared_runtime
-review_ranges = engine.review_ranges
-EMPTY_TREE = engine.EMPTY_TREE
-SENSITIVE_PARTS = engine.SENSITIVE_PARTS
-SENSITIVE_SUFFIXES = engine.SENSITIVE_SUFFIXES
-SENSITIVE_PREFIXES = engine.SENSITIVE_PREFIXES
-TEMPLATE_NAMES = engine.TEMPLATE_NAMES
-RUNTIME_VALUE = engine.RUNTIME_VALUE
-PI_THINKING = engine.PI_THINKING
-
 
 class Review(engine.Review):
     """Security Enhancer's review object: the engine's machinery plus the
@@ -75,10 +57,7 @@ def tool_plan(review):
          f"static stage already reported), then diff every changed file to its end; read is "
          f"{engine.READ_PAGE_LINES} lines with start; find is a literal search over the range. "
          "Credential containers are unavailable by design.",
-         {"operation": {"type": "string", "enum": ["inventory", "list", "diff", "read", "find"]},
-          "path": {"type": "string"}, "pattern": {"type": "string"}, "text": {"type": "string"},
-          "start": {"type": "integer"}, "offset": {"type": "integer"},
-          "revision": {"type": "string", "enum": ["outgoing", "base"]}},
+         engine.context_schema(["inventory", "list", "diff", "read", "find"]),
          ["operation"], review.context),
         ("security_submit_review",
          "Submit the final hardening verdict once, with all seven domains accounted for.",
@@ -114,7 +93,6 @@ SPEC = engine.CheckerSpec(
     stage1=lambda repo, targets: stage1.audit_all(repo, targets),
     stage1_lines=_stage1_lines,
     stage_label="static",
-    session=True,
     refusal="The static security checklist refused this operation; nothing was published",
     scope_extra=lambda target, summary: {"kind": target["kind"],
                                          "surfaces": (summary or {}).get("surfaces", [])},

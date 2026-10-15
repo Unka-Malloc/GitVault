@@ -48,25 +48,6 @@ ROOT = Path(__file__).resolve().parent
 DOMAINS = ("privacy", "business_secret", "operations_data", "machine_path",
            "personal_info", "credentials", "tooling", "hardcoding")
 
-# The engine's contract surface, re-exported for callers and tests that hold
-# this module.
-sanitize = engine.sanitize
-sanitize_source = engine.sanitize_source
-safe_path = engine.safe_path
-git = engine.git
-write_json = engine.write_json
-credential = engine.credential
-declared_runtime = engine.declared_runtime
-origin_slug = engine.origin_slug
-review_ranges = engine.review_ranges
-EMPTY_TREE = engine.EMPTY_TREE
-SENSITIVE_PARTS = engine.SENSITIVE_PARTS
-SENSITIVE_SUFFIXES = engine.SENSITIVE_SUFFIXES
-SENSITIVE_PREFIXES = engine.SENSITIVE_PREFIXES
-TEMPLATE_NAMES = engine.TEMPLATE_NAMES
-RUNTIME_VALUE = engine.RUNTIME_VALUE
-PI_THINKING = engine.PI_THINKING
-
 
 class Review(engine.Review):
     """Clean Auditor's review object: the engine's machinery bound to this
@@ -83,10 +64,7 @@ def tool_plan(review):
          f"Inspect the immutable outgoing range. Start with inventory, then diff every changed "
          f"file to its end; read is {engine.READ_PAGE_LINES} lines with start; find is a literal "
          "search over the range. Credential containers are unavailable by design.",
-         {"operation": {"type": "string", "enum": ["inventory", "list", "diff", "read", "find"]},
-          "path": {"type": "string"}, "pattern": {"type": "string"}, "text": {"type": "string"},
-          "start": {"type": "integer"}, "offset": {"type": "integer"},
-          "revision": {"type": "string", "enum": ["outgoing", "base"]}},
+         engine.context_schema(["inventory", "list", "diff", "read", "find"]),
          ["operation"], review.context),
         ("clean_submit_review",
          "Submit the final privacy verdict once, with every domain and both standing "
@@ -132,7 +110,6 @@ SPEC = engine.CheckerSpec(
         "No arbitrary turn or time limit applies."),
     root=ROOT,
     stage1=_stage1,
-    session=True,
     refusal="The deterministic audit refused this operation; nothing was published",
     scope_extra=lambda target, summary: {"kind": target["kind"]},
 )

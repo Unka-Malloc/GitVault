@@ -88,8 +88,8 @@ the run scope file is deleted when the run ends.
 
 ## Syncing a published profile
 
-The prompt and skill this agent runs on are hosted in a profile registry (`GITVAULT_PROFILES_URL`; the default
-points at a local development registry) and versioned by git tag. `install.py` seeds them once; after
+The prompt and skill this agent runs on are hosted in a profile registry (`GITVAULT_PROFILES_URL`,
+which must be set explicitly; the local development registry is `http://127.0.0.1:8891`) and versioned by git tag. `install.py` seeds them once; after
 that the registry is the source:
 
 ```sh

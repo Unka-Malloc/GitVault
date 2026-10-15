@@ -1,61 +1,20 @@
-import contextlib
-import importlib.util
-import io
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
-import tempfile
 import unittest
 from unittest.mock import patch
 
-# The payload ships `profile_sync`; in the repository it lives once, in
-# tools/agent-profiles, exactly as the installer copies it in.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "agent-profiles"))
-SOURCE = Path(__file__).resolve().parents[1] / "tools/security-enhancer"
-spec = importlib.util.spec_from_file_location("security_enhancer", SOURCE / "__init__.py")
-se = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(se)
+from checker_fixture import CheckerFixture, completed, load_checker
+
+se = load_checker("security-enhancer")
+SOURCE = Path(se.__file__).parent
 
 
-def completed(command, code=0, stdout="", stderr=""):
-    return subprocess.CompletedProcess(command, code, stdout, stderr)
-
-
-class SecurityEnhancerTests(unittest.TestCase):
-    def setUp(self):
-        output = contextlib.redirect_stdout(io.StringIO())
-        output.__enter__()
-        self.addCleanup(output.__exit__, None, None, None)
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
-        self.repo = self.root / "repo"
-        self.repo.mkdir()
-        self.git("init", "-q")
-        self.git("config", "core.hooksPath", str(self.root / "no-hooks"))
-        self.git("config", "user.name", "Synthetic Enhancer")
-        self.git("config", "user.email", "enhancer@example.invalid")
-        (self.repo / "app.js").write_text("export const value = 1\n")
-        self.git("add", "app.js")
-        self.git("commit", "-qm", "base")
-        self.base = self.git("rev-parse", "HEAD")
-        (self.repo / "handler.js").write_text("export const handler = () => 2\n")
-        self.git("add", "handler.js")
-        self.git("commit", "-qm", "outgoing")
-        self.git("branch", "-m", "work")  # the ref the fabricated push line names
-        self.head = self.git("rev-parse", "HEAD")
-        self.push_env = self.push_env_for(self.head)
-        self.profile = self.root / "profile"
-        credential_file = self.root / "credentials.env"
-        credential_file.write_text("EXAMPLE_API_KEY=synthetic-fixture-only\nOTHER_SECRET=never-forward\n")
-        self.settings = {"profile": str(self.profile), "pi": str(self.root / "pi"),
-                         "credential_file": str(credential_file)}
-
-    def git(self, *args):
-        return subprocess.check_output(["git", "-C", str(self.repo), *args],
-                                       stderr=subprocess.DEVNULL).decode().strip()
+class SecurityEnhancerTests(CheckerFixture):
+    module = se
+    changed_file = "handler.js"
 
     def write(self, name, text):
         path = self.repo / name
@@ -67,17 +26,6 @@ class SecurityEnhancerTests(unittest.TestCase):
         self.git("add", "-A")
         self.git("commit", "-qm", message, "--allow-empty")
         return self.git("rev-parse", "HEAD")
-
-    def push_env_for(self, head, base=None):
-        """The push line names the ref, its tip, and the published tip."""
-        return {"GITVAULT_EVENT": "pre-push",
-                "GITVAULT_PUSH_REFS": f"refs/heads/work {head} refs/heads/work {base or self.base}"}
-
-    def report(self, verdict="pass", overrides=None):
-        report = {"verdict": verdict, "summary": "Synthetic range reviewed", "findings": [], "unknowns": [],
-                  "coverage": {k: {"status": "not-applicable", "reason": "Synthetic fixture"} for k in se.DOMAINS}}
-        report.update(overrides or {})
-        return report
 
     # -- range resolution ---------------------------------------------------
 
@@ -261,24 +209,6 @@ class SecurityEnhancerTests(unittest.TestCase):
         self.assertEqual(len(review.context({"operation": "inventory"})["surfaces"]), 2)
 
     # -- the cloud stage ----------------------------------------------------
-
-    def stub_pi(self, calls):
-        def stub(command, **kwargs):
-            # Sessions resume within the same range key; nothing from an
-            # earlier repository or range can leak into the judgement.
-            self.assertIn("--session-dir", command)
-            self.assertEqual(command[0], self.settings["pi"])
-            self.assertEqual(command[command.index("--provider") + 1], "example")
-            self.assertIn(str(SOURCE / "pi-bridge.ts"), command)
-            self.assertNotIn("OTHER_SECRET", kwargs["env"])
-            self.assertEqual(kwargs["env"]["EXAMPLE_API_KEY"], "synthetic-fixture-only")
-            run_dir = Path(kwargs["env"]["GITVAULT_RUN_DIR"])
-            calls.append(run_dir)
-            review = se.Review(run_dir)
-            review.context({"operation": "diff", "path": "handler.js"})
-            review.submit(self.report())
-            return completed(command, 0, json.dumps({"type": "agent_settled", "aborted": False}) + "\n")
-        return stub
 
     def test_each_run_is_a_fresh_conversation_and_a_fresh_directory(self):
         calls = []

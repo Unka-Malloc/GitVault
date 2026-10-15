@@ -104,6 +104,15 @@ engine's portable floor — `-P` and `PYTHONSAFEPATH=1`, which stop `sys.path`
 shadowing but leave user site-packages and `PYTHONPATH` alone; register the
 command with `-I` itself when the stronger isolation is wanted.
 
+**Tracked repository hooks run.** The hook dispatcher also invokes a
+checked-out `.githooks/<event>` when it is executable, so a repository's own
+hooks keep working under GitVault. That is a declared exception to "nothing
+is read from the repository": a cloned repo can ship executable hooks that
+run as this user on commit and push. They cannot bypass the gate (the gate
+runs first and a non-zero exit stops the chain), but the execution surface
+exists — review `.githooks/` after cloning as you would `Makefile` or CI
+scripts.
+
 `git push --no-verify` bypasses the git `pre-push` hook — git offers no counter
 to it, so the push hook alone is a convenience. The boundaries that cannot be
 bypassed are the ones GitVault controls: `pr create`, `pr merge` and

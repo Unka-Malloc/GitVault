@@ -89,13 +89,42 @@ SENSITIVE_PREFIXES = (".env", ".dev.vars")
 TEMPLATE_NAMES = {".env.example", ".env.sample", ".env.template", ".env.dist", ".dev.vars.example"}
 
 
+# Home and temp prefixes a receipt or a review payload must never spell out:
+# the store may not describe the machine. This is one convention on two
+# runtimes - records.rs::redact carries the same list, and a drift test pins
+# the pair, so adding a marker on one side fails the other.
+LOCAL_PATH_MARKERS = ("/Users/", "/home/", "/var/folders/", "C:\\Users\\", "C:/Users/")
+
+
+def _local_path(text):
+    # Earliest marker wins, same as records.rs::redact: a later marker inside a
+    # copied span would never be seen again. Runs end at the first stop char,
+    # matching the Rust stop set exactly.
+    stops = set(' \t\n\r"\'`<')
+    out = []
+    while text:
+        hits = [(text.find(m), m) for m in LOCAL_PATH_MARKERS if text.find(m) >= 0]
+        if not hits:
+            out.append(text)
+            break
+        at, marker = min(hits)
+        end = len(text)
+        for stop in stops:
+            found = text.find(stop, at + len(marker))
+            if found >= 0:
+                end = min(end, found)
+        out.append(text[:at] + "[LOCAL_PATH]")
+        text = text[end:]
+    return "".join(out)
+
+
 def sanitize(text):
     text = re.sub(r"-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----",
                   lambda match: "[PRIVATE_KEY]" + "\n" * match[0].count("\n"), text)
     text = re.sub(r"\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[A-Z0-9]{16})\b", "[CREDENTIAL]", text)
     text = re.sub(r"(?i)((?:api[_-]?key|password|secret|access[_-]?token|authorization)[\"']?\s*[=:]\s*)[\"'][^\"'\n]+[\"']", r'\1"[REDACTED]"', text)
     text = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]+=*", "Bearer [REDACTED]", text)
-    text = re.sub(r"(?:/Users/|/home/|[A-Z]:\\Users\\)[^\s\"'`<>]+", "[LOCAL_PATH]", text)
+    text = _local_path(text)
     text = re.sub(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", "[EMAIL]", text)
     text = re.sub(r"\b(?:10\.(?:\d{1,3}\.){2}\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b", "[PRIVATE_IP]", text)
     return text
@@ -111,6 +140,19 @@ def sanitize_source(raw):
     text = re.sub(r"(?i)((?:account_id|database_id|zone_id|tenant_id)[\"']?\s*[=:]\s*)[\"'][^\"'\n]+[\"']", r'\1"[IDENTIFIER]"', text)
     text = re.sub(r"(?im)^(\s*(?:[- ]*\s*)?(?:[A-Z_]*(?:TOKEN|SECRET|PASSWORD|API_KEY)[A-Z_]*)\s*[=:]\s*)([^\s#]+)", r"\1[REDACTED]", text)
     return text
+
+
+def outgoing_paths(repo, target):
+    """The paths an operation carries - one enumeration so the deterministic
+    stage and the paid stage can never judge different sets: a NUL-delimited
+    diff for a range, ls-tree for a snapshot. Renames count as delete+add,
+    paths with newlines or quotes cannot split entries."""
+    if target["scope"] == "range":
+        out = git(repo, "diff", "--name-only", "--no-renames", "-z",
+                  target["base"] or EMPTY_TREE, target["head"])
+    else:
+        out = git(repo, "ls-tree", "-rz", "--name-only", target["head"])
+    return [p for p in out.stdout.decode(errors="replace").split("\0") if p]
 
 
 def safe_path(path):
@@ -177,6 +219,17 @@ _COVERAGE_ENTRY = {"type": "object", "properties": {
     "status": {"type": "string", "enum": ["reviewed", "not-applicable", "unknown"]},
     "reason": {"type": "string"}},
     "required": ["status", "reason"], "additionalProperties": False}
+
+
+def context_schema(operations, revisions=("outgoing", "base")):
+    """The shared context tool's parameter surface. One builder so a new key
+    cannot land on three checkers while the fourth tells the model a
+    different contract."""
+    return {"operation": {"type": "string", "enum": list(operations)},
+            "path": {"type": "string"}, "pattern": {"type": "string"},
+            "text": {"type": "string"}, "start": {"type": "integer"},
+            "offset": {"type": "integer"},
+            "revision": {"type": "string", "enum": list(revisions)}}
 
 
 def coverage_schema(domains):
@@ -395,17 +448,21 @@ class CheckerSpec:
     - ``tool_plan``: callable(review) -> the checker's tool surface.
     - ``make_review``: callable(run_dir) -> Review (handles mode swaps).
     - ``task``: callable(review) -> the instruction appended to the Pi command.
-    - ``session``: keep the Pi session dir for continuation across retries.
     - ``scope_extra``: callable(target, summary) -> dict folded into scope.json.
     - ``receipt_after``: callable(report, target, summary, summaries) mutating
       the accepted report before it is written.
     - ``root``: the checker's directory — installation.json, policy.md and the
       Pi bridge live there.
+
+    Every review keeps its Pi session dir so an interrupted run continues
+    instead of replaying paid work; there is no no-session mode because a
+    paid review that must start over is the failure this engine exists to
+    prevent.
     """
 
     def __init__(self, name, label, description, domains, tool_plan, make_review, task, root,
                  stage1=None, stage1_lines=None, stage_label="deterministic",
-                 refusal="", session=False, scope_extra=None, receipt_after=None):
+                 refusal="", scope_extra=None, receipt_after=None):
         self.name = name
         self.label = label
         self.description = description
@@ -424,7 +481,6 @@ class CheckerSpec:
             for hit in summary.get("hits", [])])
         self.stage_label = stage_label
         self.refusal = refusal
-        self.session = session
         self.scope_extra = scope_extra or (lambda target, summary: {})
         # The default receipt carries the deterministic stage's summaries and
         # the fallback marker — one shape, written once, instead of three
@@ -484,8 +540,8 @@ def pi_review(run_dir, settings, runtime, spec, spawn=subprocess.run):
     extension: Pi owns only the conversation, the Python plugin owns the
     tools, the evidence and the receipt. Returns (usage, duration_ms) or
     raises when the run did not settle into a report; no wall-clock kill, no
-    second reviewer. Checkers that keep the session directory (``spec.session``)
-    resume an interrupted run instead of replaying finished work."""
+    second reviewer. The session directory lives inside run_dir, so an
+    interrupted run continues its conversation instead of replaying it."""
     run_dir = Path(run_dir)
     review = spec.make_review(run_dir)
     manifest = [{"name": name, "description": description,
@@ -505,24 +561,17 @@ def pi_review(run_dir, settings, runtime, spec, spawn=subprocess.run):
                "--extension", str(review.ROOT / "pi-bridge.ts"),
                "--tools", ",".join(entry["name"] for entry in manifest),
                "--system-prompt", prompt]
-    if spec.session:
-        command += ["--session-dir", str(run_dir)]
-        marker = run_dir / "session.used"
-        recovery = run_dir / "recovery-prompt.txt"
-        task = spec.task(review)
-        if marker.exists():
-            command.append("--continue")
-            task = ("Continue this same review from its preserved conversation and draft. "
-                    "Correct the outstanding report fields; reuse evidence and do not restart the audit.")
-        elif recovery.exists():
-            task = recovery.read_text()
-        command.append(task)
+    command += ["--session-dir", str(run_dir)]
+    marker = run_dir / "session.used"
+    if marker.exists():
+        command.append("--continue")
+        command.append("Continue this same review from its preserved conversation and draft. "
+                       "Correct the outstanding report fields; reuse evidence and do not restart the audit.")
     else:
-        command += ["--no-session", spec.task(review)]
+        command.append(spec.task(review))
     started = time.monotonic()
     result = spawn(command, env=env, cwd=run_dir, capture_output=True, text=True)
-    if spec.session:
-        marker.touch()
+    marker.touch()
     # Pi's JSONL stream: assistant messages carry provider usage;
     # agent_settled (not agent_end, which automatic retries can follow) marks
     # a settled run. Output stays private; only the sanitized receipt
@@ -564,9 +613,7 @@ def review_range(repo, settings, target, summary, stage_summaries, runtime, spec
     head, base = target["head"], target["base"]
     tree = subprocess.run(["git", "-C", str(repo), "rev-parse", f"{head}^{{tree}}"],
                           capture_output=True, check=True).stdout.decode().strip()
-    changed = git(repo, "diff", "--name-only", "--no-renames", "-z",
-                  base or EMPTY_TREE, tree).stdout.decode().rstrip("\0").split("\0")
-    changed = [p for p in changed if p]
+    changed = outgoing_paths(repo, {"scope": "range", "base": base, "head": tree})
     # A path the tool surface refuses is a review that can never complete:
     # "every changed diff reviewed" could not hold even after paying for the
     # semantic stage. Refuse it here, the same way the deterministic stages
@@ -588,11 +635,10 @@ def review_range(repo, settings, target, summary, stage_summaries, runtime, spec
     resume_key = {"base": base, "head": head, "items": list(spec.domains),
                   "provider": runtime["provider"], "model": runtime["model"],
                   "effort": runtime["effort"]}
-    run_dir = resume_dir(runs, resume_key) if spec.session else None
+    run_dir = resume_dir(runs, resume_key)
     if run_dir is None:
         run_dir = Path(tempfile.mkdtemp(prefix="review-", dir=runs))
-        if spec.session:
-            write_json(run_dir / "resume.json", resume_key)
+        write_json(run_dir / "resume.json", resume_key)
     elif any(p.name not in {"scope.json", "resume.json"} for p in run_dir.iterdir()):
         # A prior attempt left work in this dir: mark it so pi_review
         # continues that conversation instead of replaying it.
@@ -633,10 +679,8 @@ def review_range(repo, settings, target, summary, stage_summaries, runtime, spec
             if receipt.get("gate_status") == "pending":
                 receipt["gate_status"] = "refused"
                 write_json(report_path, receipt)
-        elif not spec.session:
-            shutil.rmtree(run_dir, ignore_errors=True)
-        # A session checker's unfinished dir is the resume point for
-        # `--continue`; deleting it would discard the paid work it holds.
+        # An unfinished dir keeps its resume.json and session files: the next
+        # gate over this range continues it rather than repaying for it.
 
 
 def run(repo, settings, spec, spawn=subprocess.run):
@@ -737,6 +781,14 @@ def bind(ns, spec):
     ``serve_tools``, ``main`` — is identical for every checker; generating it
     from the SPEC keeps four modules from drifting into four copies of the
     same forwarding block."""
+    # The contract surface tests and callers read off a checker module:
+    # installed once here so a new public symbol cannot exist on three
+    # checkers and be missing on the fourth.
+    for name in ("sanitize", "sanitize_source", "safe_path", "git", "write_json",
+                 "credential", "declared_runtime", "origin_slug", "review_ranges",
+                 "SENSITIVE_PARTS", "SENSITIVE_SUFFIXES", "SENSITIVE_PREFIXES",
+                 "TEMPLATE_NAMES", "EMPTY_TREE", "RUNTIME_VALUE", "PI_THINKING"):
+        ns[name] = globals()[name]
     ns["audited"] = lambda settings, base, head, runtime: \
         audited(settings, base, head, runtime, spec)
     ns["pi_review"] = lambda run_dir, settings, runtime, spawn=subprocess.run: \
