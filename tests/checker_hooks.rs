@@ -235,9 +235,9 @@ fn merge_is_refused_before_the_api_call() {
 
 #[test]
 fn a_run_is_recorded_without_this_machines_paths() {
-    // The record is what the dashboard page reads, so it must describe the work
-    // and not the machine: a checker that prints a path under HOME gets it
-    // replaced before anything is stored.
+    // The record is built for a reader other than the person who ran the gate,
+    // so it must describe the work and not the machine: a checker that prints a
+    // path under HOME gets it replaced before anything is stored.
     let fixture = publication_fixture("'pr'", false);
     let root = fixture.0.clone();
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_gitvault"))

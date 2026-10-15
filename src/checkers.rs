@@ -104,7 +104,7 @@ impl OutcomeKind {
         !matches!(self, Self::Passed)
     }
 
-    fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         match self {
             Self::Passed => "passed".into(),
             Self::Failed(code) => format!("failed (exit {code})"),

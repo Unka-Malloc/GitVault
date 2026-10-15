@@ -227,6 +227,13 @@ impl Vault {
         self.encryption_key().map(|_| ())
     }
 
+    /// The vault key when it is readable, for binding the unlock window's
+    /// integrity tag. A caller that can obtain this could read the whole vault,
+    /// so it is also exactly the capability a forged window would need.
+    pub(crate) fn window_key(&self) -> Option<Vec<u8>> {
+        self.encryption_key().ok()
+    }
+
     /// The private key held for an account's SSH authentication.
     pub fn ssh_key_for(&self, account: &str) -> Result<String> {
         self.load()?

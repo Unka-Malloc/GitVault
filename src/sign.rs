@@ -20,7 +20,7 @@
 //! drops. Signing a commit never takes that path.
 
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
@@ -171,17 +171,19 @@ pub fn run(cfg: &Config, vault: &Vault, args: &[String], cwd: &PathBuf) -> Resul
     let key = vault.signing_key_for(&account)?;
     let passphrase = vault.passphrase_for(&account);
 
-    let (sock, agent_pid) = start_agent()?;
-    if let Err(e) = load_key(&sock, &key, passphrase.as_deref()) {
-        let _ = kill_agent(agent_pid.as_deref());
+    let agent = crate::ssh::start_agent()?;
+    // Signing keys are always stored encrypted (import requires the passphrase),
+    // so a missing one is a setup defect, not an unencrypted key.
+    if let Err(e) = crate::ssh::load_key(&agent.sock, &key, passphrase.as_deref(), true) {
+        agent.stop();
         return Err(e);
     }
 
     // Signing itself uses the agent; `-f` only needs a public key, which holds no
     // secret. The public key's temporary file lives inside this guard and is
     // removed even if any step below fails.
-    let pub_text = public_key_from_agent(&sock, &crate::vault::Store::fingerprint(&key))?;
-    let pub_file = TempSecret::write(&pub_text)?;
+    let pub_text = public_key_from_agent(&agent.sock, &crate::vault::Store::fingerprint(&key))?;
+    let pub_file = crate::ssh::TempSecret::write(&pub_text, 0o600)?;
 
     // Measured invocation behaviour:
     //
@@ -214,8 +216,9 @@ pub fn run(cfg: &Config, vault: &Vault, args: &[String], cwd: &PathBuf) -> Resul
         // exactly where git reads the signature from. Confirmed by spying on git's
         // own invocation of ssh-keygen: it passes -f <pub> <buffer> and reads
         // "<buffer>.sig" afterwards.
-        .env("SSH_AUTH_SOCK", &sock)
+        .env("SSH_AUTH_SOCK", &agent.sock)
         .env_remove("SSH_AGENT_PID")
+        .env_remove("GITVAULT_ASKPASS_VALUE")
         // stdout is deliberately NOT redirected. Doing so was the actual cause of
         // every commit verifying as bad, isolated by minimal reproduction:
         //
@@ -230,76 +233,35 @@ pub fn run(cfg: &Config, vault: &Vault, args: &[String], cwd: &PathBuf) -> Resul
 
     // ssh-keygen wrote the signature to stdout, which is where git reads it. The
     // only remaining work is to stop the temporary agent.
-    let _ = kill_agent(agent_pid.as_deref());
+    agent.stop();
     Ok(status.code().unwrap_or(1))
-}
-
-/// A file that deletes itself, on success or on any early return.
-///
-/// A private key has to touch the filesystem for `ssh-keygen` to read it: the
-/// `-f /dev/stdin` route fails its permission check (the pipe is 0660 and cannot be
-/// tightened), and without `-f` the tool prompts on the terminal. Since a file is
-/// unavoidable, the exposure is bounded to the signer's lifetime and the deletion
-/// is guaranteed by Drop rather than by an explicit call that an error path could
-/// skip.
-struct TempSecret {
-    path: PathBuf,
-}
-
-impl TempSecret {
-    fn write(contents: &str) -> Result<Self> {
-        let path = std::env::temp_dir().join(format!(
-            "gitvault-sign-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::write(&path, contents)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        Ok(Self { path })
-    }
-
-    fn path(&self) -> &std::path::Path {
-        &self.path
-    }
-}
-
-impl Drop for TempSecret {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
 }
 
 /// Derive a public key from private key material, via a self-deleting temp file.
 ///
-/// `ssh-keygen -y` needs a readable path; the stdin routes do not work. See
-/// `TempSecret`.
+/// `ssh-keygen -y` needs a readable path; the `-f /dev/stdin` route fails its
+/// permission check (the pipe is 0660 and cannot be tightened), and without `-f`
+/// the tool prompts on the terminal. Since a file is unavoidable, the exposure
+/// is bounded to the call's lifetime and the deletion is guaranteed by the
+/// `TempSecret` guard rather than by a call an error path could skip.
 pub fn public_key_of_material(private: &str, passphrase: Option<&str>) -> Result<String> {
-    let secret = TempSecret::write(private)?;
+    let secret = crate::ssh::TempSecret::write(private, 0o600)?;
     // `ssh-keygen -y` needs the passphrase for an encrypted key and has no agent to
     // ask, so it is supplied through SSH_ASKPASS. Without this it prompts on a
     // terminal it does not have and the derivation fails.
     let askpass = match passphrase {
-        Some(p) => Some(crate::ssh::askpass_script(p)?),
+        Some(_) => Some(crate::ssh::askpass_script()?),
         None => None,
     };
     let mut cmd = Command::new("ssh-keygen");
     cmd.arg("-y").arg("-f").arg(secret.path());
-    if let Some(path) = &askpass {
-        cmd.env("SSH_ASKPASS", path)
+    if let (Some(guard), Some(p)) = (&askpass, passphrase) {
+        cmd.env("SSH_ASKPASS", guard.path())
             .env("SSH_ASKPASS_REQUIRE", "force")
-            .env("DISPLAY", ":0");
+            .env("DISPLAY", ":0")
+            .env("GITVAULT_ASKPASS_VALUE", p);
     }
     let out = cmd.output().context("failed to run ssh-keygen -y")?;
-    if let Some(path) = &askpass {
-        let _ = std::fs::remove_file(path);
-    }
     if !out.status.success() {
         bail!(
             "could not derive the public key: {}",
@@ -341,71 +303,9 @@ fn public_key_from_agent(sock: &str, expected_fingerprint: &str) -> Result<Strin
     Ok(format!("{key}\n"))
 }
 
-fn start_agent() -> Result<(String, Option<String>)> {
-    let agent = Command::new("ssh-agent")
-        .arg("-s")
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("failed to start a temporary ssh-agent")?;
-    let out = agent.wait_with_output()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let sock = crate::ssh::extract_agent_var(&text, "SSH_AUTH_SOCK")
-        .ok_or_else(|| anyhow::anyhow!("ssh-agent did not report SSH_AUTH_SOCK"))?;
-    let pid = crate::ssh::extract_agent_var(&text, "SSH_AGENT_PID");
-    Ok((sock, pid))
-}
-
-fn load_key(sock: &str, key: &str, passphrase: Option<&str>) -> Result<()> {
-    let askpass = match passphrase {
-        Some(p) => Some(crate::ssh::askpass_script(p)?),
-        None => None,
-    };
-    let mut cmd = Command::new("ssh-add");
-    cmd.arg("-")
-        .env("SSH_AUTH_SOCK", sock)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    if let Some(path) = &askpass {
-        cmd.env("SSH_ASKPASS", path)
-            .env("SSH_ASKPASS_REQUIRE", "force")
-            .env("DISPLAY", ":0");
-    } else {
-        // Without askpass, ssh-add prompts on the terminal, and anything arriving on
-        // stdin is consumed as the answer - including the key material piped in
-        // below. Measured: "Error loading key (stdin): invalid format". An
-        // unencrypted key must never be fed to a prompting ssh-add.
-        bail!(
-            "no passphrase is held for this key, so ssh-add would prompt and consume \
-             the piped key as the answer\n  \
-             re-import with the passphrase: gitvault auth import-key <account> <file>"
-        );
-    }
-    let mut child = cmd.spawn().context("failed to run ssh-add")?;
-    {
-        use std::io::Write;
-        let mut stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no stdin"))?;
-        stdin.write_all(key.as_bytes())?;
-    }
-    let out = child.wait_with_output()?;
-    if let Some(path) = &askpass {
-        let _ = std::fs::remove_file(path);
-    }
-    if !out.status.success() {
-        bail!(
-            "could not load the signing key: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-fn kill_agent(pid: Option<&str>) -> Result<()> {
-    if let Some(pid) = pid {
-        let _ = Command::new("kill").arg(pid).status();
-    }
-    Ok(())
-}
+// Agent startup, key loading and the askpass helper live in `crate::ssh` - the
+// transport proxy and this one load keys the same way, and one implementation
+// is what keeps their secret-handling guarantees identical.
 
 #[cfg(test)]
 mod tests {

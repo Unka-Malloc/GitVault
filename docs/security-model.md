@@ -16,10 +16,10 @@ generic-password item (`gitvault-vault-key`, overridable via
 
 `gitvault unlock` does not hand out anything. A biometric confirmation
 (`gitvault-touchid`, a small Swift helper over LocalAuthentication) opens a
-time-bounded window written to `~/.config/gitvault/unlock-until` — a timestamp
-plus the machine's boot time, so a restored snapshot cannot resurrect an old
-window. `GITVAULT_UNLOCK_TTL` sets the duration (default 900 s);
-`gitvault lock` closes it immediately.
+time-bounded window written to `~/.config/gitvault/unlock-until` — a timestamp,
+the machine's boot time (so a restored snapshot cannot resurrect an old
+window), and an HMAC tag keyed on the vault key. `GITVAULT_UNLOCK_TTL` sets
+the duration (default 900 s); `gitvault lock` closes it immediately.
 
 During the window a caller may *ask* GitVault to perform an operation. The
 window is a permission, not a possession:
@@ -28,6 +28,12 @@ window is a permission, not a possession:
   user can request operations while it is open. The gate bounds "how long
   after a human confirmed", not "who is asking"; who may act is decided per
   operation by the owner rules and the identity check, not by the window.
+- **A window file cannot be fabricated.** The tag binds the record to the
+  vault key, so minting a valid window requires the same capability as
+  reading the vault directly — a process that could forge the record no
+  longer needs the window. A process that cannot reach the vault key cannot
+  stamp a record the gate accepts; missing or unverifiable state is locked,
+  not assumed.
 - **The vault keychain item has no biometric ACL.** macOS cannot put a
   per-read biometric requirement on a generic-password item created by a
   non-bundled CLI (the access-control variants are unavailable there). The

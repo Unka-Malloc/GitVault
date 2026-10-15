@@ -229,15 +229,6 @@ pub fn begin(cfg: &Config, selected: usize) -> Option<Run> {
     Some(Run { id: dir.file_name()?.to_string_lossy().into_owned(), dir, started_ms: now_ms() })
 }
 
-fn outcome_label(kind: &OutcomeKind) -> String {
-    match kind {
-        OutcomeKind::Passed => "passed".into(),
-        OutcomeKind::Failed(code) => format!("failed (exit {code})"),
-        OutcomeKind::Timeout => "timed out".into(),
-        OutcomeKind::CouldNotRun(why) => format!("could not run: {why}"),
-    }
-}
-
 fn exit_of(kind: &OutcomeKind) -> Option<i32> {
     match kind {
         OutcomeKind::Failed(code) => Some(*code),
@@ -272,7 +263,7 @@ pub fn finish(cfg: &Config, run: Run, ctx: &Context, report: &Report) {
             .map(|o| Outcome {
                 name: o.name.clone(),
                 severity: o.severity.to_string(),
-                outcome: outcome_label(&o.outcome),
+                outcome: o.outcome.label(),
                 exit_code: exit_of(&o.outcome),
                 duration_ms: o.duration_ms,
                 stdout: capture(&o.stdout),

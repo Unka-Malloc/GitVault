@@ -11,12 +11,18 @@
 //!    still be open after one.
 //! 2. **Bounded in time.** A window that never closed would make the confirmation
 //!    a one-time ceremony. `GITVAULT_UNLOCK_TTL` sets the length.
-//! 3. **Not inherited by children.** The in-process key cache is per process, so a
+//! 3. **Integrity-bound to the vault key.** The record carries an HMAC keyed on
+//!    the vault key, so a file nobody confirmed is void. Forging one requires
+//!    silently reading the vault key - the same capability as reading the vault
+//!    itself - which means a process that could forge the window no longer
+//!    needs it.
+//! 4. **Not inherited by children.** The in-process key cache is per process, so a
 //!    process spawned by an agent starts empty and must go through the gate itself.
 //!
 //! What this does NOT do: identify the caller. Any process running as this user can
-//! ask to open a window - it just cannot complete the biometric prompt. The gate
-//! bounds "how long after a human confirmed", not "who is asking".
+//! ask to open a window - it just cannot complete the biometric prompt, and it
+//! cannot stamp a record the gate accepts without the vault key. The gate bounds
+//! "how long after a human confirmed", not "who is asking".
 //!
 //! A note on the keychain item: it is created with `security add-generic-password`
 //! and therefore has no biometric access control, so it can be read silently. The
@@ -40,8 +46,13 @@ pub fn default_ttl_secs() -> u64 {
 }
 
 pub fn state_path() -> PathBuf {
-    if let Ok(explicit) = std::env::var("GITVAULT_UNLOCK_STATE") {
-        return PathBuf::from(explicit);
+    // The state path is fixed in release builds: a path a caller could rewrite
+    // is a window record the caller chose the location of. GITVAULT_UNLOCK_STATE
+    // remains a test hook in debug builds only, like GITVAULT_TOUCHID.
+    if cfg!(debug_assertions) {
+        if let Ok(explicit) = std::env::var("GITVAULT_UNLOCK_STATE") {
+            return PathBuf::from(explicit);
+        }
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     Path::new(&home)
@@ -144,7 +155,7 @@ pub fn ensure_open(
     announce: bool,
     ttl_secs: Option<u64>,
 ) -> Result<SystemTime> {
-    if is_unlocked() {
+    if is_unlocked(vault) {
         return Ok(SystemTime::now());
     }
     if !vault.exists() {
@@ -157,7 +168,10 @@ pub fn ensure_open(
     // Then prove the key is readable, so a window never opens on a machine where every
     // later operation would fail somewhere less obvious.
     vault.verify_key()?;
-    let until = mark_unlocked(Duration::from_secs(secs))?;
+    let key = vault
+        .window_key()
+        .context("vault key became unreadable between verification and stamping")?;
+    let until = mark_unlocked(Duration::from_secs(secs), &key)?;
     if announce {
         let mins = secs / 60;
         if mins >= 1 {
@@ -169,8 +183,28 @@ pub fn ensure_open(
     Ok(until)
 }
 
-/// Record a window opened just now.
-pub fn mark_unlocked(ttl: Duration) -> Result<SystemTime> {
+/// The window record's integrity tag.
+///
+/// Bound to the vault key: minting a valid window requires the same capability
+/// as reading the vault itself, so a process that could forge this file no
+/// longer needs the window at all. An automated process that cannot reach the
+/// vault key cannot produce a record this gate accepts.
+fn window_mac(key: &[u8], expiry: u64, boot: u64) -> String {
+    use hmac::{Hmac, Mac};
+    use hmac::digest::KeyInit;
+    use sha2::Sha256;
+    let mut mac =
+        <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("hmac accepts a key of any length");
+    mac.update(format!("gitvault-unlock:{expiry}:{boot}").as_bytes());
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Record a window opened just now, tagged with the vault key.
+pub fn mark_unlocked(ttl: Duration, key: &[u8]) -> Result<SystemTime> {
     let until = SystemTime::now() + ttl;
     let until_secs = until
         .duration_since(UNIX_EPOCH)
@@ -185,8 +219,9 @@ pub fn mark_unlocked(ttl: Duration) -> Result<SystemTime> {
             let _ = restrict(parent, 0o700);
         }
     }
-    // "<expiry> <boot-time>": the boot stamp is what makes a stale file detectable.
-    std::fs::write(&path, format!("{until_secs} {boot}\n"))?;
+    // "<expiry> <boot-time> <hmac>": the boot stamp makes a stale file
+    // detectable; the tag makes a fabricated one detectable.
+    std::fs::write(&path, format!("{until_secs} {boot} {}\n", window_mac(key, until_secs, boot)))?;
     restrict(&path, 0o600)?;
     Ok(until)
 }
@@ -202,13 +237,13 @@ pub fn clear() -> Result<()> {
     Ok(())
 }
 
-/// Remaining seconds in the current window; 0 when locked or stale.
-pub fn remaining() -> u64 {
+/// Remaining seconds in the current window; 0 when locked, stale or forged.
+pub fn remaining(vault: &crate::vault::Vault) -> u64 {
     let Ok(raw) = std::fs::read_to_string(state_path()) else {
         return 0;
     };
     let mut parts = raw.split_whitespace();
-    let (Some(until), Some(stamp)) = (parts.next(), parts.next()) else {
+    let (Some(until), Some(stamp), Some(tag)) = (parts.next(), parts.next(), parts.next()) else {
         return 0;
     };
     let (Ok(until), Ok(stamp)) = (until.parse::<u64>(), stamp.parse::<u64>()) else {
@@ -222,11 +257,22 @@ pub fn remaining() -> u64 {
         _ => return 0,
     }
 
+    // A record nobody confirmed is void: the tag is keyed on the vault key, so
+    // forging it requires the same access as reading the vault directly. A
+    // machine where the key cannot be read cannot verify the window either -
+    // fail closed.
+    let Some(key) = vault.window_key() else {
+        return 0;
+    };
+    if window_mac(&key, until, stamp) != tag {
+        return 0;
+    }
+
     until.saturating_sub(now_secs())
 }
 
-pub fn is_unlocked() -> bool {
-    remaining() > 0
+pub fn is_unlocked(vault: &crate::vault::Vault) -> bool {
+    remaining(vault) > 0
 }
 
 // ------------------------------------------------------------ in-process cache
@@ -280,29 +326,55 @@ mod tests {
         out
     }
 
+    fn seeded_vault(key: &[u8; 32]) -> crate::vault::Vault {
+        // window_key() consults the in-process cache first, so a synthetic key
+        // stands in for the keychain item without touching it. The key must be
+        // 32 bytes like a real vault key: a sibling test can pick it up through
+        // the same cache, and a wrong length would panic the cipher.
+        crate::unlock::cache_key(key, Duration::from_secs(60));
+        crate::vault::Vault::open().unwrap()
+    }
+
     #[test]
     fn window_opens_and_closes() {
         with_state("open", || {
             clear().unwrap();
-            assert_eq!(remaining(), 0);
-            assert!(!is_unlocked());
+            let key = b"synthetic-window-key-01234567890";
+            let vault = seeded_vault(key);
+            assert_eq!(remaining(&vault), 0);
+            assert!(!is_unlocked(&vault));
 
-            mark_unlocked(Duration::from_secs(60)).unwrap();
-            assert!(is_unlocked());
-            assert!(remaining() > 50);
+            mark_unlocked(Duration::from_secs(60), key).unwrap();
+            assert!(is_unlocked(&vault));
+            assert!(remaining(&vault) > 50);
 
+            // A forged record — right shape, tag nobody minted — is still locked.
+            let forged = format!("{} {} {}\n", now_secs() + 3600, boot_time().unwrap_or(0), "0".repeat(64));
+            std::fs::write(state_path(), forged).unwrap();
+            assert_eq!(remaining(&vault), 0, "a tag the vault key did not mint must lock");
+            // A record minted under a different key is equally void.
+            let boot = boot_time().unwrap_or(0);
+            let expiry = now_secs() + 3600;
+            let alien = window_mac(b"a-different-key-0123456789ab", expiry, boot);
+            std::fs::write(state_path(), format!("{expiry} {boot} {alien}\n")).unwrap();
+            assert_eq!(remaining(&vault), 0, "a tag under another key must lock");
+
+            mark_unlocked(Duration::from_secs(60), key).unwrap();
             clear().unwrap();
-            assert!(!is_unlocked());
+            assert!(!is_unlocked(&vault));
         });
     }
 
     #[test]
     fn an_expired_window_is_locked() {
         with_state("expired", || {
+            clear().unwrap();
+            let key = b"synthetic-window-key-01234567890";
+            let vault = seeded_vault(key);
             let boot = boot_time().unwrap_or(0);
-            std::fs::write(state_path(), format!("1 {boot}\n")).unwrap();
-            assert_eq!(remaining(), 0);
-            assert!(!is_unlocked());
+            std::fs::write(state_path(), format!("1 {boot} {}\n", window_mac(key, 1, boot))).unwrap();
+            assert_eq!(remaining(&vault), 0);
+            assert!(!is_unlocked(&vault));
         });
     }
 
@@ -311,26 +383,37 @@ mod tests {
         // The point of the boot stamp: a window that survived a restart must not
         // still be open.
         with_state("prior-boot", || {
+            clear().unwrap();
+            let key = b"synthetic-window-key-01234567890";
+            let vault = seeded_vault(key);
             let current = boot_time().unwrap_or(1);
             let different = current.wrapping_sub(1);
+            let expiry = now_secs() + 3600;
 
-            std::fs::write(state_path(), format!("{}\n", now_secs() + 3600)).unwrap();
-            assert_eq!(remaining(), 0, "a missing boot stamp must lock");
+            std::fs::write(state_path(), format!("{expiry}\n")).unwrap();
+            assert_eq!(remaining(&vault), 0, "a missing boot stamp must lock");
 
-            std::fs::write(state_path(), format!("{} {different}\n", now_secs() + 3600)).unwrap();
-            assert_eq!(remaining(), 0, "a different boot session must lock");
+            let tag = window_mac(key, expiry, different);
+            std::fs::write(state_path(), format!("{expiry} {different} {tag}\n")).unwrap();
+            assert_eq!(remaining(&vault), 0, "a different boot session must lock");
         });
     }
 
     #[test]
     fn a_missing_or_malformed_state_file_is_locked() {
         with_state("missing", || {
+            clear().unwrap();
+            let vault = seeded_vault(b"synthetic-window-key-01234567890");
             let _ = std::fs::remove_file(state_path());
-            assert_eq!(remaining(), 0);
+            assert_eq!(remaining(&vault), 0);
             std::fs::write(state_path(), "not a number\n").unwrap();
-            assert_eq!(remaining(), 0);
+            assert_eq!(remaining(&vault), 0);
             std::fs::write(state_path(), "").unwrap();
-            assert_eq!(remaining(), 0);
+            assert_eq!(remaining(&vault), 0);
+            // The legacy two-field record predates the integrity tag; it cannot
+            // stand in for a window nobody confirmed.
+            std::fs::write(state_path(), format!("{} {}\n", now_secs() + 3600, boot_time().unwrap_or(0))).unwrap();
+            assert_eq!(remaining(&vault), 0, "a record without an integrity tag must lock");
         });
     }
 

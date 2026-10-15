@@ -74,16 +74,7 @@ impl Repo {
     /// `Owner/Repo` slug parsed from the origin remote, which is what external
     /// tooling (the audit scanner, for one) expects as a repository identifier.
     pub fn slug(&self) -> Option<String> {
-        let remote = self.remote.as_deref()?;
-        let s = remote.trim();
-        let s = s.strip_suffix(".git").unwrap_or(s);
-        let path = if let Some(rest) = s.split_once("://").map(|(_, r)| r) {
-            rest.split_once('/').map(|(_, p)| p)?
-        } else if let Some((_, rest)) = s.split_once(':') {
-            rest
-        } else {
-            return None;
-        };
+        let path = remote_path(self.remote.as_deref()?)?;
         let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
         if parts.len() < 2 {
             return None;
@@ -128,23 +119,24 @@ impl Repo {
 
 }
 
-pub fn parse_owner(remote: &str) -> Option<String> {
+/// The `<owner>/<repo>` portion of a remote across the forms that occur in
+/// the wild: `scheme://[user@]host[:port]/owner/repo` and the scp-like
+/// `user@host:owner/repo`.
+fn remote_path(remote: &str) -> Option<&str> {
     let s = remote.trim();
     let s = s.strip_suffix(".git").unwrap_or(s);
     if s.is_empty() {
         return None;
     }
-
-    // Split into "<prefix>:<path>" for scp-like, or take the URL path.
-    let path = if let Some(rest) = s.split_once("://").map(|(_, r)| r) {
-        // scheme://[user@]host[:port]/owner/repo
-        rest.split_once('/').map(|(_, p)| p)?
-    } else if let Some((_, rest)) = s.split_once(':') {
-        rest
+    if let Some((_, rest)) = s.split_once("://") {
+        rest.split_once('/').map(|(_, p)| p)
     } else {
-        return None;
-    };
+        s.split_once(':').map(|(_, rest)| rest)
+    }
+}
 
+pub fn parse_owner(remote: &str) -> Option<String> {
+    let path = remote_path(remote)?;
     let mut parts = path.split('/').filter(|p| !p.is_empty());
     let owner = parts.next()?;
     // Require a repository component: "github.com/foo" alone is not owner/repo.

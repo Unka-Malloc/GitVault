@@ -76,8 +76,9 @@ enum Command {
 
     /// Inspect recorded checker runs.
     ///
-    /// Read-only: no vault, no network, no writes. This is what the dashboard
-    /// page reads, so nothing here may describe this machine's paths.
+    /// Read-only: no vault, no network, no writes. Records are built to be
+    /// read by someone other than the person who ran the gate, so nothing
+    /// here may describe this machine's paths.
     Records {
         #[command(subcommand)]
         command: RecordsCommand,
@@ -813,7 +814,7 @@ fn cmd_lock() -> anyhow::Result<ExitCode> {
 
 fn cmd_status(json: bool) -> anyhow::Result<ExitCode> {
     let vault = vault::Vault::open()?;
-    let remaining = unlock::remaining();
+    let remaining = unlock::remaining(&vault);
     if json {
         println!(
             "{}",

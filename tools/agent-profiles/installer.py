@@ -78,7 +78,8 @@ def install_payload(source, target, agent, payload, skill_docs):
 
     `payload` names the agent's own files; the shared library under
     agent-profiles is always added, so every installed checker carries the
-    same profile_sync / pi-bridge / audit_runtime / review_ranges contract.
+    same profile_sync / pi-bridge / audit_runtime / review_ranges /
+    audit_engine contract.
     """
     home = Path.home()
     shared = home / f".agents/skills/{agent}"
@@ -103,7 +104,8 @@ def install_payload(source, target, agent, payload, skill_docs):
         shutil.copyfile(source / name, target / name)
         (target / name).chmod(0o600)
     library = source.parent / "agent-profiles"
-    for name in ("profile_sync.py", "pi-bridge.ts", "audit_runtime.py", "review_ranges.py"):
+    for name in ("profile_sync.py", "pi-bridge.ts", "audit_runtime.py",
+                 "review_ranges.py", "audit_engine.py"):
         shutil.copyfile(library / name, target / name)
         (target / name).chmod(0o600)
     # The legacy embedded runner is gone from the payload entirely: an

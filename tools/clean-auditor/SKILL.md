@@ -5,8 +5,9 @@ description: The privacy and confidentiality gate before publication. Use when c
 
 # Clean Auditor
 
-Publication happens at three boundaries, and Clean Auditor stands at all of
-them: `pre-push`, `pr` (create and merge), and `release create`. It reviews the
+Publication happens at three boundaries, and Clean Auditor stands at two of
+them: `pre-push` and `pr` (create and merge); `release create` is gated by the
+security reviewer. It reviews the
 outgoing range only, refuses when the change cannot be published, and never
 modifies anything.
 
@@ -44,7 +45,7 @@ checker run anyway — self-check precedes the audit, it does not replace it.
 ## Boundaries worth knowing
 
 - `git push --no-verify` bypasses the `pre-push` hook; the unbypassable
-  boundaries are GitVault's own `pr` and `release` paths.
+  boundary is GitVault's own `pr` path.
 - A branch with nothing published to compare against is scanned whole and the
   receipt records why.
 - The semantic stage runs once per range; a range that already passed is reused

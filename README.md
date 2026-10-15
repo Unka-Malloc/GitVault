@@ -119,9 +119,12 @@ is documented in [`docs/security-model.md`](docs/security-model.md).
 ## Requirements
 
 - **macOS** for the biometric gate: `gitvault unlock` and every credential use
-  confirm through LocalAuthentication via the `gitvault-touchid` helper
-  (`swiftc tools/gitvault-touchid.swift`, placed on `PATH`). The checker engine
-  itself is platform-neutral; anything that touches the vault needs a Mac.
+  confirm through LocalAuthentication via the `gitvault-touchid` helper —
+  build it with `swiftc tools/gitvault-touchid.swift -o ~/.local/bin/gitvault-touchid`.
+  The helper path is fixed (`~/.local/bin/gitvault-touchid`), not a `PATH`
+  lookup: a path a caller could rewrite is a prompt the caller could
+  self-answer. The checker engine itself is platform-neutral; anything that
+  touches the vault needs a Mac.
 - `git`, `curl`, `ssh-agent`/`ssh-add` for the SSH path.
 - Python 3 for the bundled checkers under `tools/`; the semantic review stage
   uses the `pi` agent harness with a provider configured in the synced profile.
@@ -141,14 +144,19 @@ python3 tools/clean-auditor/install.py --pull          # newest published versio
 python3 tools/clean-auditor/install.py --pull profile/clean-auditor/v2
 ```
 
-A profile carries a name, a summary, a tool list and prose — there is no field
-for a command, an environment variable or an argument, so an edit made in a
-browser can change what an agent is *told*, never what the machine *runs*. The
-download is verified file by file and as a whole before anything is written, and
-a local edit to a synced document makes the checker refuse the operation until
-it is synced again: a prompt this machine edited is not the prompt that was
-reviewed. `install.py` seeds the documents only on a machine that has never
-pulled; after that the registry is the source.
+A profile carries a name, a summary, a tool list, prose and a runtime
+declaration — provider, model and reasoning effort for the semantic review.
+There is no field for a command or an argument, so an edit made in a browser
+can change what an agent is *told* and *which provider and credential it runs
+on*, never an executable the machine launches: the profile selects the
+provider and model, and the matching `*_API_KEY` is the one credential passed
+to the Pi child. That is still trusted input — treat the registry as part of
+the machine's security boundary. The download is verified file by file and as
+a whole before anything is written, and a local edit to a synced document
+makes the checker refuse the operation until it is synced again: a prompt
+this machine edited is not the prompt that was reviewed. `install.py` seeds
+the documents only on a machine that has never pulled; after that the
+registry is the source.
 
 ## Run records
 

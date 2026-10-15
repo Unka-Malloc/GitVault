@@ -149,67 +149,24 @@ pub fn run(cfg: &Config, vault: &Vault, args: &[String]) -> Result<i32> {
     let passphrase = vault.passphrase_for(&account);
 
     // A throwaway agent holds the key in memory. Nothing is written to disk.
-    let agent = Command::new("ssh-agent")
-        .arg("-s")
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("failed to start a temporary ssh-agent")?;
-
-    let out = agent.wait_with_output()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let sock = extract_agent_var(&text, "SSH_AUTH_SOCK")
-        .ok_or_else(|| anyhow::anyhow!("ssh-agent did not report SSH_AUTH_SOCK"))?;
-    let agent_pid = extract_agent_var(&text, "SSH_AGENT_PID");
-
-    // Load the key without it touching the filesystem: ssh-add reads a key file,
-    // so it is fed through a pipe on stdin via /dev/fd.
-    // ssh-add cannot be fed an encrypted key through a pipe: it prompts on the
-    // terminal. SSH_ASKPASS supplies the passphrase instead, so no unencrypted copy
-    // of the key ever reaches the filesystem.
-    let askpass = match &passphrase {
-        Some(p) => Some(askpass_script(p)?),
-        None => None,
-    };
-    let mut add_cmd = Command::new("ssh-add");
-    add_cmd
-        .arg("-")
-        .env("SSH_AUTH_SOCK", &sock)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    if let Some(path) = &askpass {
-        add_cmd
-            .env("SSH_ASKPASS", path)
-            .env("SSH_ASKPASS_REQUIRE", "force")
-            .env("DISPLAY", ":0");
-    }
-    let mut add = add_cmd.spawn().context("failed to run ssh-add")?;
-    {
-        use std::io::Write;
-        let mut stdin = add.stdin.take().ok_or_else(|| anyhow::anyhow!("no ssh-add stdin"))?;
-        stdin.write_all(key.as_bytes())?;
-    }
-    let add_out = add.wait_with_output()?;
-    if let Some(path) = &askpass {
-        let _ = std::fs::remove_file(path);
-    }
-    if !add_out.status.success() {
-        let _ = kill_agent(agent_pid.as_deref());
-        bail!(
-            "could not load the key into the temporary agent: {}",
-            String::from_utf8_lossy(&add_out.stderr).trim()
-        );
+    let agent = start_agent()?;
+    if let Err(e) = load_key(&agent.sock, &key, passphrase.as_deref(), false) {
+        agent.stop();
+        return Err(e);
     }
 
     // Run the real ssh with the throwaway agent and no identities of its own.
     let status = Command::new("ssh")
         .args(args)
-        .env("SSH_AUTH_SOCK", &sock)
+        .env("SSH_AUTH_SOCK", &agent.sock)
         .env_remove("SSH_AGENT_PID")
+        // The passphrase only ever lives in the ssh-add child's environment;
+        // strip it from the connection process whatever the caller's env held.
+        .env_remove("GITVAULT_ASKPASS_VALUE")
         .status()
         .context("failed to run ssh")?;
 
-    let _ = kill_agent(agent_pid.as_deref());
+    agent.stop();
     Ok(status.code().unwrap_or(1))
 }
 
@@ -238,33 +195,144 @@ fn kill_agent(pid: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Write a short-lived askpass helper.
+/// A file that deletes itself, on success or on any early return.
 ///
-/// The file is 0700, contains the passphrase, and is removed as soon as ssh-add
-/// returns. The passphrase is passed as an argument to the shell inside the script
-/// rather than interpolated into it, so a passphrase containing shell
-/// metacharacters cannot alter the script.
-pub fn askpass_script(passphrase: &str) -> Result<PathBuf> {
-    let path = std::env::temp_dir().join(format!(
-        "gitvault-askpass-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0)
-    ));
-    let script = "#!/bin/sh\nprintf '%s\\n' \"$GITVAULT_ASKPASS_VALUE\"\n";
-    std::fs::write(&path, script)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+/// `ssh-keygen` and the askpass helper both need a filesystem path, so a secret
+/// has to touch the disk briefly. Two properties bound that exposure: the file
+/// is created atomically at its final mode (`O_EXCL`, so nothing else could
+/// have planted the predictable name first), and the deletion is guaranteed by
+/// Drop rather than by a call an error path could skip.
+pub struct TempSecret {
+    path: PathBuf,
+}
+
+impl TempSecret {
+    /// Create a uniquely named file in the temp directory, atomically, at `mode`.
+    ///
+    /// `create_new` makes this fail rather than follow a planted symlink or
+    /// inherit a pre-created file's permissions: a same-user attacker who raced
+    /// the name ahead of us gets an error, not our contents.
+    pub fn write(contents: &str, mode: u32) -> Result<Self> {
+        let path = std::env::temp_dir().join(format!(
+            "gitvault-secret-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(mode);
+        }
+        use std::io::Write;
+        opts.open(&path)
+            .and_then(|mut f| f.write_all(contents.as_bytes()))
+            .with_context(|| format!("could not create {}", path.display()))?;
+        Ok(Self { path })
     }
-    // The value travels in the environment of this process and its child, never in
-    // the script text and never in argv.
-    // SAFETY: single-threaded at this point in the call.
-    unsafe { std::env::set_var("GITVAULT_ASKPASS_VALUE", passphrase) };
-    Ok(path)
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempSecret {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// A throwaway ssh-agent holding a vault key.
+pub struct Agent {
+    pub sock: String,
+    pub pid: Option<String>,
+}
+
+impl Agent {
+    pub fn stop(&self) {
+        let _ = kill_agent(self.pid.as_deref());
+    }
+}
+
+/// Start a private ssh-agent; the caller stops it when the operation ends.
+pub fn start_agent() -> Result<Agent> {
+    let agent = Command::new("ssh-agent")
+        .arg("-s")
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("failed to start a temporary ssh-agent")?;
+    let out = agent.wait_with_output()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let sock = extract_agent_var(&text, "SSH_AUTH_SOCK")
+        .ok_or_else(|| anyhow::anyhow!("ssh-agent did not report SSH_AUTH_SOCK"))?;
+    let pid = extract_agent_var(&text, "SSH_AGENT_PID");
+    Ok(Agent { sock, pid })
+}
+
+/// Write a short-lived askpass helper; the passphrase itself is never in the
+/// script, the file's name, or argv.
+///
+/// The returned guard holds the path and deletes the file on drop. The script
+/// reads `GITVAULT_ASKPASS_VALUE` from its own environment, so the caller sets
+/// that variable on the exact child (ssh-add or ssh-keygen) that may ask -
+/// never on this process, where every later child would inherit it.
+pub fn askpass_script() -> Result<TempSecret> {
+    let script = "#!/bin/sh\nprintf '%s\\n' \"$GITVAULT_ASKPASS_VALUE\"\n";
+    TempSecret::write(script, 0o700)
+}
+
+/// Feed `key` to `ssh-add` over a stdin pipe so no key file touches the disk.
+///
+/// An encrypted key prompts ssh-add on the terminal; SSH_ASKPASS answers it
+/// with a passphrase that travels in the child's environment only.
+/// `require_passphrase` marks callers whose keys are always encrypted (the
+/// signing path): without one, ssh-add's prompt would consume the piped key as
+/// its answer - measured: "Error loading key (stdin): invalid format". The
+/// transport path passes false because unencrypted keys are legitimate there.
+pub fn load_key(
+    sock: &str,
+    key: &str,
+    passphrase: Option<&str>,
+    require_passphrase: bool,
+) -> Result<()> {
+    let askpass = match passphrase {
+        Some(_) => Some(askpass_script()?),
+        None => None,
+    };
+    if askpass.is_none() && require_passphrase {
+        bail!(
+            "no passphrase is held for this key, so ssh-add would prompt and consume \
+             the piped key as the answer\n  \
+             re-import with the passphrase: gitvault auth import-key <account> <file>"
+        );
+    }
+    let mut cmd = Command::new("ssh-add");
+    cmd.arg("-")
+        .env("SSH_AUTH_SOCK", sock)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    if let (Some(guard), Some(p)) = (&askpass, passphrase) {
+        cmd.env("SSH_ASKPASS", guard.path())
+            .env("SSH_ASKPASS_REQUIRE", "force")
+            .env("DISPLAY", ":0")
+            .env("GITVAULT_ASKPASS_VALUE", p);
+    }
+    let mut child = cmd.spawn().context("failed to run ssh-add")?;
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no ssh-add stdin"))?;
+        stdin.write_all(key.as_bytes())?;
+    }
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        bail!(
+            "could not load the key into the temporary agent: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -328,5 +396,31 @@ mod tests {
     fn strips_quotes_and_the_git_suffix() {
         let inv = parse(&args(&["git@github.com", "git-upload-pack", "\"Owner/Repo.git\""])).unwrap();
         assert_eq!(inv.slug.as_deref(), Some("Owner/Repo"));
+    }
+
+    #[test]
+    fn askpass_never_touches_this_processs_environment() {
+        // The passphrase belongs in the ssh-add child's env, set by load_key -
+        // never in ours, where every later child (ssh, ssh-keygen) inherits it.
+        let _guard = TempSecret::write("x", 0o600).unwrap();
+        let _script = askpass_script().unwrap();
+        assert!(
+            std::env::var_os("GITVAULT_ASKPASS_VALUE").is_none(),
+            "writing the askpass helper must not leave the passphrase channel set"
+        );
+    }
+
+    #[test]
+    fn temp_secrets_are_private_atomically_and_unique() {
+        use std::os::unix::fs::PermissionsExt;
+        let a = TempSecret::write("first", 0o600).unwrap();
+        let b = TempSecret::write("second", 0o600).unwrap();
+        assert_ne!(a.path(), b.path(), "secret files must not collide");
+        let mode = std::fs::metadata(a.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the file must be private from creation, not chmodded after");
+        assert!(a.path().exists());
+        let held = a.path().to_path_buf();
+        drop(a);
+        assert!(!held.exists(), "the guard deletes the file when it drops");
     }
 }
