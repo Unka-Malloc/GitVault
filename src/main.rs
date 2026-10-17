@@ -1165,7 +1165,15 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
     //    ownership and clearing xattrs do not revive it. A fresh inode carries
     //    a clean record, and that is the only cure.
     let exe = std::env::current_exe().context("cannot locate the running binary")?;
-    if target.exists() {
+    let exe = exe.canonicalize().unwrap_or(exe);
+    // Reinstalling through the installed binary itself: exe and target are
+    // the same file. Removing the target would delete the running binary
+    // before the copy — the self-delete that loses the gate entirely.
+    let self_install = target
+        .canonicalize()
+        .map(|resolved| resolved == exe)
+        .unwrap_or(false);
+    if target.exists() && !self_install {
         std::fs::remove_file(&target).with_context(|| {
             format!(
                 "cannot remove {} before reinstall - is it still schg-flagged?",
@@ -1173,8 +1181,10 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
             )
         })?;
     }
-    std::fs::copy(&exe, &target)
-        .with_context(|| format!("cannot install {} to {}", exe.display(), target.display()))?;
+    if !self_install {
+        std::fs::copy(&exe, &target)
+            .with_context(|| format!("cannot install {} to {}", exe.display(), target.display()))?;
+    }
     if !sign_wrapper.exists() {
         std::fs::write(
             &sign_wrapper,
