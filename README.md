@@ -137,8 +137,10 @@ is documented in [`docs/security-model.md`](docs/security-model.md).
   touches the vault needs a Mac.
 - `git`, `curl`, `ssh-agent`/`ssh-add` for the SSH path.
 - `gitvault-review` and `gitvault-audit-agent` on PATH for the bundled
-  checkers under `tools/`; the semantic review stage
-  uses OpenCode (`opencode acp`) through A4AA with the runtime declared in the synced profile.
+  checkers under `tools/`; the semantic review stage runs whichever agent
+  lane the checker's registry document declares, through A4AA, with the
+  runtime declared in the synced profile — this machine's deployment
+  declares OpenCode (`opencode serve`) with a Devin ACP fallback.
   Python 3 only when a registered checker uses `kind = "python"`.
 
 ## License
@@ -157,24 +159,30 @@ instruction composition. The existing signed registry documents remain
 the source, projected into AwP's native types without a second persisted
 card copy or another profile merge implementation.
 
-The installer writes each checker's declared AwP registry document — the
-`a4aa-opencode` agent spec and the `audit` binding — which the runner loads
-through AwP's standard registry rather than wiring a specific agent itself.
+The installer writes each checker's declared AwP registry document from the
+shared declarative template `tools/registry.json` — agent lane specs, the
+`audit` binding's fallback chain and the secret recipes are data — which the
+runner loads through AwP's standard registry rather than wiring a specific
+agent itself.
 The engine's role projection supplies the checker's review tools as the
 role's one MCP server, materialized onto the ACP lane by AwP. The review
 engine owns scope, evidence and verdicts; a
 completed turn alone cannot pass a gate. Receipts record the AwP principal and revision;
 receipt reuse and unfinished-run selection also match the role and version.
 
-The declared runtime is OpenCode on a free model,
-`opencode/deepseek-v4.1-flash-free`. Each checker has an isolated XDG home
-with no host configuration, plugins, skills or shell tools; the per-run
-config denies edits, shell, web and sub-agent calls and enables only the
-`opencode` provider wall. Authentication links the operator's existing
-OpenCode sign-in files; no API key is copied into the checker or passed
+The runtime comes from the synced profile's `runtime` declaration — harness,
+provider and model chain — and this machine's deployment declares an OpenCode
+lane on the free `opencode/`-namespaced model chain. Each checker has an
+isolated XDG home with no host configuration, plugins, skills or shell tools;
+the deployment's declared agent spec carries the tool policy — denied edits,
+shell, web and sub-agent calls — as data. Credentials resolve through the
+registry document's declared secret recipes — environment lookups and TOML
+key references — never by copying a key into the checker or passing one
 through the runner request. Durable session bindings resume unfinished
-reviews of the same target and runtime. Agent failures
-refuse publication; there is no fallback or review deadline.
+reviews of the same target and runtime. When the primary agent cannot serve
+the turn, the audit binding steps down its declared fallback chain — an
+unavailable agent yields to the next declared candidate, a quota-exhausted
+model to the next declared model; an exhausted chain refuses publication.
 Report submission alone does not finalize a review. Recovery resumes the same
 conversation after transport failure, or reuses verified completion evidence
 when only local receipt finalization failed. Unfinished reviews retain their
@@ -182,11 +190,12 @@ progress independently of completed-receipt cleanup.
 
 Build both binaries with `cargo build --release`. Install the runner beside
 `gitvault` on PATH, then run `gitvault-review update --source tools/<checker>`
-for each checker and sync each published OpenCode profile with
+for each checker and sync each published profile with
 `gitvault-review pull --source tools/<checker>`. The workspace
-uses `a4aa` and `a4aa-opencode` from `../../Adapter-For-All-Agents`, and
+uses `a4aa` from `../../Adapter-For-All-Agents` for the generic spec types, and
 `agents-with-profiles` from `../../Agents-With-Profiles` with default
-features disabled (the OpenCode adapter is the only adapter needed).
+features disabled; the agent-specific specs the deployment runs live in the
+registry template and the A4AA agent crates, not in GitVault.
 The runner does not access GitHub credentials or the vault.
 
 The prompt and skill each audit agent runs on are hosted in a profile
@@ -202,8 +211,9 @@ A profile carries a name, a summary, a tool list, prose and a runtime
 declaration — harness, provider and model for the semantic review.
 There is no field for a command or an argument, so an edit made in a browser
 can change what an agent is *told* and its declared model and reasoning
-settings, never the executable it launches. This implementation accepts only
-OpenCode on a free `opencode/`-namespaced model. The registry remains part of
+settings, never the executable it launches. The runtime accepts any declared
+harness and provider, and requires every model label to sit in the declared
+provider's namespace. The registry remains part of
 the machine's security boundary. The download is verified file by file and as
 a whole before anything is written, and a local edit to a synced document
 makes the checker refuse the operation until it is synced again: a prompt
@@ -230,7 +240,7 @@ identity gate alone on a local commit — are not recorded at all.
 ## Money Saver
 
 [Money Saver](tools/money-saver/README.md) is an operations-cost checker running
-an isolated OpenCode review on the runtime its synced profile declares. It is registered for
+an isolated agent review on the runtime its synced profile declares. It is registered for
 `pre-push`: the whole tree at each pushed ref's head is reviewed once per push, and
 the engine's `pr` event judges the same checker at a pull request's head commit, so
 both publication boundaries are covered without auditing local commits. The engine also
@@ -243,7 +253,7 @@ checks and privacy verification are documented with the checker.
 [Clean Auditor](tools/clean-auditor/README.md) is a blocking privacy and
 confidentiality checker on `pre-push` and `pr`. A local deterministic scan runs
 first over the outgoing snapshot (a refusal there costs no token); only if it
-passes does an isolated OpenCode conversation judge privacy, business secrets,
+passes does an isolated agent conversation judge privacy, business secrets,
 operational data, machine paths, personal information and credentials. It never
 modifies the repository and never reads a skip switch.
 
@@ -257,7 +267,7 @@ action, a world-writable step, a manifest moving without its lockfile, an ignore
 rule that was protecting a key file). New execution or egress surfaces (an added
 install hook, a URL dependency source, a private address, a plaintext endpoint)
 are recorded and handed to the semantic stage instead of refused. Only if the
-static stage finds no regression does an isolated OpenCode conversation judge the
+static stage finds no regression does an isolated agent conversation judge the
 seven hardening domains. A release is judged as everything since the previous
 tag, because a release commit is normally already on the default branch.
 
@@ -266,7 +276,7 @@ tag, because a release commit is normally already on the default branch.
 [Sustainable Maintainer](tools/sustainable-maintainer/README.md) is a blocking
 maintainability checker on `pre-push` and `pr`. A local hygiene scan refuses
 conflict markers, merge artifacts and editor/OS junk before any token is spent;
-only if it passes does an isolated OpenCode conversation judge the six domains —
+only if it passes does an isolated agent conversation judge the six domains —
 structure, contracts, craft, duplication, tests and evolution — and return
 advisory findings with architecture advice for long-term maintainability. It
 never modifies the repository and never reads a skip switch.

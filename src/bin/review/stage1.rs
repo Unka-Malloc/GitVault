@@ -1353,6 +1353,7 @@ pub fn audit_all(
 #[cfg(test)]
 mod tests {
     use super::{in_scope, marker_lines, name_pattern};
+    use base64::Engine as _;
 
     #[test]
     fn a_name_matches_however_it_is_spelled() {
@@ -1420,6 +1421,23 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
+    /// Fixture values are plain strings, except where a case must carry a
+    /// literal the publication gate itself would refuse (credential shapes,
+    /// disabled-verification flags): a `b64:` prefix marks base64 content the
+    /// case decodes back to the real bytes before it reaches the repository
+    /// under test. The corpus stays reviewable while this repository's own
+    /// tree never stores the shape as text.
+    fn case_str(value: &Value) -> String {
+        let raw = value.as_str().unwrap();
+        let Some(encoded) = raw.strip_prefix("b64:") else {
+            return raw.to_string();
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("fixture value marked b64: must decode");
+        String::from_utf8(bytes).expect("fixture value must be UTF-8")
+    }
+
     fn apply(root: &Path, files: &serde_json::Map<String, Value>) {
         for (path, content) in files {
             let file = root.join(path);
@@ -1427,7 +1445,7 @@ mod tests {
                 let _ = std::fs::remove_file(&file);
             } else {
                 std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-                std::fs::write(&file, content.as_str().unwrap()).unwrap();
+                std::fs::write(&file, case_str(content)).unwrap();
             }
         }
     }
@@ -1443,8 +1461,9 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         git(&root, &["init", "-q"]);
         git(&root, &["config", "commit.gpgsign", "false"]);
-        if let Some(origin) = case["origin"].as_str() {
-            git(&root, &["remote", "add", "origin", origin]);
+        if !case["origin"].is_null() {
+            let origin = case_str(&case["origin"]);
+            git(&root, &["remote", "add", "origin", &origin]);
         }
         let mut base = None;
         if let Some(files) = case["base"].as_object() {
@@ -1488,10 +1507,10 @@ mod tests {
             // The withheld-names list is always an explicit file here: the
             // machine's own list must never leak into a test verdict.
             let withheld = guard.0.join("withheld.txt");
-            let lines: Vec<&str> = case
+            let lines: Vec<String> = case
                 .get("withheld_lines")
                 .and_then(Value::as_array)
-                .map(|lines| lines.iter().filter_map(Value::as_str).collect())
+                .map(|lines| lines.iter().map(case_str).collect())
                 .unwrap_or_default();
             std::fs::write(&withheld, lines.join("\n") + "\n").unwrap();
             let opts = Opts {

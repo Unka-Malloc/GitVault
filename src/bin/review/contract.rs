@@ -44,8 +44,6 @@ pub const RULE_TARGETS: [&str; 4] = [
     "removed-lines",
     "changed-paths",
 ];
-/// OpenCode sessions take no reasoning effort; a contract that pins a runtime
-/// writes `"none"` in `runtime.effort`.
 /// A checker is a blocking gate or an adviser.
 pub const SEVERITIES: [&str; 2] = ["blocking", "advisory"];
 /// Stage-1 labels: how the deterministic stage is announced.
@@ -193,7 +191,10 @@ pub struct Runtime {
     /// poll interval and a reset grace, each a duration string.
     #[serde(default)]
     pub retry: Option<RuntimeRetry>,
-    pub effort: String,
+    /// Declarative reasoning-effort label passed through to the lane;
+    /// what the agent does with it is the agent's business.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 /// The runtime's quota-recovery declaration: how the orchestrator should
@@ -300,6 +301,12 @@ fn is_file_name(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
+/// `^[A-Za-z0-9._-]+$` — the runtime's harness and provider labels. The
+/// provider-relative model check relies on a provider never containing '/'.
+pub(crate) fn is_runtime_label(value: &str) -> bool {
+    is_file_name(value)
+}
+
 /// The duplicate entries of a list, each named once.
 fn duplicates(values: &[String]) -> Vec<&str> {
     let mut seen = HashSet::new();
@@ -349,6 +356,17 @@ fn check_placeholders(field: &str, text: &str, issues: &mut Vec<String>) {
             ));
         }
         rest = &rest[at + end + 1..];
+    }
+}
+
+/// A model must be an inert label inside the declared provider's namespace —
+/// provider-relative (`{provider}/`), so the contract pins no vendor but a
+/// chain cannot point across providers.
+fn check_provider_model(field: &str, model: &str, prefix: &str, issues: &mut Vec<String>) {
+    if !is_model(model) || !model.starts_with(prefix) {
+        issues.push(format!(
+            "{field} {model:?} must be a model in the declared provider's namespace ({prefix}…)"
+        ));
     }
 }
 
@@ -591,30 +609,25 @@ fn check_verbs(field: &str, verbs: &[String], issues: &mut Vec<String>) {
 impl Runtime {
     fn violations(&self) -> Vec<String> {
         let mut issues = Vec::new();
-        if self.harness != "opencode" {
-            issues.push(format!(
-                "runtime.harness {:?} must be \"opencode\": the runtime is declared, never invented",
-                self.harness
-            ));
-        }
-        if self.provider != "opencode" {
-            issues.push(format!(
-                "runtime.provider {:?} must be \"opencode\"",
-                self.provider
-            ));
-        }
-        if !is_model(&self.model) || !self.model.starts_with("opencode/") {
-            issues.push(format!(
-                "runtime.model {:?} must be a free OpenCode model (opencode/…)",
-                self.model
-            ));
-        }
-        for fallback in &self.fallback_models {
-            if !is_model(fallback) || !fallback.starts_with("opencode/") {
+        for (field, value) in [("harness", &self.harness), ("provider", &self.provider)] {
+            if !is_runtime_label(value) {
                 issues.push(format!(
-                    "runtime.fallback_models entry {fallback:?} must be a free OpenCode model (opencode/…)"
+                    "runtime.{field} {value:?} must match ^[A-Za-z0-9._-]+$"
                 ));
             }
+        }
+        // Every model the runtime names must sit in the declared provider's
+        // namespace — provider-relative, so no vendor is pinned by the
+        // contract but a chain cannot point across providers.
+        let prefix = format!("{}/", self.provider);
+        check_provider_model("runtime.model", &self.model, &prefix, &mut issues);
+        for fallback in &self.fallback_models {
+            check_provider_model(
+                "runtime.fallback_models entry",
+                fallback,
+                &prefix,
+                &mut issues,
+            );
         }
         if let Some(retry) = &self.retry {
             for (field, duration) in [
@@ -649,18 +662,13 @@ impl Runtime {
                 ));
             }
             for model in window.model.iter().chain(window.models.iter()) {
-                if !is_model(model) || !model.starts_with("opencode/") {
-                    issues.push(format!(
-                        "runtime.windows model {model:?} must be a free OpenCode model (opencode/…)"
-                    ));
-                }
+                check_provider_model("runtime.windows model", model, &prefix, &mut issues);
             }
         }
-        if self.effort != "none" {
-            issues.push(format!(
-                "runtime.effort {:?} must be \"none\": OpenCode takes no reasoning effort",
-                self.effort
-            ));
+        if let Some(effort) = &self.effort
+            && !RUNTIME_VALUE.is_match(effort)
+        {
+            issues.push(format!("runtime.effort {effort:?} must be an inert label"));
         }
         issues
     }
@@ -901,8 +909,12 @@ mod tests {
         contract["snapshot"] = json!({"suffixes": [".rs"], "manifests": ["Cargo.toml"]});
         contract["task_full_service"] = json!("Perform the assigned full-service audit.");
         contract["runtime"] = json!({
-            "harness": "opencode", "provider": "opencode",
-            "model": "opencode/deepseek-v4.1-flash-free", "effort": "none"
+            "harness": "agent-host", "provider": "acme",
+            "model": "acme/reviewer-2", "effort": "high",
+            "fallback_models": ["acme/reviewer-1"],
+            "windows": [{"timezone": "Asia/Shanghai", "from": "09:00", "to": "18:00",
+                         "model": "acme/reviewer-peak"}],
+            "retry": {"interval": "30m", "reset_grace": "3h01m"}
         });
         assert_eq!(issues(contract), Vec::<String>::new());
     }
@@ -1101,14 +1113,38 @@ mod tests {
     fn the_runtime_is_inert_labels_only() {
         let mut contract = minimal();
         contract["runtime"] = json!({
-            "harness": "bash", "provider": "opencode", "model": "ok-model", "effort": "ludicrous"
+            "harness": "bad harness", "provider": "acme",
+            "model": "acme/ok-model", "effort": "not a label"
         });
         let found = issues(contract);
         assert!(found.iter().any(|i| i.contains("runtime.harness")));
         assert!(found.iter().any(|i| i.contains("runtime.effort")));
-        // A model outside the free OpenCode namespace is refused too.
-        assert!(found.iter().any(|i| i.contains("runtime.model")));
         assert!(!found.iter().any(|i| i.contains("runtime.provider")));
+        assert!(!found.iter().any(|i| i.contains("runtime.model")));
+    }
+
+    #[test]
+    fn runtime_models_stay_in_the_declared_provider() {
+        let mut contract = minimal();
+        contract["runtime"] = json!({
+            "harness": "agent", "provider": "acme",
+            "model": "other/model",
+            "fallback_models": ["acme/ok", "other/fallback"],
+            "windows": [{"timezone": "UTC", "from": "09:00", "to": "18:00",
+                         "model": "other/peak"}]
+        });
+        let found = issues(contract);
+        assert!(found.iter().any(|i| i.contains("runtime.model")));
+        assert!(found.iter().any(|i| i.contains("runtime.fallback_models")));
+        assert!(found.iter().any(|i| i.contains("runtime.windows model")));
+        // Only the cross-provider entries are refused, not the whole chain.
+        assert_eq!(
+            found
+                .iter()
+                .filter(|i| i.contains("fallback_models"))
+                .count(),
+            1
+        );
     }
 
     #[test]

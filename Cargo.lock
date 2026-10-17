@@ -19,20 +19,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "a4aa-devin"
-version = "0.2.0"
-dependencies = [
- "a4aa",
-]
-
-[[package]]
-name = "a4aa-opencode"
-version = "0.2.0"
-dependencies = [
- "a4aa",
-]
-
-[[package]]
 name = "aead"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -689,8 +675,6 @@ name = "gitvault"
 version = "0.2.0"
 dependencies = [
  "a4aa",
- "a4aa-devin",
- "a4aa-opencode",
  "agents-with-profiles",
  "anyhow",
  "async-trait",

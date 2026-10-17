@@ -1,0 +1,125 @@
+{
+  "agents": {
+    "opencode": {
+      "id": "opencode",
+      "lane": "serve",
+      "command": {
+        "program": {"resolve": ["opencode", "{home}/.opencode/bin/opencode"]},
+        "args": ["serve", "--port", "0"],
+        "env": {
+          "inheritAll": {
+            "set": {
+              "OPENCODE_CONFIG_CONTENT": {"$json": {
+                "share": "disabled",
+                "autoupdate": false,
+                "snapshot": false,
+                "formatter": false,
+                "lsp": false,
+                "plugin": [],
+                "enabled_providers": ["opencode"],
+                "permission": {
+                  "edit": "deny",
+                  "bash": "deny",
+                  "webfetch": "deny",
+                  "doom_loop": "deny",
+                  "external_directory": "deny"
+                },
+                "tools": {
+                  "write": false,
+                  "edit": false,
+                  "patch": false,
+                  "bash": false,
+                  "webfetch": false,
+                  "websearch": false,
+                  "task": false,
+                  "skill": false,
+                  "question": false,
+                  "todowrite": false,
+                  "todoread": false,
+                  "codesearch": false
+                }
+              }}
+            }
+          }
+        }
+      },
+      "alternates": [
+        {
+          "id": "opencode",
+          "lane": "acp",
+          "prefer_load": true,
+          "command": {
+            "program": {"resolve": ["opencode", "{home}/.opencode/bin/opencode"]},
+            "args": ["acp"],
+            "env": {
+              "inheritAll": {
+                "set": {
+                  "OPENCODE_CONFIG_CONTENT": {"$json": {
+                    "share": "disabled",
+                    "autoupdate": false,
+                    "snapshot": false,
+                    "formatter": false,
+                    "lsp": false,
+                    "plugin": [],
+                    "enabled_providers": ["opencode"],
+                    "permission": {
+                      "edit": "deny",
+                      "bash": "deny",
+                      "webfetch": "deny",
+                      "doom_loop": "deny",
+                      "external_directory": "deny"
+                    },
+                    "tools": {
+                      "write": false,
+                      "edit": false,
+                      "patch": false,
+                      "bash": false,
+                      "webfetch": false,
+                      "websearch": false,
+                      "task": false,
+                      "skill": false,
+                      "question": false,
+                      "todowrite": false,
+                      "todoread": false,
+                      "codesearch": false
+                    }
+                  }}
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "devin": {
+      "id": "devin",
+      "lane": "acp",
+      "prefer_load": true,
+      "auth_key": {"secret": {"secret": "devin-api-key"}},
+      "command": {
+        "program": {"resolve": ["devin", "/Applications/Devin.app/Contents/Resources/app/extensions/windsurf/devin/bin/devin"]},
+        "args": ["acp"],
+        "env": {
+          "inheritAll": {
+            "set": {
+              "DEVIN_MODEL": "swe-2-max"
+            }
+          }
+        }
+      }
+    }
+  },
+  "profiles": {
+    "{checker}": {"agent": "opencode"},
+    "{checker}-devin": {"agent": "devin", "model": "swe-2-max"}
+  },
+  "bindings": {
+    "audit": {"profile": "{checker}", "fallbacks": ["{checker}-devin"]}
+  },
+  "secrets": {
+    "devin-api-key": [
+      {"env": "DEVIN_API_KEY"},
+      {"toml": {"path": "{home}/.local/share/devin/credentials.toml", "key": "windsurf_api_key"}}
+    ]
+  }
+}

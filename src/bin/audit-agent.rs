@@ -1,6 +1,7 @@
-//! OpenCode audit host. The checker declares its agent and binding in an AwP
-//! registry document (`registry.json`, written by the installer). This host
-//! fires as `gitvault-audit-agent --contract <contract.json> --run <dir>` and
+//! Audit host. The checker declares its agents, binding and secret recipes
+//! in an AwP registry document (`registry.json`, materialized by the
+//! installer from `tools/registry.json`). This host fires as
+//! `gitvault-audit-agent --contract <contract.json> --run <dir>` and
 //! derives the whole review surface from the installation itself: the
 //! checker's role, its one MCP tool server, the run's scope and any resume
 //! binding all live in the two directories it is pointed at. AwP owns
@@ -168,37 +169,50 @@ impl PermissionHandler for AuditPermissions {
     }
 }
 
-/// Secret references the registry may declare. `devin-api-key` supplies the
-/// fallback agent's ACP credential: an explicit `DEVIN_API_KEY` in the
-/// host's environment wins; otherwise the Devin CLI's own credential store
-/// supplies the key this host then presents explicitly through the
-/// `authenticate` handshake. Nothing is read until a lane asks.
-struct AuditSecrets;
+/// Secret references the registry document's `secrets` section declares:
+/// each reference names an ordered recipe list — `{"env": "NAME"}` reads a
+/// host environment variable, `{"toml": {"path", "key"}}` reads a
+/// `key = "value"` assignment from a file (`{home}` expands). The first
+/// recipe yielding a value wins; nothing is read until a lane asks.
+/// Credentials never enter the document itself — a lane's `auth_key` names
+/// a reference the host resolves at session establishment and presents
+/// through the `authenticate` handshake.
+struct AuditSecrets {
+    recipes: serde_json::Map<String, Value>,
+}
 
-#[async_trait::async_trait]
-impl a4aa::SecretResolver for AuditSecrets {
-    async fn resolve(&self, reference: &str) -> Option<String> {
-        if reference != "devin-api-key" {
-            return None;
-        }
-        if let Some(key) = std::env::var("DEVIN_API_KEY")
-            .ok()
-            .filter(|value| !value.is_empty())
-        {
-            return Some(key);
-        }
-        let path = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)?
-            .join(".local/share/devin/credentials.toml");
+impl AuditSecrets {
+    /// One `toml` recipe: the named file's `key = "value"` assignment.
+    fn toml_key(path: &str, key: &str) -> Option<String> {
+        let path = path.replace("{home}", std::env::var("HOME").ok()?.as_str());
         std::fs::read_to_string(path)
             .ok()?
             .lines()
             .find_map(|line| {
-                let (key, value) = line.trim().split_once('=')?;
-                (key.trim() == "windsurf_api_key")
+                let (name, value) = line.trim().split_once('=')?;
+                (name.trim() == key)
                     .then(|| value.trim().trim_matches('"').to_owned())
                     .filter(|value| !value.is_empty())
             })
+    }
+}
+
+#[async_trait::async_trait]
+impl a4aa::SecretResolver for AuditSecrets {
+    async fn resolve(&self, reference: &str) -> Option<String> {
+        for recipe in self.recipes.get(reference)?.as_array()? {
+            let resolved = if let Some(name) = recipe["env"].as_str() {
+                std::env::var(name).ok().filter(|value| !value.is_empty())
+            } else if let Some(toml) = recipe["toml"].as_object() {
+                Self::toml_key(toml["path"].as_str()?, toml["key"].as_str()?)
+            } else {
+                None
+            };
+            if resolved.is_some() {
+                return resolved;
+            }
+        }
+        None
     }
 }
 
@@ -212,21 +226,42 @@ fn save_session(path: &Path, id: &str) -> io::Result<()> {
     writeln!(file, "{}", json!({"session_id":id}))
 }
 
+/// `^[A-Za-z0-9._-]+$` — a provider or agent label; the provider-relative
+/// model check relies on a provider never containing '/'.
+fn is_label(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// `^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,79}$` — an inert model label, the same
+/// shape the review contract enforces.
+fn is_model_label(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric())
+        && value.chars().count() <= 80
+        && chars
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '/' | '+' | '-'))
+}
+
 async fn run(request: Request) -> a4aa::Result<Value> {
     let role = &request.role;
     // AwP models general virtual agents. This publication gate admits only
     // audit roles: executable, environment and tool surface stay gate-owned —
     // the single MCP server the role carries is the one the engine projected.
-    if role.agent != "opencode"
+    // The agent itself is whatever the binding declared.
+    let provider = role
+        .extensions
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !is_label(role.agent.as_str())
         || role.permission.as_deref() != Some("read-only")
-        || role.extensions.get("provider") != Some(&json!("opencode"))
+        || !is_label(provider)
         || !role.env.is_empty()
         || role.cwd.is_some()
         || role.mechanisms.is_some()
-        || role
-            .effort
-            .as_deref()
-            .is_some_and(|value| !value.is_empty())
         || !role
             .mcp_servers
             .iter()
@@ -234,16 +269,24 @@ async fn run(request: Request) -> a4aa::Result<Value> {
     {
         return Err(failure("audit_role_not_admitted", "profile/resolve"));
     }
-    // The role's model chain — primary plus same-agent fallbacks — is
-    // restricted to the free OpenCode catalog.
+    // The role's model chain — primary, same-agent fallbacks and window
+    // heads — stays inside the declared provider's namespace.
+    let prefix = format!("{provider}/");
     let chain_models = std::iter::once(role.model.as_deref().unwrap_or(""))
         .chain(role.models.iter().map(String::as_str))
+        .chain(role.windows.iter().flat_map(|window| {
+            window
+                .model
+                .iter()
+                .chain(window.models.iter())
+                .map(String::as_str)
+        }))
         .collect::<Vec<_>>();
     if chain_models
         .iter()
-        .any(|model| model.is_empty() || !model.starts_with("opencode/"))
+        .any(|model| !is_model_label(model) || !model.starts_with(&prefix))
     {
-        return Err(failure("audit_role_model_not_free", "profile/resolve"));
+        return Err(failure("audit_role_model_mismatch", "profile/resolve"));
     }
     if role
         .instructions
@@ -257,16 +300,26 @@ async fn run(request: Request) -> a4aa::Result<Value> {
     }
     let document = std::fs::read_to_string(&request.document)
         .map_err(|_| failure("audit_document_unreadable", "registry/load"))?;
-    let mut registry = awp::Registry::from_json(&document)?;
+    let mut document: Value = serde_json::from_str(&document)
+        .map_err(|_| failure("audit_document_invalid", "registry/load"))?;
+    // The `secrets` section is host data this runner resolves; it is not
+    // part of AwP's document shape and must leave before the registry read.
+    let recipes = document
+        .as_object_mut()
+        .and_then(|object| object.remove("secrets"))
+        .and_then(|secrets| secrets.as_object().cloned())
+        .unwrap_or_default();
+    let document: awp::RegistryDocument = serde_json::from_value(document)
+        .map_err(|_| failure("audit_document_invalid", "registry/load"))?;
+    let mut registry = awp::Registry::from_document(document)?;
     let fallbacks: Vec<String> = registry
         .binding("audit")
         .map(|binding| binding.fallbacks().to_vec())
         .unwrap_or_default();
     let mut patch = role.to_patch();
     // `read-only` is the gate's admission posture — enforced by the declared
-    // spec's fail-closed config and DenyAll — not an ACP session selector.
-    // OpenCode advertises no permissions config option, so the field stays
-    // out of session establishment.
+    // spec's fail-closed config and DenyAll — not an ACP session selector,
+    // so the field stays out of session establishment.
     patch.permission = None;
     let mut overlay = awp::RegistryDocument::default();
     overlay.profiles.insert(role.id.clone(), patch);
@@ -285,30 +338,26 @@ async fn run(request: Request) -> a4aa::Result<Value> {
         );
     }
     registry.apply(overlay)?;
+    let secrets = Arc::new(AuditSecrets { recipes });
     let candidates: Vec<_> = registry
         .resolve_chain("audit")?
         .into_iter()
         .map(|agent| {
             agent
                 .permission(Arc::new(AuditPermissions))
-                .secrets(Arc::new(AuditSecrets))
+                .secrets(secrets.clone())
         })
         .collect();
-    // Every declared candidate must be an audit-admissible protocol agent:
-    // the primary names this role; fallbacks may back a different harness
-    // but never widen the admitted agent set. Both protocol lanes the
-    // registry may declare — the native server and the ACP bridge — are
-    // admissible; every other surface stays refused.
+    // Every declared candidate must be an audit-admissible protocol agent
+    // with a declared model chain: the primary names this role; fallbacks
+    // may back a different harness but never widen beyond the binding's
+    // declared chain. Both protocol lanes the registry may declare — the
+    // native server and the ACP bridge — are admissible; every other
+    // surface stays refused.
     for (index, agent) in candidates.iter().enumerate() {
         let profile = agent.profile();
-        let admitted = match profile.agent.as_str() {
-            "opencode" => profile
-                .model_chain()
-                .iter()
-                .all(|model| model.starts_with("opencode/")),
-            "devin" => profile.model.is_some(),
-            _ => false,
-        };
+        let chain = profile.model_chain();
+        let admitted = !chain.is_empty() && chain.iter().all(|model| is_model_label(model));
         if !matches!(agent.lane_kind(), awp::LaneKind::Acp | awp::LaneKind::Serve)
             || !admitted
             || (index == 0 && profile.id != role.id)

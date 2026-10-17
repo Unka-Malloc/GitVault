@@ -25,15 +25,6 @@ use std::process::{Command, Stdio};
 pub const MAX_RUNS: usize = 200;
 pub const MAX_AGE_SECS: u64 = 90 * 24 * 60 * 60;
 
-/// The runtime a profile falls back to when it declares none. Published
-/// profile.json is the only place a provider, model or effort may come from;
-/// values are inert labels, never paths or endpoints.
-const DEFAULT_RUNTIME: &[(&str, &str)] = &[
-    ("harness", "opencode"),
-    ("provider", "opencode"),
-    ("model", "opencode/deepseek-v4.1-flash-free"),
-];
-
 fn sha256(text: &str) -> String {
     sha2::Sha256::digest(text.as_bytes())
         .iter()
@@ -117,35 +108,49 @@ pub fn assert_synced(settings: &Settings, contract_dir: &Path) -> Result<(), Str
     Ok(())
 }
 
-/// The runtime this review runs on, with the declared profile.json first and
-/// the built-in default second - never a guess.
+/// The runtime this review runs on — the synced profile.json's declared
+/// `runtime` block, held to inert labels and the declared provider's
+/// namespace. A profile that declares no runtime refuses the audit: a
+/// provider, model or effort is never invented, and which agent or catalog
+/// the declaration names is the profile's business, not the engine's.
 pub fn declared_runtime(settings: &Settings) -> Result<Map<String, Value>, String> {
-    let mut runtime = Map::new();
-    for (key, value) in DEFAULT_RUNTIME {
-        runtime.insert(key.to_string(), json!(value));
-    }
     let declared = std::fs::read_to_string(settings.skill_dir.join("profile.json"))
         .ok()
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .and_then(|profile| profile["runtime"].as_object().cloned())
-        .unwrap_or_default();
-    for key in ["harness", "provider", "model", "effort"] {
-        if let Some(value) = declared.get(key).and_then(Value::as_str)
-            && contract::RUNTIME_VALUE.is_match(value)
-        {
-            runtime.insert(key.to_string(), json!(value));
-        }
+        .ok_or_else(|| "The synced profile declares no audit runtime".to_string())?;
+    let mut runtime = Map::new();
+    for key in ["harness", "provider"] {
+        let Some(value) = declared
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| contract::is_runtime_label(value))
+        else {
+            return Err(format!(
+                "The audit runtime must declare {key} as an inert label"
+            ));
+        };
+        runtime.insert(key.to_string(), json!(value));
     }
-    if runtime["harness"] != "opencode" || runtime["provider"] != "opencode" {
-        return Err(
-            "The audit runtime must declare OpenCode with the OpenCode provider".to_string(),
-        );
-    }
-    let model = runtime["model"].as_str().unwrap_or("");
-    if !model.starts_with("opencode/") {
+    // Every declared model must sit in the runtime's own provider
+    // namespace — provider-relative, never a pinned vendor.
+    let prefix = format!("{}/", runtime["provider"].as_str().unwrap_or(""));
+    let model = declared["model"].as_str().unwrap_or("");
+    if !contract::RUNTIME_VALUE.is_match(model) || !model.starts_with(&prefix) {
         return Err(format!(
-            "The audit runtime must select a free OpenCode model (opencode/…), not {model:?}"
+            "The audit runtime's model must sit in its declared provider's namespace \
+             ({prefix}…), not {model:?}"
         ));
+    }
+    runtime.insert("model".to_string(), json!(model));
+    if let Some(effort) = declared.get("effort") {
+        let Some(effort) = effort
+            .as_str()
+            .filter(|value| contract::RUNTIME_VALUE.is_match(value))
+        else {
+            return Err("runtime.effort must be an inert label".to_string());
+        };
+        runtime.insert("effort".to_string(), json!(effort));
     }
     if let Some(fallbacks) = declared.get("fallback_models") {
         let fallbacks = fallbacks
@@ -154,12 +159,10 @@ pub fn declared_runtime(settings: &Settings) -> Result<Map<String, Value>, Strin
             .iter()
             .map(|entry| entry.as_str().unwrap_or("").to_string())
             .collect::<Vec<_>>();
-        if let Some(bad) = fallbacks
-            .iter()
-            .find(|entry| !entry.starts_with("opencode/"))
-        {
+        if let Some(bad) = fallbacks.iter().find(|entry| !entry.starts_with(&prefix)) {
             return Err(format!(
-                "runtime.fallback_models entry {bad:?} must be a free OpenCode model (opencode/…)"
+                "runtime.fallback_models entry {bad:?} must sit in the declared provider's \
+                 namespace ({prefix}…)"
             ));
         }
         runtime.insert("models".to_string(), json!(fallbacks));
@@ -196,9 +199,10 @@ pub fn declared_runtime(settings: &Settings) -> Result<Map<String, Value>, Strin
                     .filter_map(Value::as_str),
             );
             for entry in model_entries {
-                if !entry.starts_with("opencode/") {
+                if !entry.starts_with(&prefix) {
                     return Err(format!(
-                        "runtime.windows[{index}] model {entry:?} must be a free OpenCode model (opencode/…)"
+                        "runtime.windows[{index}] model {entry:?} must sit in the declared \
+                         provider's namespace ({prefix}…)"
                     ));
                 }
             }
@@ -228,9 +232,6 @@ pub fn declared_runtime(settings: &Settings) -> Result<Map<String, Value>, Strin
             projected.insert(key.to_string(), value.clone());
         }
         runtime.insert("retry".to_string(), Value::Object(projected));
-    }
-    if runtime.contains_key("effort") {
-        return Err("The OpenCode audit runtime takes no declared effort".to_string());
     }
     Ok(runtime)
 }
@@ -621,7 +622,7 @@ fn review_target(
             runtime
                 .get("effort")
                 .and_then(|v| v.as_str())
-                .unwrap_or("none"),
+                .unwrap_or("default"),
         );
         let (usage, duration_ms, identity) = agent_review(&run_dir, settings, runtime, contract)?;
         let report_path = run_dir.join("report.json");

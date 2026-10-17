@@ -74,8 +74,9 @@ live acceptance operation, not an implementation test.
 
 ## Explicit full-service audit
 
-`audit.py --manifest <manifest.json> --request <original-request.json> --output
-<new-private-directory>` invokes the same OpenCode reviewer on selected
+`gitvault-review full-audit --contract <contract.json> --manifest <manifest.json>
+--request <original-request.json> --output <new-private-directory>` invokes the
+same OpenCode reviewer on selected
 current source, including nonignored unstaged/untracked changes. The manifest maps
 project labels to local source roots under `projects`. Optional `reuse` maps a
 second selected project to its primary copy; byte-identical original source files share
@@ -94,7 +95,7 @@ bills. A full-audit report does not approve a later staged commit.
 
 Full audits write compact tool progress and final status without a task deadline.
 They do not deploy, mutate services, query production or automatically repeat a
-failed audit. Resume a failed full audit with `audit.py --resume <run-directory>`:
+failed audit. Resume a failed full audit with `gitvault-review full-audit --resume <run-directory>`:
 the same snapshot, OpenCode session, read evidence, official document
 cache and latest draft are retained. A successful report cannot be re-audited by
 this command. Normal publication review continues to use only the operation's

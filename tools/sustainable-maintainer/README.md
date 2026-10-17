@@ -50,7 +50,7 @@ The installer creates the checker's private home `~/.local/share/gitvault/profil
 installs the contract payload and writes the checker's declared AwP registry
 document (the audit agent spec and binding the runner resolves), links the shared skill directory `~/.agents/skills/sustainable-maintainer`
 into every agent skill directory it finds, and registers (or replaces in place)
-this entry in `$XDG_CONFIG_HOME/gitvault/config.toml` (or `~/.config/gitvault/config.toml`):
+this entry in `$XDG_CONFIG_HOME/gitvault/checkers.toml` (or `~/.config/gitvault/checkers.toml`):
 
 ```toml
 [[checkers]]
@@ -61,13 +61,18 @@ severity = "blocking"
 timeout_secs = 0
 ```
 
+The routing `config.toml` keeps only the `audit_policy = "checkers.toml"`
+declaration binding this policy file's name; deleting the policy file
+does not silence the audit, it refuses.
+
 Hook files are owned by `~/.git-hooks/_dispatch`; the installer never writes
 them.
 
 ## Explicit full-service review
 
-`audit.py --manifest <manifest.json> --request <charter.json> --output
-<new-private-directory>` runs the same reviewer over the whole current source
+`gitvault-review full-audit --contract <contract.json> --manifest <manifest.json>
+--request <charter.json> --output <new-private-directory>` runs the same
+reviewer over the whole current source
 of explicitly selected projects, including nonignored unstaged/untracked
 changes. The manifest maps project labels to local source roots under
 `projects`; the charter carries the authorized conversation URL and the exact
@@ -80,7 +85,8 @@ domain before submitting; findings must name an exact listed path and an
 existing line the reviewer actually read this run. Unknown coverage cannot
 pass. The report stays in the private output directory: it never blocks
 publication and never approves a later commit. Resume a failed review with
-`audit.py --resume <run-directory>`; a submitted report is never re-audited.
+`gitvault-review full-audit --resume <run-directory>`; a submitted report is
+never re-audited.
 
 ## Boundaries an operator must know
 

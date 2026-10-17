@@ -142,7 +142,24 @@ mod tests {
         assert!(!cases.is_empty(), "the corpus must not be empty");
         for case in &cases {
             let name = case["name"].as_str().unwrap();
+            // `b64:` marks base64 payloads: shapes the gate itself refuses
+            // (credential forms) live encoded in the corpus and decode back to
+            // the real text the sanitizer must catch.
             let input = case["input"].as_str().unwrap();
+            let decoded;
+            let input = match input.strip_prefix("b64:") {
+                Some(encoded) => {
+                    use base64::Engine as _;
+                    decoded = String::from_utf8(
+                        base64::engine::general_purpose::STANDARD
+                            .decode(encoded)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    decoded.as_str()
+                }
+                None => input,
+            };
             assert_eq!(
                 sanitize(input),
                 expected[name]["sanitize"].as_str().unwrap(),

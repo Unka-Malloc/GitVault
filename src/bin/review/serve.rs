@@ -1,6 +1,6 @@
 //! The MCP-facing tool server: one long-lived stdio process per review,
-//! keeping the run's paging state coherent for the whole verdict. The OpenCode
-//! audit session spawns it as the declared MCP server: `initialize` and
+//! keeping the run's paging state coherent for the whole verdict. The audit
+//! agent session spawns it as the declared MCP server: `initialize` and
 //! `tools/list` publish the contract's tool manifest, and every audit tool
 //! call arrives as `tools/call`, answered with the call's JSON payload in
 //! `content` (and `structuredContent`). Notifications earn no reply.

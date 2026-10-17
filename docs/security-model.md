@@ -84,8 +84,9 @@ window is a permission, not a possession:
 
 ## The audit boundary
 
-Checkers are a list in `$XDG_CONFIG_HOME/gitvault/config.toml` (or
-`~/.config/gitvault/config.toml`) — outside every work
+Checkers are a list in `$XDG_CONFIG_HOME/gitvault/checkers.toml` (or
+`~/.config/gitvault/checkers.toml`) — the audit policy the routing table's
+`audit_policy` key binds — outside every work
 tree, so a repository cannot edit the terms it is judged by. The engine:
 
 - runs each checker from a **neutral working directory** with a **curated
@@ -97,12 +98,11 @@ tree, so a repository cannot edit the terms it is judged by. The engine:
 - runs every checker for the event and reports all results — no short-circuit
   on the first refusal.
 
-The bundled Python checkers are registered with `python3 -I` (isolated mode):
-no `sys.path` shadowing from the work tree, no user site-packages, no
-environment `PYTHONPATH`. A custom `kind = "python"` entry instead gets the
-engine's portable floor — `-P` and `PYTHONSAFEPATH=1`, which stop `sys.path`
-shadowing but leave user site-packages and `PYTHONPATH` alone; register the
-command with `-I` itself when the stronger isolation is wanted.
+Checker rows default to `kind = "exec"`: the declared command runs as-is
+under the curated environment above. A custom `kind = "python"` entry gets
+the engine's portable floor — `-P` and `PYTHONSAFEPATH=1`, which stop
+`sys.path` shadowing but leave user site-packages and `PYTHONPATH` alone;
+register the command with `-I` itself when the stronger isolation is wanted.
 
 **Tracked repository hooks run.** The hook dispatcher also invokes a
 checked-out `.githooks/<event>` when it is executable, so a repository's own

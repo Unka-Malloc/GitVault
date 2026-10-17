@@ -113,6 +113,21 @@ fn fixture() -> (Fixture, String, String) {
     std::fs::create_dir_all(&plugin).unwrap();
     std::fs::write(plugin.join("contract.json"), CONTRACT).unwrap();
     std::fs::write(plugin.join("policy.md"), "Review policy.\n").unwrap();
+    // The audit runtime is declared data, synced with the profile: the
+    // engine refuses a profile without one. Neutral labels — the gate
+    // pins no vendor.
+    std::fs::write(
+        skills.join("profile.json"),
+        serde_json::json!({
+            "runtime": {
+                "harness": "stub-agent",
+                "provider": "stub",
+                "model": "stub/reviewer-1"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
     let runner = root.join("runner.sh");
     std::fs::write(&runner, RUNNER).unwrap();
     {
@@ -163,7 +178,7 @@ fn the_gate_reviews_once_then_reuses_the_receipt() {
     );
     assert!(
         stdout.contains(
-            "Sample Gate: reviewing push refs/heads/nightly with opencode/opencode/deepseek-v4.1-flash-free (none)…"
+            "Sample Gate: reviewing push refs/heads/nightly with stub/stub/reviewer-1 (default)…"
         ),
         "{stdout}"
     );
@@ -187,8 +202,8 @@ fn the_gate_reviews_once_then_reuses_the_receipt() {
     assert_eq!(receipt["review_head"], head);
     assert_eq!(receipt["review_items"], serde_json::json!(["structure"]));
     assert_eq!(receipt["agent_profile"]["id"], "sample-gate");
-    assert_eq!(receipt["harness"], "opencode");
-    assert_eq!(receipt["model"], "opencode/deepseek-v4.1-flash-free");
+    assert_eq!(receipt["harness"], "stub-agent");
+    assert_eq!(receipt["model"], "stub/reviewer-1");
     assert!(
         receipt["engine"]
             .as_str()

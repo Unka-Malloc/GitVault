@@ -7,7 +7,6 @@
 use crate::contract::{self, Contract};
 use serde_json::{Map, Value, json};
 use sha2::Digest as _;
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// The two well-known roots every checker lives under. The profile root is
@@ -78,121 +77,200 @@ fn payload_of(contract: &Contract) -> Vec<&'static str> {
     payload
 }
 
-/// The per-run OpenCode configuration the declared agent spec carries:
-/// sharing and self-update off, the opencode-only provider wall, and a
-/// fail-closed tool surface (no edits, shell, web or sub-agents). The model
-/// is the profile's business — declared at runtime, applied by AwP's session
-/// configuration path, never baked into the agent document.
-fn opencode_config() -> Value {
-    json!({
-        "share": "disabled",
-        "autoupdate": false,
-        "snapshot": false,
-        "formatter": false,
-        "lsp": false,
-        "plugin": [],
-        "enabled_providers": ["opencode"],
-        "permission": {
-            "edit": "deny",
-            "bash": "deny",
-            "webfetch": "deny",
-            "doom_loop": "deny",
-            "external_directory": "deny",
-        },
-        "tools": {
-            "write": false,
-            "edit": false,
-            "patch": false,
-            "bash": false,
-            "webfetch": false,
-            "websearch": false,
-            "task": false,
-            "skill": false,
-            "question": false,
-            "todowrite": false,
-            "todoread": false,
-            "codesearch": false,
-        },
+/// The declarative AwP registry template every checker materializes —
+/// `tools/registry.json` in the source tree, baked into the binary so the
+/// installer cannot drift from the document it validates. Beyond plain AwP
+/// shape the template carries install-time conventions, resolved before
+/// validation and never reaching disk:
+///
+/// - `{checker}` in any string or key: the contract name.
+/// - `{"resolve": [candidates]}` as a `command.program`: a bare name looks
+///   up `PATH`, a `{home}`-relative or absolute path checks existence; the
+///   first reachable candidate wins. An unreachable declaration keeps its
+///   first candidate as a bare name — a program that cannot spawn simply
+///   yields to the next chain entry. Only the `audit` binding's primary
+///   agent is required to resolve.
+/// - `{"$json": <value>}` inside `env.set`: the value's compact JSON text
+///   as a string literal.
+///
+/// The top-level `secrets` section is host data the audit runner resolves
+/// — each reference names an ordered recipe list. It sits outside AwP's
+/// document shape, so it is stripped for validation, not from the written
+/// file.
+const REGISTRY_TEMPLATE: &str = include_str!("../../../tools/registry.json");
+
+/// Replace `{"$json": <value>}` with the value's compact JSON text — the
+/// template's way of declaring an env entry whose literal is itself JSON.
+fn embed_json_literals(value: &mut Value) {
+    match value {
+        Value::Array(items) => items.iter_mut().for_each(embed_json_literals),
+        Value::Object(map) => {
+            if map.len() == 1
+                && let Some(inner) = map.remove("$json")
+            {
+                *value = Value::String(inner.to_string());
+                return;
+            }
+            map.values_mut().for_each(embed_json_literals);
+        }
+        _ => {}
+    }
+}
+
+/// One declared program candidate: a bare name resolves through `PATH`, a
+/// path (`{home}` expands first) through an existence check.
+fn probe_program(candidate: &str) -> Option<String> {
+    if !candidate.contains('/') && !candidate.contains('{') {
+        return which(candidate);
+    }
+    let expanded = if candidate.contains("{home}") {
+        candidate.replace("{home}", std::env::var("HOME").ok()?.as_str())
+    } else {
+        candidate.to_string()
+    };
+    Path::new(&expanded).is_file().then_some(expanded)
+}
+
+/// Resolve one `command.program` declaration in place; returns the
+/// reachable path a candidate resolved to, `None` when the declaration
+/// kept its first candidate as an unreachable bare name.
+fn resolve_program(program: &mut Value) -> Option<String> {
+    let Some(candidates) = program.get("resolve").and_then(Value::as_array) else {
+        // A plain string names the program already.
+        return program.as_str().map(str::to_string);
+    };
+    for candidate in candidates.iter().filter_map(Value::as_str) {
+        if let Some(found) = probe_program(candidate) {
+            *program = json!(found);
+            return Some(found);
+        }
+    }
+    *program = json!(candidates.first().and_then(Value::as_str).unwrap_or(""));
+    None
+}
+
+/// Resolve the `command.program` of one agent spec and each of its
+/// declared lane alternates; returns the primary spec's resolution.
+fn resolve_spec_programs(spec: &mut Value) -> Option<String> {
+    let found = spec
+        .pointer_mut("/command/program")
+        .and_then(resolve_program);
+    if let Some(alternates) = spec.get_mut("alternates").and_then(Value::as_array_mut) {
+        for alternate in alternates {
+            resolve_spec_programs(alternate);
+        }
+    }
+    found
+}
+
+/// The host-side secret recipes a document may declare: each reference
+/// names an ordered recipe list — `{"env": "NAME"}` reads a host variable,
+/// `{"toml": {"path", "key"}}` a `key = "value"` assignment. Anything else
+/// refuses the install rather than dying inside the audit run.
+fn check_secrets(secrets: &Value) -> Result<(), String> {
+    if secrets.is_null() {
+        return Ok(());
+    }
+    let Some(object) = secrets.as_object() else {
+        return Err("registry template: secrets must be an object".to_string());
+    };
+    for (reference, recipes) in object {
+        let Some(recipes) = recipes.as_array() else {
+            return Err(format!(
+                "registry template: secrets.{reference} must be a recipe list"
+            ));
+        };
+        for recipe in recipes {
+            let declared = recipe["env"].is_string()
+                || (recipe["toml"]["path"].is_string() && recipe["toml"]["key"].is_string());
+            if !declared {
+                return Err(format!(
+                    "registry template: secrets.{reference} recipes are \
+                     {{\"env\": \"NAME\"}} or {{\"toml\": {{\"path\", \"key\"}}}}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The materialization product: the validated document to write plus what
+/// the `audit` binding's primary program resolved to — `None` (with the
+/// tried candidates) when no candidate exists on this machine.
+struct Materialized {
+    document: Value,
+    primary: Option<String>,
+    primary_candidates: Vec<String>,
+}
+
+/// Materialize the checker's registry document from the shared template:
+/// substitute the contract name, embed declared env literals, resolve
+/// declared program candidates and validate the AwP document — a template
+/// that cannot materialize a registry fails the install, not the audit.
+fn registry_document(contract: &Contract) -> Result<Materialized, String> {
+    let mut document: Value =
+        serde_json::from_str(&REGISTRY_TEMPLATE.replace("{checker}", &contract.name))
+            .map_err(|error| format!("registry template: {error}"))?;
+    embed_json_literals(&mut document);
+    let primary_agent = document["bindings"]["audit"]["profile"]
+        .as_str()
+        .map(|profile| {
+            document["profiles"][profile]["agent"]
+                .as_str()
+                .unwrap_or("")
+                .to_string()
+        })
+        .unwrap_or_default();
+    if primary_agent.is_empty() {
+        return Err("registry template: the audit binding resolves to no agent".to_string());
+    }
+    let agents = document["agents"]
+        .as_object_mut()
+        .ok_or("registry template: agents must be an object")?;
+    let primary_candidates = agents
+        .get(primary_agent.as_str())
+        .and_then(|entry| entry.pointer("/command/program/resolve"))
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut primary = None;
+    for (id, entry) in agents.iter_mut() {
+        let found = resolve_spec_programs(entry);
+        if *id == primary_agent {
+            primary = Some(found);
+        }
+    }
+    check_secrets(&document["secrets"])?;
+    // Validation runs on the AwP document alone: `secrets` is host data
+    // the audit runner resolves, not a registry field.
+    let mut awp_document = document.clone();
+    if let Some(object) = awp_document.as_object_mut() {
+        object.remove("secrets");
+    }
+    let document_model: awp::RegistryDocument = serde_json::from_value(awp_document)
+        .map_err(|error| format!("registry template: {error}"))?;
+    awp::Registry::from_document(document_model).map_err(|error| error.to_string())?;
+    Ok(Materialized {
+        document,
+        primary: primary.flatten(),
+        primary_candidates,
     })
 }
 
-/// The checker's declared AwP registry document: the materialized agent
-/// spec plus its standing `audit` binding. The runner resolves this file
-/// through AwP's standard registry and overlays the runtime-projected role —
-/// nothing about a specific agent is wired into the runner itself.
-fn write_registry_document(
-    target: &Path,
-    contract: &Contract,
-    opencode: &str,
-    devin: &str,
-) -> Result<(), String> {
-    let mut spec = a4aa_opencode::spec();
-    spec.command.program = opencode.to_string();
-    // The agent inherits the operator's full environment — the audit's
-    // posture lives in the injected config, not in walls around the child.
-    spec.command.env = a4aa::EnvPolicy::InheritAll {
-        set: BTreeMap::from([(
-            "OPENCODE_CONFIG_CONTENT".to_string(),
-            a4aa::EnvValue::Literal(opencode_config().to_string()),
-        )]),
-    };
-    // Two protocol lanes for the same agent, ordered native-first: the
-    // `serve` HTTP surface is polled request/response — the `acp` lane's
-    // internal event subscriber cannot overflow because it never exists.
-    // When the server cannot start or serve, the ACP alternate carries the
-    // identical configuration.
-    let mut serve = spec.clone();
-    serve.lane = a4aa::LaneSpec::Serve {
-        mcp_servers: vec![],
-    };
-    serve.command.args = vec!["serve".to_string(), "--port".to_string(), "0".to_string()];
-    // The cross-agent fallback: same audit role on `devin acp`. Credentials
-    // never enter the document — the lane's `auth_key` is a secret reference
-    // the host resolves at session establishment (explicit DEVIN_API_KEY,
-    // then the Devin CLI's own credential store), and a host without one
-    // simply exhausts the chain. DEVIN_MODEL pins the declared model at
-    // spawn so the selection holds whether or not the session advertises a
-    // model configOption.
-    const FALLBACK_MODEL: &str = "swe-2-max";
-    let mut fallback = a4aa_devin::spec();
-    if let a4aa::LaneSpec::Acp { auth_key, .. } = &mut fallback.lane {
-        *auth_key = Some(a4aa::EnvSource::Secret {
-            secret: "devin-api-key".to_string(),
-        });
-    }
-    fallback.command.program = devin.to_string();
-    fallback.command.env = a4aa::EnvPolicy::InheritAll {
-        set: BTreeMap::from([(
-            "DEVIN_MODEL".to_string(),
-            a4aa::EnvValue::Literal(FALLBACK_MODEL.to_string()),
-        )]),
-    };
-    // The profile stub declares only which agent serves the role; the
-    // engine's runtime projection supplies the role's model, policy and tool
-    // surface on top of it. The fallback profile carries its own agent's
-    // model — a different catalog than the primary's.
-    let id = spec.id.clone();
-    let fallback_id = fallback.id.clone();
-    let fallback_profile = format!("{}-{fallback_id}", contract.name);
-    let opencode_entry = awp::AgentEntry {
-        spec: serve,
-        alternates: vec![spec],
-    };
-    let document = json!({
-        "agents": BTreeMap::from([
-            (id.clone(), serde_json::to_value(&opencode_entry).map_err(|e| e.to_string())?),
-            (fallback_id.clone(), serde_json::to_value(&fallback).map_err(|e| e.to_string())?),
-        ]),
-        "profiles": BTreeMap::from([
-            (contract.name.clone(), json!({"agent": id})),
-            (fallback_profile.clone(), json!({"agent": fallback_id, "model": FALLBACK_MODEL})),
-        ]),
-        "bindings": {"audit": {"profile": contract.name, "fallbacks": [fallback_profile]}},
-    });
+/// Write the checker's materialized AwP registry document. The runner
+/// resolves this file through AwP's standard registry and overlays the
+/// runtime-projected role — nothing about a specific agent is wired into
+/// the runner or the installer.
+fn write_registry_document(target: &Path, document: &Value) -> Result<(), String> {
     let path = target.join("registry.json");
     std::fs::write(
         &path,
-        serde_json::to_string_pretty(&document).map_err(|e| e.to_string())? + "\n",
+        serde_json::to_string_pretty(document).map_err(|e| e.to_string())? + "\n",
     )
     .map_err(|e| e.to_string())?;
     #[cfg(unix)]
@@ -201,6 +279,21 @@ fn write_registry_document(
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
     Ok(())
+}
+
+/// Materialize the checker's registry document, requiring the `audit`
+/// binding's primary agent program to exist on this machine — the audit
+/// has no primary without it. Fallback programs may stay bare names.
+fn materialized_registry(contract: &Contract) -> Result<(Value, String), String> {
+    let materialized = registry_document(contract)?;
+    let Some(program) = materialized.primary else {
+        return Err(format!(
+            "the audit binding's primary agent is not installed; \
+             the registry template tried: {}",
+            materialized.primary_candidates.join(", ")
+        ));
+    };
+    Ok((materialized.document, program))
 }
 
 /// The files the drift check covers: the copied payload plus the generated
@@ -212,39 +305,12 @@ fn installed_files(contract: &Contract) -> Vec<&'static str> {
 }
 
 fn which(name: &str) -> Option<String> {
-    let from_path = std::env::var_os("PATH").and_then(|path| {
+    std::env::var_os("PATH").and_then(|path| {
         std::env::split_paths(&path)
             .map(|dir| dir.join(name))
             .find(|candidate| candidate.is_file())
             .map(|candidate| candidate.to_string_lossy().into_owned())
-    });
-    if from_path.is_some() || name != "opencode" {
-        return from_path;
-    }
-    // The self-installed OpenCode binary lives outside PATH on a fresh login.
-    let candidate = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
-        .join(".opencode")
-        .join("bin")
-        .join("opencode");
-    candidate
-        .is_file()
-        .then(|| candidate.to_string_lossy().into_owned())
-}
-
-/// The fallback agent's binary: PATH first, then the Devin app's bundled
-/// CLI. Absent installs keep the bare name — a candidate that cannot spawn
-/// simply yields to the next chain entry.
-fn devin_program() -> String {
-    which("devin")
-        .or_else(|| {
-            let candidate = Path::new(
-                "/Applications/Devin.app/Contents/Resources/app/extensions/windsurf/devin/bin/devin",
-            );
-            candidate
-                .is_file()
-                .then(|| candidate.to_string_lossy().into_owned())
-        })
-        .unwrap_or_else(|| "devin".to_string())
+    })
 }
 
 /// Add or replace this checker's registry entry. Replacing rather than
@@ -474,16 +540,13 @@ fn checker_block(contract: &Contract, target: &Path) -> Result<String, String> {
 /// Install a checker from its source directory (`tools/<checker>/`).
 pub fn install(source: &Path) -> Result<String, String> {
     let contract = contract::load(&source.join("contract.json"))?;
-    let (Some(opencode), Some(runner), Some(review)) = (
-        which("opencode"),
-        which("gitvault-audit-agent"),
-        which("gitvault-review"),
-    ) else {
+    let (Some(runner), Some(review)) = (which("gitvault-audit-agent"), which("gitvault-review"))
+    else {
         return Err(
-            "OpenCode, gitvault-review and gitvault-audit-agent (the A4AA runner) are required"
-                .to_string(),
+            "gitvault-review and gitvault-audit-agent (the A4AA runner) are required".to_string(),
         );
     };
+    let (document, program) = materialized_registry(&contract)?;
     let profile = profile_root().join(&contract.name);
     let target = profile.join("plugins").join(&contract.name);
     if !profile.exists() {
@@ -496,10 +559,10 @@ pub fn install(source: &Path) -> Result<String, String> {
     }
     std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
     install_payload(source, &target, &contract)?;
-    write_registry_document(&target, &contract, &opencode, &devin_program())?;
+    write_registry_document(&target, &document)?;
     let previous = read_installation(&target).unwrap_or_default();
     let mut settings = json!({
-        "program": opencode,
+        "program": program,
         "review": review,
         "agent_runner": runner,
         "profile": profile.to_string_lossy(),
@@ -554,23 +617,21 @@ const RETIRED_PAYLOAD: [&str; 10] = [
 /// re-register its entry; the retired Python payload files leave with it.
 pub fn update(source: &Path) -> Result<String, String> {
     let contract = contract::load(&source.join("contract.json"))?;
-    let (Some(opencode), Some(runner), Some(review)) = (
-        which("opencode"),
-        which("gitvault-audit-agent"),
-        which("gitvault-review"),
-    ) else {
+    let (Some(runner), Some(review)) = (which("gitvault-audit-agent"), which("gitvault-review"))
+    else {
         return Err(
-            "OpenCode, gitvault-review and gitvault-audit-agent (the A4AA runner) are required"
-                .to_string(),
+            "gitvault-review and gitvault-audit-agent (the A4AA runner) are required".to_string(),
         );
     };
+    let (document, program) = materialized_registry(&contract)?;
     let profile = profile_root().join(&contract.name);
     let target = profile.join("plugins").join(&contract.name);
     let Some(mut settings) = read_installation(&target) else {
         return Err(format!("{} is not installed", contract.title));
     };
-    // Legacy records predate the OpenCode runtime; the record migrates in
-    // place so the checker never consults a removed harness or home.
+    // Legacy records predate the declared-agent runtime; the record
+    // migrates in place so the checker never consults a removed harness
+    // or home.
     settings.remove("hermes");
     settings.remove("pi");
     settings.remove("credential_file");
@@ -578,7 +639,7 @@ pub fn update(source: &Path) -> Result<String, String> {
     settings.remove("codex");
     settings.remove("codex_home");
     settings.remove("agent_home");
-    settings.insert("program".into(), json!(opencode));
+    settings.insert("program".into(), json!(program));
     settings.insert("review".into(), json!(review));
     settings.insert("agent_runner".into(), json!(runner));
     settings.insert("profile".into(), json!(profile.to_string_lossy()));
@@ -588,7 +649,7 @@ pub fn update(source: &Path) -> Result<String, String> {
     let _ = std::fs::remove_file(target.join("review_ranges.py"));
     let _ = std::fs::remove_file(target.join("audit_engine.py"));
     install_payload(source, &target, &contract)?;
-    write_registry_document(&target, &contract, &opencode, &devin_program())?;
+    write_registry_document(&target, &document)?;
     settings.insert(
         "payload".into(),
         Value::Object(payload_hashes(&target, &installed_files(&contract))?),
@@ -760,7 +821,10 @@ fn pull_with(
 
 #[cfg(test)]
 mod tests {
-    use super::{bundle_manifest, check_url, declare_policy, payload_of, pull_with, register};
+    use super::{
+        bundle_manifest, check_url, declare_policy, payload_of, pull_with, register,
+        registry_document, write_registry_document,
+    };
     use crate::contract;
     use serde_json::{Value, json};
     use std::io::{BufRead, BufReader, Write};
@@ -850,6 +914,69 @@ mod tests {
         declare_policy(&config).unwrap();
         let twice = std::fs::read_to_string(&config).unwrap();
         assert_eq!(twice.matches("audit_policy").count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_registry_template_materializes_a_valid_document() {
+        let dir = tempdir();
+        let contract = contract_at(&dir, false);
+        let materialized = registry_document(&contract).unwrap();
+        let document = &materialized.document;
+        // The contract name filled the profile and binding placeholders.
+        assert_eq!(
+            document["bindings"]["audit"]["profile"],
+            json!("sample-checker")
+        );
+        assert_eq!(
+            document["bindings"]["audit"]["fallbacks"],
+            json!(["sample-checker-devin"])
+        );
+        assert_eq!(
+            document["profiles"]["sample-checker-devin"]["model"].as_str(),
+            Some("swe-2-max")
+        );
+        // Every program declaration resolved to a concrete string.
+        for (id, entry) in document["agents"].as_object().unwrap() {
+            assert!(
+                entry["command"]["program"].is_string(),
+                "agent {id} kept an unresolved program declaration"
+            );
+            for alternate in entry["alternates"].as_array().into_iter().flatten() {
+                assert!(
+                    alternate["command"]["program"].is_string(),
+                    "agent {id} alternate kept an unresolved program declaration"
+                );
+            }
+        }
+        // The env config embedded as a literal string, not a template form.
+        let env_set = &document["agents"]["opencode"]["command"]["env"]["inheritAll"]["set"];
+        let config = env_set["OPENCODE_CONFIG_CONTENT"].as_str().unwrap();
+        assert!(config.starts_with('{'), "the config embeds as JSON text");
+        // The fallback lane carries a secret reference, never a credential.
+        assert_eq!(
+            document["agents"]["devin"]["auth_key"],
+            json!({"secret": {"secret": "devin-api-key"}})
+        );
+        // Secret recipes ride the document as host data…
+        assert!(document["secrets"]["devin-api-key"].is_array());
+        // …and the AwP document validates once they are stripped.
+        let mut stripped = document.clone();
+        stripped.as_object_mut().unwrap().remove("secrets");
+        let parsed: awp::RegistryDocument = serde_json::from_value(stripped).unwrap();
+        let registry = awp::Registry::from_document(parsed).unwrap();
+        let binding = registry.binding("audit").unwrap();
+        assert_eq!(binding.profile(), "sample-checker");
+        assert_eq!(binding.fallbacks(), &["sample-checker-devin".to_string()]);
+        // The written file round-trips through the same path the runner uses.
+        let target = dir.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        write_registry_document(&target, document).unwrap();
+        let written = std::fs::read_to_string(target.join("registry.json")).unwrap();
+        let mut on_disk: Value = serde_json::from_str(&written).unwrap();
+        on_disk.as_object_mut().unwrap().remove("secrets");
+        let reparsed: awp::RegistryDocument = serde_json::from_value(on_disk).unwrap();
+        awp::Registry::from_document(reparsed).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

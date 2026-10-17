@@ -32,7 +32,7 @@ The installer creates the checker's private home `~/.local/share/gitvault/profil
 installs the contract payload and writes the checker's declared AwP registry
 document (the audit agent spec and binding the runner resolves), links the shared skill directory `~/.agents/skills/clean-auditor`
 into every agent skill directory it finds, and registers (or replaces in place)
-this entry in `$XDG_CONFIG_HOME/gitvault/config.toml` (or `~/.config/gitvault/config.toml`):
+this entry in `$XDG_CONFIG_HOME/gitvault/checkers.toml` (or `~/.config/gitvault/checkers.toml`):
 
 ```toml
 [[checkers]]
@@ -42,6 +42,10 @@ kind = "exec"
 severity = "blocking"
 timeout_secs = 0
 ```
+
+The routing `config.toml` keeps only the `audit_policy = "checkers.toml"`
+declaration binding this policy file's name; deleting the policy file
+does not silence the audit, it refuses.
 
 Hook files are owned by `~/.git-hooks/_dispatch`; the installer never writes
 them.
