@@ -13,6 +13,8 @@
 // directory.
 #[path = "review/contract.rs"]
 mod contract;
+#[path = "review/date.rs"]
+mod date;
 #[path = "review/documents.rs"]
 mod documents;
 #[path = "review/engine.rs"]
@@ -35,6 +37,8 @@ mod serve;
 mod stage1;
 #[path = "review/submit.rs"]
 mod submit;
+#[path = "review/util.rs"]
+mod util;
 
 use std::io::Read as _;
 use std::path::PathBuf;

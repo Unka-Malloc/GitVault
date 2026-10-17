@@ -5,6 +5,8 @@ version = 4
 [[package]]
 name = "a4aa"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d26a0662456ac45999772b90c239bbdf32e12eb8a2800cecbdb4f934b5441480"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
@@ -72,6 +74,8 @@ dependencies = [
 [[package]]
 name = "agents-with-profiles"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4104eec806dcd647804db31062a21adc6ed4fc3ec1c79667ff832ea117dacc63"
 dependencies = [
  "a4aa",
  "jiff",

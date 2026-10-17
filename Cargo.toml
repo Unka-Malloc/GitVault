@@ -21,8 +21,8 @@ name = "gitvault-review"
 path = "src/bin/review.rs"
 
 [dependencies]
-a4aa = { path = "../../Adapter-For-All-Agents", version = "0.2.0" }
-agents-with-profiles = { path = "../../Agents-With-Profiles", version = "0.1.0", default-features = false }
+a4aa = "0.2.0"
+agents-with-profiles = { version = "0.1.0", default-features = false }
 async-trait = "0.1"
 anyhow = "1.0.104"
 base64 = "0.23.1"

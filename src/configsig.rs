@@ -43,6 +43,15 @@ pub const PRINCIPAL: &str = "gitvault-config";
 /// with `XDG_CONFIG_HOME`, pointing that variable elsewhere would disarm
 /// enforcement - the trust root must not follow the file it protects.
 pub fn anchor_path() -> PathBuf {
+    // Test escape, debug builds only - the same convention as
+    // GITVAULT_UNSIGNED_OK below: an integration fixture cannot chown a file
+    // to root, so it points the anchor at a path it owns to arm enforcement.
+    // A release binary never honours the variable.
+    if cfg!(debug_assertions)
+        && let Ok(explicit) = std::env::var("GITVAULT_ANCHOR")
+    {
+        return PathBuf::from(explicit);
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     Path::new(&home)
         .join(".config")
@@ -74,6 +83,12 @@ pub enum Anchor {
 pub fn anchor_state(anchor: &Path) -> Anchor {
     if !anchor.exists() {
         return Anchor::Absent;
+    }
+    // The GITVAULT_ANCHOR escape also arms enforcement: the fixture's file
+    // cannot be made root-owned. Arming is all the override can do - it can
+    // never weaken a check the real anchor would have run.
+    if cfg!(debug_assertions) && std::env::var_os("GITVAULT_ANCHOR").is_some() {
+        return Anchor::Anchored;
     }
     #[cfg(unix)]
     {

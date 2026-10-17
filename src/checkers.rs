@@ -13,7 +13,8 @@
 //! * **Safe-path flags are injected, not requested.** For `kind = "python"` the
 //!   launcher adds `-P` (or `PYTHONSAFEPATH=1` on older interpreters) so that even
 //!   an accidental cwd cannot inject an import path.
-//! * **A curated environment.** Nothing is inherited except PATH and locale, so
+//! * **A curated environment.** Nothing is inherited except PATH, HOME, TMPDIR
+//!   and locale (LANG, LC_*); the GITVAULT_* run context is set explicitly, so
 //!   ambient credentials or steering variables cannot reach a checker.
 //! * **Fail-closed.** A blocking checker that is missing, times out, or exits
 //!   non-zero stops the action.
@@ -368,9 +369,22 @@ fn run_one(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // The checker sees what the operator sees — the gate contributes its
-        // context as explicit variables, not as walls around the child.
-        .env("GITVAULT_EVENT", &ctx.event)
+        // A curated environment, as the module docs promise: the child starts
+        // empty and regains only the whitelist below - ambient credentials,
+        // PYTHONPATH, proxy and provider-steering variables cannot reach it.
+        .env_clear();
+    // The documented inheritance: PATH and locale, plus HOME and TMPDIR for
+    // the child to find its own files. The GITVAULT_* context is contributed
+    // explicitly underneath, never inherited - a same-named ambient variable
+    // must not steer the checker.
+    for (key, value) in std::env::vars_os() {
+        if key.to_str().is_some_and(|k| {
+            matches!(k, "PATH" | "HOME" | "TMPDIR" | "LANG") || k.starts_with("LC_")
+        }) {
+            cmd.env(key, value);
+        }
+    }
+    cmd.env("GITVAULT_EVENT", &ctx.event)
         .env("GITVAULT_IDENTITY", &ctx.identity)
         .env("GITVAULT_REPO", ctx.repo_root.display().to_string())
         .env(

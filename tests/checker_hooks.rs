@@ -620,3 +620,250 @@ fn patch_application_cannot_create_an_unreviewed_commit() {
     assert!(!git(&f.0, &["am", "change.patch"]).status.success());
     assert_eq!(git(&f.0, &["rev-parse", "HEAD"]).stdout, before);
 }
+
+/// A repository under armed signature enforcement: the debug-only
+/// `GITVAULT_ANCHOR` escape points the trust root at the fixture's own
+/// `config.pub`, so unsigned policy and routing files classify as `Invalid`.
+/// The policy file exists but declares no `[[checkers]]` - the emptied state
+/// a local write can produce.
+fn anchored_fixture() -> Fixture {
+    let root = std::env::temp_dir().join(format!(
+        "gitvault-anchor-test-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    checked(&root, &["init", "-q"]);
+    checked(
+        &root,
+        &[
+            "config",
+            "core.hooksPath",
+            root.join("no-hooks").to_str().unwrap(),
+        ],
+    );
+    checked(&root, &["config", "user.name", "Synthetic"]);
+    checked(
+        &root,
+        &["config", "user.email", "synthetic@example.invalid"],
+    );
+    std::fs::write(root.join("one"), "base\n").unwrap();
+    checked(&root, &["add", "."]);
+    checked(&root, &["commit", "-qm", "base"]);
+    std::fs::write(
+        root.join("config.toml"),
+        "[identities.fixture]\nname = 'Synthetic'\nemail = 'synthetic@example.invalid'\n[rules]\ndefault = 'fixture'\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("checkers.toml"), "# audit policy: emptied\n").unwrap();
+    Fixture(root)
+}
+
+/// `gitvault check --event pr` and `gitvault hook pr` over the fixture, under
+/// the armed anchor.
+fn pr_gate_runs(root: &Path) -> Vec<Output> {
+    let anchor = root.join("config.pub");
+    let config = root.join("config.toml");
+    [
+        vec![
+            "--config".into(),
+            config.display().to_string(),
+            "check".into(),
+            "--event".into(),
+            "pr".into(),
+            "--directory".into(),
+            root.display().to_string(),
+        ],
+        vec![
+            "--config".into(),
+            config.display().to_string(),
+            "hook".into(),
+            "pr".into(),
+        ],
+    ]
+    .into_iter()
+    .map(|args| {
+        Command::new(env!("CARGO_BIN_EXE_gitvault"))
+            .env("GITVAULT_ANCHOR", &anchor)
+            .env_remove("GITVAULT_UNSIGNED_OK")
+            .env_remove("GITVAULT_CONFIG")
+            .args(&args)
+            .current_dir(root)
+            .output()
+            .unwrap()
+    })
+    .collect()
+}
+
+#[test]
+fn an_emptied_policy_cannot_disarm_the_publication_boundary() {
+    // The emptied policy declares no checkers, which used to skip the
+    // signature refusal entirely: one local write ran zero audits at the
+    // boundary and credentials still flowed. Anchored, the refusal is
+    // unconditional at events that publish or spend credentials.
+    let fixture = anchored_fixture();
+    let root = fixture.0.clone();
+    // Any existing file arms the fixture anchor; its content is only read
+    // when a signature sidecar exists.
+    std::fs::write(
+        root.join("config.pub"),
+        "gitvault-config ssh-ed25519 AAAAFixtureOnly\n",
+    )
+    .unwrap();
+    for result in pr_gate_runs(&root) {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            !result.status.success(),
+            "the boundary must refuse: {stderr}"
+        );
+        assert!(
+            stderr.contains("uncertified audit policy"),
+            "stderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn an_emptied_policy_still_holds_the_routing_table_to_its_signature() {
+    // ssh-keygen does the signing, the same plumbing `gitvault config sign`
+    // uses; skip where it cannot sign.
+    if Command::new("ssh-keygen")
+        .args(["-Y", "sign"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_err()
+    {
+        return;
+    }
+    let fixture = anchored_fixture();
+    let root = fixture.0.clone();
+    // Certify the emptied policy; leave the routing table unsigned.
+    let key = root.join("anchor-key");
+    let out = Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-C", "gitvault-config", "-f"])
+        .arg(&key)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "anchor keygen failed");
+    let public = std::fs::read_to_string(key.with_extension("pub")).unwrap();
+    let mut fields = public.split_whitespace();
+    std::fs::write(
+        root.join("config.pub"),
+        format!(
+            "gitvault-config {} {}\n",
+            fields.next().unwrap(),
+            fields.next().unwrap()
+        ),
+    )
+    .unwrap();
+    let out = Command::new("ssh-keygen")
+        .args(["-Y", "sign", "-n", "gitvault-config", "-f"])
+        .arg(&key)
+        .arg(root.join("checkers.toml"))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "policy signing failed");
+
+    for result in pr_gate_runs(&root) {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            !result.status.success(),
+            "the boundary must refuse: {stderr}"
+        );
+        assert!(
+            stderr.contains("routing table") && stderr.contains("uncertified"),
+            "stderr: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn checkers_run_with_a_curated_environment() {
+    // The documented guarantee: nothing is inherited except PATH and locale.
+    // Sentinel variables in the parent environment - credentials, steering
+    // knobs - must not reach a checker; PATH and the GITVAULT_* context must.
+    let root = std::env::temp_dir().join(format!(
+        "gitvault-env-test-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _cleanup = Fixture(root.clone());
+    std::fs::create_dir_all(&root).unwrap();
+    checked(&root, &["init", "-q"]);
+    checked(
+        &root,
+        &[
+            "config",
+            "core.hooksPath",
+            root.join("no-hooks").to_str().unwrap(),
+        ],
+    );
+    checked(&root, &["config", "user.name", "Synthetic"]);
+    checked(
+        &root,
+        &["config", "user.email", "synthetic@example.invalid"],
+    );
+    std::fs::write(root.join("one"), "base\n").unwrap();
+    checked(&root, &["add", "."]);
+    checked(&root, &["commit", "-qm", "base"]);
+    let marker = root.join("env-report");
+    let checker = root.join("checker.sh");
+    std::fs::write(
+        &checker,
+        format!(
+            "#!/bin/sh\n\
+             if [ -n \"${{CHECKER_SENTINEL:+x}}\" ] || [ -n \"${{GH_TOKEN:+x}}\" ] || [ -n \"${{PYTHONPATH:+x}}\" ]; then\n  \
+               printf 'leaked' > '{0}'; exit 1\n\
+             fi\n\
+             if [ -z \"$PATH\" ] || [ -z \"$GITVAULT_EVENT\" ]; then\n  \
+               printf 'missing' > '{0}'; exit 1\n\
+             fi\n\
+             printf 'clean:%s' \"$GITVAULT_EVENT\" > '{0}'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("config.toml"),
+        format!(
+            "record_dir = '{}'\n[identities.fixture]\nname = 'Synthetic'\nemail = 'synthetic@example.invalid'\n[rules]\ndefault = 'fixture'\n",
+            root.join("runs").display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("checkers.toml"),
+        format!(
+            "[[checkers]]\nname = 'env-probe'\non = ['pr']\ncommand = ['/bin/sh', '{}', '{{repo}}']\n",
+            checker.display()
+        ),
+    )
+    .unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_gitvault"))
+        .env("GITVAULT_UNSIGNED_OK", "1")
+        .env("CHECKER_SENTINEL", "must-not-leak")
+        .env("GH_TOKEN", "must-not-leak")
+        .env("PYTHONPATH", "/attacker/modules")
+        .args([
+            "--config",
+            root.join("config.toml").to_str().unwrap(),
+            "check",
+            "--event",
+            "pr",
+            "--directory",
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "check failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap(),
+        "clean:pr",
+        "the checker's view of its environment"
+    );
+}

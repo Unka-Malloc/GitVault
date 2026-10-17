@@ -12,9 +12,9 @@ use crate::contract::{self, Contract};
 use crate::evidence;
 use crate::fullservice;
 use crate::sanitize::sanitize;
+use crate::util::sha256;
 use crate::{ranges, stage1};
 use serde_json::{Map, Value, json};
-use sha2::Digest as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -24,13 +24,6 @@ use std::process::{Command, Stdio};
 /// finalized; only settled receipts and abandoned directories use the bounds.
 pub const MAX_RUNS: usize = 200;
 pub const MAX_AGE_SECS: u64 = 90 * 24 * 60 * 60;
-
-fn sha256(text: &str) -> String {
-    sha2::Sha256::digest(text.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
 
 // ---------------------------------------------------------------------------
 // the installed profile's settings and the sync contract

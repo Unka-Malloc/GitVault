@@ -705,11 +705,13 @@ fn context_for(
 /// question is asked. Audits first, blessing after: the routing signature only
 /// gates the verdict, never the audit.
 ///
-/// An event the policy registers checkers for is a publication boundary: when
-/// the routing table's signature does not hold, the run refuses - but only
-/// after the evidence is on screen, so what is being certified was already
-/// produced. An event with no registered checkers passes either way, so local
-/// work (commits, messages) is never held hostage to a blessing.
+/// `pre-push`, `pr` and `release` are publication boundaries unconditionally:
+/// they spend credentials or put content on GitHub, so an uncertified policy
+/// or routing table refuses them even when the policy registers no checkers -
+/// an emptied policy file must never read as "no audit required". Every other
+/// event is held to the signatures only when the policy's commands would
+/// actually execute: an event the policy says nothing about runs nothing, and
+/// local work (commits, messages) is never held hostage to a blessing.
 fn audit_gate(
     cfg: &config::Config,
     cfg_sig: &configsig::SigState,
@@ -721,28 +723,38 @@ fn audit_gate(
 ) -> anyhow::Result<checkers::Report> {
     let event = config::Event::parse(&ctx.event)?;
     let selected = policy.checkers_for(event);
-    // An uncertified policy is refused only when its commands would actually
-    // execute - checker rows are arbitrary code, so running them unsigned is
-    // the privilege hole this guard closes. An event the policy says nothing
-    // about executes nothing and proceeds regardless.
-    if !selected.is_empty()
-        && let configsig::SigState::Invalid(reason) = policy_sig
+    let boundary = matches!(
+        event,
+        config::Event::PrePush | config::Event::Pr | config::Event::Release
+    );
+    // Checker rows are arbitrary code, so running them unsigned is the
+    // privilege hole this guard closes. `selected` only shapes the refusal
+    // message; it is never a precondition for checking the signature.
+    if let configsig::SigState::Invalid(reason) = policy_sig
+        && (boundary || !selected.is_empty())
     {
-        let declared = selected
-            .iter()
-            .map(|c| format!("{} -> {}", c.name, c.command.join(" ")))
-            .collect::<Vec<_>>()
-            .join("\n    ");
+        let declared = if selected.is_empty() {
+            format!("it registers no checkers for {}", event.name())
+        } else {
+            format!(
+                "it declares:\n    {}",
+                selected
+                    .iter()
+                    .map(|c| format!("{} -> {}", c.name, c.command.join(" ")))
+                    .collect::<Vec<_>>()
+                    .join("\n    ")
+            )
+        };
         anyhow::bail!(
             "refusing to run an uncertified audit policy: {reason}\n  \
-             it declares:\n    {declared}\n  \
-             if these are the commands audits should execute, certify them: gitvault config sign"
+             {declared}\n  \
+             if this is the policy audits should enforce, certify it: gitvault config sign"
         );
     }
     let report = checkers::run_all(cfg, policy, ctx, cfg_sig, only)?;
     report.print(&ctx.event);
     if let configsig::SigState::Invalid(reason) = cfg_sig
-        && !selected.is_empty()
+        && (boundary || !selected.is_empty())
     {
         anyhow::bail!(
             "audits complete, but the routing table they ran against is uncertified: {reason}\n  \
@@ -1915,4 +1927,110 @@ fn cmd_signing_key(
     // Always succeed: git treats a non-zero exit here as a configuration error, and
     // this command only supplies a key hint. The signer itself is what refuses.
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::audit_gate;
+    use crate::checkers::Context;
+    use crate::config::{Config, Policy};
+    use crate::configsig::SigState;
+    use std::path::PathBuf;
+
+    fn ctx(event: &str) -> Context {
+        Context {
+            event: event.to_string(),
+            repo_root: PathBuf::from("/synthetic/repo"),
+            repo_slug: Some("Owner/Repo".into()),
+            identity: "personal".into(),
+            account: None,
+            via_default: true,
+            expected_email: None,
+            actual_email: None,
+            stdin: None,
+            pr_base: None,
+            pr_head: None,
+            pr_number: None,
+            release_tag: None,
+            release_commit: None,
+        }
+    }
+
+    /// A `checkers.toml` that exists but registers no checkers used to skip
+    /// both signature refusals: one local write disarmed the publication
+    /// boundary with zero audits and zero signature checks. The refusal is
+    /// now unconditional at the events that publish or spend credentials.
+    #[test]
+    fn boundary_events_refuse_an_uncertified_policy_even_when_empty() {
+        let cfg = Config::default();
+        let policy = Policy::default();
+        for event in ["pre-push", "pr", "release"] {
+            let err = match audit_gate(
+                &cfg,
+                &SigState::Inactive,
+                &policy,
+                &SigState::Invalid("checkers.toml is unsigned".into()),
+                &ctx(event),
+                "test",
+                None,
+            ) {
+                Err(err) => err,
+                Ok(_) => panic!("{event} must refuse an uncertified audit policy"),
+            };
+            assert!(
+                err.to_string().contains("uncertified audit policy"),
+                "{err}"
+            );
+        }
+        // An event the policy gates nothing for still passes: nothing would
+        // execute, so local work is not held hostage to a blessing.
+        assert!(
+            audit_gate(
+                &cfg,
+                &SigState::Inactive,
+                &policy,
+                &SigState::Invalid("checkers.toml is unsigned".into()),
+                &ctx("pre-commit"),
+                "test",
+                None,
+            )
+            .is_ok()
+        );
+    }
+
+    /// The routing-table refusal is unconditional at the same boundaries: a
+    /// certified-but-empty policy must not skip it either.
+    #[test]
+    fn boundary_events_refuse_an_uncertified_routing_table() {
+        let cfg = Config::default();
+        let policy = Policy::default();
+        for event in ["pre-push", "pr", "release"] {
+            let err = match audit_gate(
+                &cfg,
+                &SigState::Invalid("config.toml is unsigned".into()),
+                &policy,
+                &SigState::Inactive,
+                &ctx(event),
+                "check",
+                None,
+            ) {
+                Err(err) => err,
+                Ok(_) => panic!("{event} must refuse an uncertified routing table"),
+            };
+            assert!(err.to_string().contains("uncertified"), "{err}");
+        }
+        // Non-boundary events keep the checker-registration criterion.
+        assert!(
+            audit_gate(
+                &cfg,
+                &SigState::Invalid("config.toml is unsigned".into()),
+                &policy,
+                &SigState::Inactive,
+                &ctx("pre-commit"),
+                "check",
+                None,
+            )
+            .is_ok()
+        );
+    }
 }

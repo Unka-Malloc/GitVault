@@ -81,6 +81,10 @@ fn now_ms() -> u128 {
 /// The civil-date arithmetic is Howard Hinnant's `civil_from_days`: 719468 days
 /// from 0000-03-01 to 1970-01-01, then a 400-year era of 146097 days. Records
 /// store the epoch second; only the operator's view needs it readable.
+///
+/// The `gitvault-review` crate shares the algorithm through
+/// `src/bin/review/date.rs` - the two binaries are separate crates, so a
+/// crate-boundary merge should converge the copies, not keep a third home.
 pub fn iso8601(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rest = secs % 86_400;

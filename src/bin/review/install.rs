@@ -5,8 +5,8 @@
 //! exactly one home.
 
 use crate::contract::{self, Contract};
+use crate::util::sha256;
 use serde_json::{Map, Value, json};
-use sha2::Digest as _;
 use std::path::{Path, PathBuf};
 
 /// The two well-known roots every checker lives under. The profile root is
@@ -58,13 +58,6 @@ fn policy_file() -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("checkers.toml")
-}
-
-fn sha256(text: &str) -> String {
-    sha2::Sha256::digest(text.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 /// The payload a checker installs: its contract, plus the document catalog
@@ -1038,8 +1031,8 @@ mod tests {
         .unwrap();
         let files = json!({"policy.md": "the policy\n", "SKILL.md": "the skill\n"});
         let hashes = json!({
-            "policy.md": super::sha256("the policy\n"),
-            "SKILL.md": super::sha256("the skill\n"),
+            "policy.md": crate::util::sha256("the policy\n"),
+            "SKILL.md": crate::util::sha256("the skill\n"),
         });
         let bundle = json!({
             "tag": "profile/sample-checker/v3",
