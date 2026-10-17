@@ -32,7 +32,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use wait_timeout::ChildExt;
 
-use crate::config::{Checker, Config, Event, Kind, Severity};
+use crate::config::{Checker, Config, Event, Kind, Policy, Severity};
 use crate::records;
 
 #[derive(Debug, Clone)]
@@ -187,7 +187,13 @@ impl Report {
 ///
 /// Runs for pre-commit and pre-push, and is skipped by `--only` so an individual
 /// checker can still be exercised in isolation.
-pub fn identity_gate(ctx: &Context) -> Option<CheckerOutcome> {
+///
+/// `routing_certified` is false while the routing table's signature is broken
+/// or missing under an armed anchor. The gate's expectation comes from that
+/// table, so an uncertified expectation cannot hold a commit to anything - the
+/// mismatch is still reported, as advisory, but nothing local is refused on an
+/// uncertified word.
+pub fn identity_gate(ctx: &Context, routing_certified: bool) -> Option<CheckerOutcome> {
     if !matches!(ctx.event.as_str(), "pre-commit" | "pre-push") {
         return None;
     }
@@ -221,7 +227,11 @@ pub fn identity_gate(ctx: &Context) -> Option<CheckerOutcome> {
 
     Some(CheckerOutcome {
         name: "identity-actual".to_string(),
-        severity: Severity::Blocking,
+        severity: if routing_certified {
+            Severity::Blocking
+        } else {
+            Severity::Advisory
+        },
         outcome,
         duration_ms: 0,
         stdout: if actual.eq_ignore_ascii_case(expected) {
@@ -237,9 +247,22 @@ pub fn identity_gate(ctx: &Context) -> Option<CheckerOutcome> {
     })
 }
 
-pub fn run_all(cfg: &Config, ctx: &Context, only: Option<&str>) -> Result<Report> {
+/// Run the certified policy against the snapshot. `policy` must come from
+/// `Policy::load_certified` - this function executes its commands verbatim and
+/// never re-checks the signature itself. `routing_sig` is the routing table's
+/// signature state: uncertified routing downgrades the built-in identity gate
+/// to advisory so nothing local is refused on an uncertified expectation, and
+/// the state is stamped on the run record as evidence.
+pub fn run_all(
+    cfg: &Config,
+    policy: &Policy,
+    ctx: &Context,
+    routing_sig: &crate::configsig::SigState,
+    only: Option<&str>,
+) -> Result<Report> {
+    let routing_certified = !matches!(routing_sig, crate::configsig::SigState::Invalid(_));
     let event = Event::parse(&ctx.event)?;
-    let selected: Vec<&Checker> = cfg
+    let selected: Vec<&Checker> = policy
         .checkers_for(event)
         .into_iter()
         .filter(|c| only.is_none_or(|name| c.name == name))
@@ -256,7 +279,7 @@ pub fn run_all(cfg: &Config, ctx: &Context, only: Option<&str>) -> Result<Report
     let mut report = Report::default();
 
     if only.is_none()
-        && let Some(gate) = identity_gate(ctx)
+        && let Some(gate) = identity_gate(ctx, routing_certified)
     {
         report.outcomes.push(gate);
     }
@@ -287,7 +310,7 @@ pub fn run_all(cfg: &Config, ctx: &Context, only: Option<&str>) -> Result<Report
     });
     report.outcomes.append(&mut outcomes);
     if let Some(run) = run {
-        records::finish(cfg, run, ctx, &report);
+        records::finish(cfg, run, ctx, &report, routing_sig);
     }
     Ok(report)
 }
@@ -340,14 +363,8 @@ fn run_one(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
-        .env("LANG", std::env::var("LANG").unwrap_or_else(|_| "C".into()))
-        .env(
-            "TMPDIR",
-            std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into()),
-        )
+        // The checker sees what the operator sees — the gate contributes its
+        // context as explicit variables, not as walls around the child.
         .env("GITVAULT_EVENT", &ctx.event)
         .env("GITVAULT_IDENTITY", &ctx.identity)
         .env("GITVAULT_REPO", ctx.repo_root.display().to_string())

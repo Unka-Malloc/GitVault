@@ -253,11 +253,13 @@ enum ConfigCommand {
     /// verification.
     Keygen,
 
-    /// Sign the current configuration file after editing it.
+    /// Sign the configuration and the audit policy after editing them.
     ///
-    /// Editing `config.toml` stays a plain file edit; this command is the
-    /// ceremony that makes the edit loadable again, gated by the same human
-    /// confirmation as releasing a credential.
+    /// Editing `config.toml` or `checkers.toml` stays a plain file edit; this
+    /// command is the ceremony that certifies both, gated by the same human
+    /// confirmation as releasing a credential. `[[checkers]]` rows still left
+    /// in `config.toml` migrate into `checkers.toml` first, so each file is
+    /// certified under its own signature.
     Sign,
 
     /// Report the configuration's signature state. Fails when enforcement is
@@ -621,16 +623,20 @@ fn cmd_resolve(
 }
 
 fn cmd_checkers(config: Option<&PathBuf>, json: bool) -> anyhow::Result<ExitCode> {
-    let cfg = config::Config::load(config)?;
+    let (cfg, cfg_path, _) = config::Config::load_unverified(config)?;
+    let (policy, _policy_path, policy_sig) = config::Policy::load_state(&cfg_path, &cfg)?;
+    if let configsig::SigState::Invalid(reason) = &policy_sig {
+        eprintln!("warning: audit policy is uncertified - {reason}");
+    }
     if json {
-        println!("{}", serde_json::to_string_pretty(&cfg.checkers)?);
+        println!("{}", serde_json::to_string_pretty(&policy.checkers)?);
         return Ok(ExitCode::SUCCESS);
     }
-    if cfg.checkers.is_empty() {
+    if policy.checkers.is_empty() {
         println!("no checkers registered");
         return Ok(ExitCode::SUCCESS);
     }
-    for c in &cfg.checkers {
+    for c in &policy.checkers {
         println!(
             "{:<24} on={:<26} severity={:<9} timeout={}s",
             c.name,
@@ -694,17 +700,69 @@ fn context_for(
     })
 }
 
+/// Run the certified audit policy and print the report BEFORE any signature
+/// question is asked. Audits first, blessing after: the routing signature only
+/// gates the verdict, never the audit.
+///
+/// An event the policy registers checkers for is a publication boundary: when
+/// the routing table's signature does not hold, the run refuses - but only
+/// after the evidence is on screen, so what is being certified was already
+/// produced. An event with no registered checkers passes either way, so local
+/// work (commits, messages) is never held hostage to a blessing.
+fn audit_gate(
+    cfg: &config::Config,
+    cfg_sig: &configsig::SigState,
+    policy: &config::Policy,
+    policy_sig: &configsig::SigState,
+    ctx: &checkers::Context,
+    operation: &str,
+    only: Option<&str>,
+) -> anyhow::Result<checkers::Report> {
+    let event = config::Event::parse(&ctx.event)?;
+    let selected = policy.checkers_for(event);
+    // An uncertified policy is refused only when its commands would actually
+    // execute - checker rows are arbitrary code, so running them unsigned is
+    // the privilege hole this guard closes. An event the policy says nothing
+    // about executes nothing and proceeds regardless.
+    if !selected.is_empty()
+        && let configsig::SigState::Invalid(reason) = policy_sig
+    {
+        let declared = selected
+            .iter()
+            .map(|c| format!("{} -> {}", c.name, c.command.join(" ")))
+            .collect::<Vec<_>>()
+            .join("\n    ");
+        anyhow::bail!(
+            "refusing to run an uncertified audit policy: {reason}\n  \
+             it declares:\n    {declared}\n  \
+             if these are the commands audits should execute, certify them: gitvault config sign"
+        );
+    }
+    let report = checkers::run_all(cfg, policy, ctx, cfg_sig, only)?;
+    report.print(&ctx.event);
+    if let configsig::SigState::Invalid(reason) = cfg_sig
+        && !selected.is_empty()
+    {
+        anyhow::bail!(
+            "audits complete, but the routing table they ran against is uncertified: {reason}\n  \
+             certify it: gitvault config sign   (then rerun this {operation})"
+        );
+    }
+    Ok(report)
+}
+
 /// The publication gate every GitHub-reaching operation must pass: run the
 /// checkers registered for the event, print the verdicts, and fail closed.
 /// One copy so a new publish path cannot quietly forget it.
 fn run_publication_gate(
     cfg: &config::Config,
+    cfg_sig: &configsig::SigState,
+    policy: &config::Policy,
+    policy_sig: &configsig::SigState,
     ctx: &checkers::Context,
-    event: &str,
     operation: &str,
 ) -> anyhow::Result<()> {
-    let report = checkers::run_all(cfg, ctx, None)?;
-    report.print(event);
+    let report = audit_gate(cfg, cfg_sig, policy, policy_sig, ctx, operation, None)?;
     anyhow::ensure!(
         report.exit_code() == ExitCode::SUCCESS,
         "a blocking checker refused this {operation}; nothing was sent to GitHub"
@@ -713,12 +771,20 @@ fn run_publication_gate(
 }
 
 fn cmd_hook(config: Option<&PathBuf>, event: &str, _args: &[String]) -> anyhow::Result<ExitCode> {
-    let cfg = config::Config::load(config)?;
+    let (cfg, cfg_path, cfg_sig) = config::Config::load_unverified(config)?;
+    let (policy, _policy_path, policy_sig) = config::Policy::load_state(&cfg_path, &cfg)?;
     // git runs hooks with cwd set to the top level of the working tree, so "."
     // resolves correctly and no directory argument is needed from the hook shim.
     let ctx = context_for(&cfg, event, &PathBuf::from("."), None)?;
-    let report = checkers::run_all(&cfg, &ctx, None)?;
-    report.print(event);
+    let report = audit_gate(
+        &cfg,
+        &cfg_sig,
+        &policy,
+        &policy_sig,
+        &ctx,
+        "operation",
+        None,
+    )?;
     Ok(report.exit_code())
 }
 
@@ -808,10 +874,10 @@ fn cmd_check(
     only: Option<&str>,
     tag: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
-    let cfg = config::Config::load(config)?;
+    let (cfg, cfg_path, cfg_sig) = config::Config::load_unverified(config)?;
+    let (policy, _policy_path, policy_sig) = config::Policy::load_state(&cfg_path, &cfg)?;
     let ctx = context_for(&cfg, event, directory, tag.map(str::to_string))?;
-    let report = checkers::run_all(&cfg, &ctx, only)?;
-    report.print(event);
+    let report = audit_gate(&cfg, &cfg_sig, &policy, &policy_sig, &ctx, "check", only)?;
     Ok(report.exit_code())
 }
 
@@ -978,6 +1044,15 @@ fn cmd_config_sign(config: Option<&PathBuf>) -> anyhow::Result<ExitCode> {
     if !path.exists() {
         anyhow::bail!("nothing to sign at {}", path.display());
     }
+    // Checker rows left in the routing table migrate out before signing, so
+    // each file is certified under its own signature: the blessing the user
+    // gives here covers exactly what both files contain now.
+    if config::Config::migrate_checkers(&path)? {
+        println!(
+            "moved checker entries to {}",
+            config::Policy::path_for(&path).display()
+        );
+    }
     let vault = vault::Vault::open()?;
     unlock::ensure_open(
         &vault,
@@ -988,6 +1063,11 @@ fn cmd_config_sign(config: Option<&PathBuf>) -> anyhow::Result<ExitCode> {
     let key = vault.config_key()?;
     let sig = configsig::sign(&path, &key)?;
     println!("signed {} -> {}", path.display(), sig.display());
+    let policy_path = config::Policy::path_for(&path);
+    if policy_path.exists() {
+        let sig = configsig::sign(&policy_path, &key)?;
+        println!("signed {} -> {}", policy_path.display(), sig.display());
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1016,6 +1096,16 @@ fn cmd_config_verify(config: Option<&PathBuf>) -> anyhow::Result<ExitCode> {
                     return Ok(ExitCode::FAILURE);
                 }
             }
+            let policy_path = config::Policy::path_for(&path);
+            if policy_path.exists() {
+                match configsig::verify(&policy_path) {
+                    Ok(()) => println!("signature: valid for {}", policy_path.display()),
+                    Err(e) => {
+                        eprintln!("signature: INVALID - {e:#}");
+                        return Ok(ExitCode::FAILURE);
+                    }
+                }
+            }
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -1026,9 +1116,9 @@ fn cmd_config_verify(config: Option<&PathBuf>) -> anyhow::Result<ExitCode> {
 ///
 /// The privileged step is one `sudo` run inside this command. What lands under
 /// root: the binaries, the hooks directory and - when present - the signature
-/// anchor. What deliberately stays user-owned: `config.toml` (edits are
-/// allowed, only unsigned loads are refused) and `config.toml.sig` (rewritten
-/// by every `gitvault config sign`).
+/// anchor. What deliberately stays user-owned: `config.toml` and
+/// `checkers.toml` (edits are allowed, only unsigned loads are refused) and
+/// their `.sig` sidecars (rewritten by every `gitvault config sign`).
 fn cmd_install() -> anyhow::Result<ExitCode> {
     let home = PathBuf::from(std::env::var("HOME").context("HOME is not set")?);
     let bin_dir = home.join(".local/bin");
@@ -1290,7 +1380,10 @@ fn cmd_pr(
     command: PrCommand,
     repo: Option<String>,
 ) -> anyhow::Result<ExitCode> {
-    let cfg = config::Config::load(config)?;
+    // Audit first, blessing after: the routing table is parsed without its
+    // signature so the registry can run; the gate asks for certification only
+    // after the evidence is produced, and credentials flow only once it holds.
+    let (cfg, cfg_path, cfg_sig) = config::Config::load_unverified(config)?;
     let vault = vault::Vault::open()?;
 
     let slug = match repo {
@@ -1329,7 +1422,8 @@ fn cmd_pr(
             })?;
             ctx.pr_base = Some(base.clone());
             ctx.pr_head = Some(head.clone());
-            run_publication_gate(&cfg, &ctx, "pr", "pull request")?;
+            let (policy, _policy_path, policy_sig) = config::Policy::load_state(&cfg_path, &cfg)?;
+            run_publication_gate(&cfg, &cfg_sig, &policy, &policy_sig, &ctx, "pull request")?;
             let mut f = vec![
                 ("title".to_string(), title),
                 ("head".to_string(), head),
@@ -1385,7 +1479,8 @@ fn cmd_pr(
                 )
             })?;
             ctx.pr_number = Some(number.to_string());
-            run_publication_gate(&cfg, &ctx, "pr", "merge")?;
+            let (policy, _policy_path, policy_sig) = config::Policy::load_state(&cfg_path, &cfg)?;
+            run_publication_gate(&cfg, &cfg_sig, &policy, &policy_sig, &ctx, "merge")?;
             let mut f = vec![("merge_method".to_string(), method)];
             if let Some(s) = subject {
                 f.push(("commit_title".to_string(), s));
@@ -1607,11 +1702,12 @@ fn cmd_release(
     command: ReleaseCommand,
     repo: Option<String>,
 ) -> anyhow::Result<ExitCode> {
-    let cfg = config::Config::load(config)?;
+    let (cfg, cfg_path, cfg_sig) = config::Config::load_unverified(config)?;
     // The release boundary runs before any credential is touched: the verdict
     // does not depend on the vault, and a refusal must be possible even where
     // the vault is locked. Nothing reaches GitHub until the registry passes.
     if let ReleaseCommand::Create { tag, .. } = &command {
+        let (policy, _policy_path, policy_sig) = config::Policy::load_state(&cfg_path, &cfg)?;
         let ctx = context_for(&cfg, "release", &PathBuf::from("."), Some(tag.clone())).map_err(
             |err| {
                 anyhow::anyhow!(
@@ -1621,7 +1717,7 @@ fn cmd_release(
                 )
             },
         )?;
-        run_publication_gate(&cfg, &ctx, "release", "release")?;
+        run_publication_gate(&cfg, &cfg_sig, &policy, &policy_sig, &ctx, "release")?;
     }
     let vault = vault::Vault::open()?;
     let slug = resolve_slug(repo)?;

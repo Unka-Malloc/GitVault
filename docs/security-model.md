@@ -150,13 +150,27 @@ machine is not the prompt that was reviewed.
 ## Configuration attestation
 
 `config.toml` is a routing table, not a secret: which repository resolves to
-which identity, backed by which account. What it requires is **integrity**, so
-the control is a signature, not encryption.
+which identity, backed by which account. `checkers.toml` is the audit policy:
+the commands a gate may execute. What both require is **integrity**, so the
+control is a signature, not encryption — one signature per file, because the
+two files answer different questions and are blessed at different moments.
 
+- **Audit first, blessing after.** The policy signature means *these commands
+  may execute*; the routing signature means *these identities may act*.
+  Audits run under the certified policy before the routing table's blessing
+  is asked: a gated event whose routing signature does not hold refuses only
+  after the audit report has been shown, so the operator always certifies
+  evidence already produced, never a blind precondition. An uncertified
+  policy is never executed — its declared commands are shown, then refused —
+  and an uncertified routing table never reaches a credential. A routing
+  table that declares `audit_policy` also binds the policy file's existence:
+  deleting `checkers.toml` cannot silence the audit, it refuses.
 - **Signing key in the vault.** `gitvault config keygen` creates an ed25519
   pair; the private half is stored in `vault.enc` beside the credentials, so
   producing a signature costs the same biometric-gated window as releasing a
-  key. `gitvault config sign` re-blesses the file after an intended edit.
+  key. `gitvault config sign` re-blesses both files after an intended edit
+  (and migrates any `[[checkers]]` rows still sitting in `config.toml` into
+  the policy file).
 - **Public anchor, root-owned.** `config.pub` (an allowed-signers line, one
   `gitvault-config` principal) sits beside the configuration, but it only
   counts while root owns it. A same-user process can rewrite `config.toml`
@@ -165,9 +179,11 @@ the control is a signature, not encryption.
   and sets the system-immutable flag on the binaries and the hooks directory,
   which resists the same owner without changing how the kernel launches them
   (a user-built binary chowned to root is refused by AppleSystemPolicy).
-- **Reads stay free, writes are a ceremony.** Every `Config::load` verifies
-  the signature when enforcement is armed and fails closed on a missing or
-  invalid sidecar. `gitvault config verify` reports the state for an operator.
+- **Reads stay free, writes are a ceremony.** Every credential-bearing load
+  verifies the routing signature when enforcement is armed and fails closed
+  on a missing or invalid sidecar; audit surfaces classify instead of
+  refusing so the audit can precede the blessing. `gitvault config verify`
+  reports both files' state for an operator.
 - **Honest residual.** This does not change the keychain note above: a
   determined same-user process can read the vault key silently and could, in
   principle, decrypt the vault, extract the signing key, and forge a

@@ -198,6 +198,11 @@ pub struct Record {
     pub identity: String,
     pub account: String,
     pub range: Range,
+    /// Whether the routing table's signature held when the audit ran:
+    /// `valid`, `invalid` or `inactive` (no armed anchor). Audits run before
+    /// the blessing, so the record keeps the state the verdict was made under.
+    #[serde(default)]
+    pub routing_signature: String,
     pub passed: bool,
     pub blocking_failures: usize,
     pub outcomes: Vec<Outcome>,
@@ -264,7 +269,13 @@ fn exit_of(kind: &OutcomeKind) -> Option<i32> {
 
 /// Write the record and prune the store. A failure is reported on stderr at
 /// most, never as a refusal: a run that decided must stay decided.
-pub fn finish(cfg: &Config, run: Run, ctx: &Context, report: &Report) {
+pub fn finish(
+    cfg: &Config,
+    run: Run,
+    ctx: &Context,
+    report: &Report,
+    routing_signature: &crate::configsig::SigState,
+) {
     let record = Record {
         id: run.id,
         created_at: epoch_secs(),
@@ -280,6 +291,11 @@ pub fn finish(cfg: &Config, run: Run, ctx: &Context, report: &Report) {
             pr_number: ctx.pr_number.clone(),
             release_tag: ctx.release_tag.clone(),
             release_commit: ctx.release_commit.clone(),
+        },
+        routing_signature: match routing_signature {
+            crate::configsig::SigState::Valid => "valid".to_string(),
+            crate::configsig::SigState::Invalid(_) => "invalid".to_string(),
+            crate::configsig::SigState::Inactive => "inactive".to_string(),
         },
         passed: report.blocking_failures() == 0,
         blocking_failures: report.blocking_failures(),

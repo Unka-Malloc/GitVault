@@ -93,48 +93,71 @@ pub fn anchor_state(anchor: &Path) -> Anchor {
     }
 }
 
-/// Verify `config_path` against its signature sidecar, when enforcement is on.
-///
-/// Called from `Config::load`, which every gitvault surface funnels through, so
-/// a tampered routing table cannot be used anywhere - including read-only
-/// surfaces, which would otherwise lull the operator with a wrong answer.
-pub fn verify(config_path: &Path) -> Result<()> {
+/// Where a file's signature stands, without refusing it. Audit surfaces
+/// classify first so the audits can run (or visibly decline) before the
+/// operator is asked to bless anything: the signature certifies what was
+/// already shown, it is never a blind precondition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SigState {
+    /// Enforcement is armed and the file verifies against its sidecar.
+    Valid,
+    /// Enforcement is armed; the file is unsigned or fails verification.
+    /// The reason is operator-facing.
+    Invalid(String),
+    /// No root-owned anchor (or a test escape): enforcement is inactive
+    /// and the file is accepted as-is.
+    Inactive,
+}
+
+/// Classify `path` without refusing it - the audit-first counterpart of
+/// [`verify`].
+pub fn signature_state(config_path: &Path) -> SigState {
     // Test escape, debug builds only - the same convention as
     // GITVAULT_UNLOCK_STATE and GITVAULT_TOUCHID. Integration fixtures pass an
     // unsigned `--config`; a release binary never honours this variable.
     if cfg!(debug_assertions) && std::env::var_os("GITVAULT_UNSIGNED_OK").is_some() {
-        return Ok(());
+        return SigState::Inactive;
     }
     let anchor = anchor_path();
     match anchor_state(&anchor) {
-        Anchor::Absent => return Ok(()),
-        Anchor::Unanchored => {
-            eprintln!(
-                "gitvault: {} exists but is not root-owned; signature enforcement is inactive\n  \
-                 fix: run `gitvault install` (or sudo chown root:wheel {})",
-                anchor.display(),
-                anchor.display()
-            );
-            return Ok(());
+        Anchor::Absent | Anchor::Unanchored => SigState::Inactive,
+        Anchor::Anchored => {
+            if !sig_path(config_path).exists() {
+                return SigState::Invalid(format!("{} is unsigned", config_path.display()));
+            }
+            match verify_signed(config_path, &anchor) {
+                Ok(()) => SigState::Valid,
+                Err(e) => SigState::Invalid(format!(
+                    "{} failed signature verification: {e:#}",
+                    config_path.display()
+                )),
+            }
         }
-        Anchor::Anchored => {}
     }
+}
 
-    let sig = sig_path(config_path);
-    if !sig.exists() {
-        bail!(
-            "{} is unsigned\n  bless the current file: gitvault config sign",
-            config_path.display()
+/// Verify `config_path` against its signature sidecar, when enforcement is on.
+///
+/// Called from `Config::load`, which every credential-bearing surface funnels
+/// through, so a tampered routing table cannot route credentials anywhere.
+/// Audit surfaces use [`signature_state`] instead: they run first and ask for
+/// the blessing afterwards.
+pub fn verify(config_path: &Path) -> Result<()> {
+    let anchor = anchor_path();
+    if anchor_state(&anchor) == Anchor::Unanchored {
+        eprintln!(
+            "gitvault: {} exists but is not root-owned; signature enforcement is inactive\n  \
+             fix: run `gitvault install` (or sudo chown root:wheel {})",
+            anchor.display(),
+            anchor.display()
         );
     }
-
-    verify_signed(config_path, &anchor).map_err(|e| {
-        anyhow::anyhow!(
-            "{} failed signature verification: {e:#}\n  \
-             if the edit is intended, bless it: gitvault config sign",
-            config_path.display()
-        )
-    })
+    match signature_state(config_path) {
+        SigState::Valid | SigState::Inactive => Ok(()),
+        SigState::Invalid(reason) => {
+            bail!("{reason}\n  if the edit is intended, bless it: gitvault config sign")
+        }
+    }
 }
 
 /// Verify `config_path` against the signature sidecar under `anchor`. The root

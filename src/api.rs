@@ -537,7 +537,7 @@ mod tests {
                 default: Some("personal".to_string()),
                 ..Default::default()
             },
-            checkers: vec![],
+            audit_policy: None,
             record_dir: None,
         };
         let repo = Repo::for_test("/tmp/x", Some("git@github.com:Attacker/Repo.git"));

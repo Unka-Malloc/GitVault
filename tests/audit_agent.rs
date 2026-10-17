@@ -1,12 +1,18 @@
 //! Exercise the audit host's AwP wiring against a declarative registry
 //! document and a deterministic ACP agent double — no external model.
+//! The host is driven exactly as the gate drives it: `--contract <dir>`
+//! points at an installed checker payload (contract, installation,
+//! registry, policy) and `--run <dir>` at this run's working directory.
 use serde_json::{Value, json};
-use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-struct Fixture(PathBuf);
+
+struct Fixture {
+    contract_dir: PathBuf,
+    run_dir: PathBuf,
+}
 impl Fixture {
     fn new(mode: &str) -> Self {
         let nonce = std::time::SystemTime::now()
@@ -18,7 +24,10 @@ impl Fixture {
             "gitvault-acp-{}-{nonce}-{sequence}",
             std::process::id()
         ));
-        std::fs::create_dir(&root).unwrap();
+        let contract_dir = root.join("contract");
+        let run_dir = root.join("run");
+        std::fs::create_dir_all(&contract_dir).unwrap();
+        std::fs::create_dir_all(&run_dir).unwrap();
         std::fs::write(root.join("acp.mode"), mode).unwrap();
         let stub_args = [PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/acp_agent.py")
@@ -71,47 +80,86 @@ impl Fixture {
             }
         });
         std::fs::write(
-            root.join("registry.json"),
+            contract_dir.join("registry.json"),
             serde_json::to_string_pretty(&document).unwrap(),
         )
         .unwrap();
-        Self(root)
+        std::fs::write(
+            contract_dir.join("contract.json"),
+            serde_json::to_string_pretty(&json!({
+                "name": "synthetic-reviewer",
+                "title": "Synthetic Reviewer",
+                "task": "synthetic audit"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            contract_dir.join("installation.json"),
+            serde_json::to_string_pretty(&json!({
+                "synced": {"tag": "profile/synthetic-reviewer/v1"},
+                "review": "/bin/echo"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            contract_dir.join("policy.md"),
+            "Only inspect synthetic evidence.",
+        )
+        .unwrap();
+        std::fs::write(
+            run_dir.join("scope.json"),
+            serde_json::to_string_pretty(&json!({
+                "runtime": {
+                    "harness": "opencode",
+                    "provider": "opencode",
+                    "model": "opencode/stub-free"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        Self {
+            contract_dir,
+            run_dir,
+        }
     }
-    fn request(&self) -> Value {
-        json!({
-            "document": self.0.join("registry.json"),
-            "prompt": "synthetic audit",
-            "role": {"id":"synthetic-reviewer","name":"Synthetic Reviewer","agent":"opencode",
-                    "revision":"profile/synthetic-reviewer/v1","model":"opencode/stub-free",
-                    "permission":"read-only","instructions":"Only inspect synthetic evidence.",
-                    "mcpServers":[{"type":"stdio","name":"gitvault-audit",
-                                    "command":"/bin/echo","args":[],"env":[]}],
-                    "extensions":{"provider":"opencode"}},
-            "resume":null,"session_file":self.0.join("session.json"),
-            "run_dir":self.0,
-        })
+    /// The run directory the stub's fixtures land in — STUB_DIR's parent.
+    fn stub_root(&self) -> PathBuf {
+        self.contract_dir.parent().unwrap().to_path_buf()
+    }
+    fn write_document(&self, document: &Value) {
+        std::fs::write(
+            self.contract_dir.join("registry.json"),
+            serde_json::to_string(document).unwrap(),
+        )
+        .unwrap();
+    }
+    fn document(&self) -> Value {
+        serde_json::from_str(
+            &std::fs::read_to_string(self.contract_dir.join("registry.json")).unwrap(),
+        )
+        .unwrap()
     }
     fn invoke(&self) -> (bool, Value) {
-        self.invoke_request(self.request())
-    }
-    fn invoke_request(&self, request: Value) -> (bool, Value) {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_gitvault-audit-agent"))
-            .current_dir(&self.0)
-            .stdin(Stdio::piped())
+        let output = Command::new(env!("CARGO_BIN_EXE_gitvault-audit-agent"))
+            .args([
+                "--contract",
+                self.contract_dir.to_str().unwrap(),
+                "--run",
+                self.run_dir.to_str().unwrap(),
+            ])
+            .current_dir(&self.run_dir)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()
+            .output()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(request.to_string().as_bytes())
-            .unwrap();
-        let output = child.wait_with_output().unwrap();
         assert!(output.stdout.len() < 1024);
         let text = String::from_utf8(output.stdout).unwrap();
-        assert!(!text.contains(self.0.to_str().unwrap()));
+        let root = self.stub_root();
+        assert!(!text.contains(root.to_str().unwrap()));
         (
             output.status.success(),
             serde_json::from_str(&text).unwrap(),
@@ -120,7 +168,9 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if let Some(root) = self.contract_dir.parent() {
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 }
 
@@ -137,9 +187,13 @@ fn declared_document_completes_with_usage_and_composed_instructions() {
     );
     // Policy, the declared binding's standing prompt, then the task — AwP's
     // own composition order.
-    assert_eq!(
-        std::fs::read_to_string(fixture.0.join("fixture-instructions.txt")).unwrap(),
-        "Only inspect synthetic evidence.\n\nBinding context.\n\nsynthetic audit"
+    let composed =
+        std::fs::read_to_string(fixture.stub_root().join("fixture-instructions.txt")).unwrap();
+    assert!(
+        composed.starts_with(
+            "Only inspect synthetic evidence.\n\nBinding context.\n\nReview date (UTC): "
+        ) && composed.ends_with("\n\nsynthetic audit"),
+        "{composed}"
     );
     assert_eq!(
         result["usage"],
@@ -148,19 +202,25 @@ fn declared_document_completes_with_usage_and_composed_instructions() {
     );
     assert_eq!(
         serde_json::from_str::<Value>(
-            &std::fs::read_to_string(fixture.0.join("session.json")).unwrap()
+            &std::fs::read_to_string(fixture.run_dir.join("audit-session.json")).unwrap()
         )
         .unwrap()["session_id"],
         "acp-stub-session"
     );
     // The role's single MCP server reached the session declaration — `type`
     // is consumed as the wire discriminant; the stdio payload is what lands.
-    let servers: Value =
-        serde_json::from_str(&std::fs::read_to_string(fixture.0.join("mcp_servers.json")).unwrap())
-            .unwrap();
+    let servers: Value = serde_json::from_str(
+        &std::fs::read_to_string(fixture.stub_root().join("mcp_servers.json")).unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         servers,
-        json!([{"name":"gitvault-audit","command":"/bin/echo","args":[],"env":[]}])
+        json!([{"name":"gitvault-audit","command":"/bin/echo","args":[
+            "serve","--contract",
+            fixture.contract_dir.join("contract.json").to_string_lossy(),
+            "--run",
+            fixture.run_dir.to_string_lossy(),
+        ],"env":[]}])
     );
 }
 
@@ -182,22 +242,23 @@ fn each_auditor_has_its_own_awp_principal() {
         "sustainable-maintainer",
     ] {
         let fixture = Fixture::new("complete");
-        let mut request = fixture.request();
-        request["role"]["id"] = json!(id);
-        let mut document: Value = serde_json::from_str(
-            &std::fs::read_to_string(fixture.0.join("registry.json")).unwrap(),
+        // Production installs one profile per checker under its own name:
+        // contract name, profile key and binding target are the same.
+        let mut contract: Value = serde_json::from_str(
+            &std::fs::read_to_string(fixture.contract_dir.join("contract.json")).unwrap(),
         )
         .unwrap();
-        // Production installs one profile per checker under its own name:
-        // profile key, binding target and projected role id are the same.
+        contract["name"] = json!(id);
+        std::fs::write(
+            fixture.contract_dir.join("contract.json"),
+            serde_json::to_string(&contract).unwrap(),
+        )
+        .unwrap();
+        let mut document = fixture.document();
         document["profiles"][id] = json!({"agent": "opencode"});
         document["bindings"]["audit"]["profile"] = json!(id);
-        std::fs::write(
-            fixture.0.join("registry.json"),
-            serde_json::to_string(&document).unwrap(),
-        )
-        .unwrap();
-        let (ok, result) = fixture.invoke_request(request);
+        fixture.write_document(&document);
+        let (ok, result) = fixture.invoke();
         assert!(ok);
         assert_eq!(result["profile"]["id"], id);
         assert_eq!(result["profile"]["principal"], format!("profile:{id}"));
@@ -206,33 +267,73 @@ fn each_auditor_has_its_own_awp_principal() {
 
 #[test]
 fn inadmissible_roles_and_bindings_never_spawn_an_agent() {
-    for (field, value) in [
-        ("agent", json!("unknown-agent")),
-        ("permission", json!("danger-full-access")),
-        ("model", Value::Null),
-        ("instructions", Value::Null),
+    // The runtime's declared model chain outside the free OpenCode catalog
+    // refuses the review before any agent spawns.
+    for (runtime, policy) in [
         (
-            "mcpServers",
-            json!([{"type":"stdio","name":"foreign-tools","command":"/bin/echo"}]),
+            json!({"harness": "unknown-agent", "provider": "opencode", "model": "opencode/stub-free"}),
+            Some("Only inspect synthetic evidence."),
         ),
-        // The free-tier restriction binds the whole model chain, not just
-        // the primary.
-        ("models", json!(["openai/gpt-5"])),
+        (
+            json!({"harness": "opencode", "provider": "opencode"}),
+            Some("Only inspect synthetic evidence."),
+        ),
+        (
+            json!({"harness": "opencode", "provider": "opencode",
+                   "model": "opencode/stub-free", "models": ["openai/gpt-5"]}),
+            Some("Only inspect synthetic evidence."),
+        ),
+        // An empty policy leaves the role without instructions — refused.
+        (
+            json!({"harness": "opencode", "provider": "opencode", "model": "opencode/stub-free"}),
+            Some(""),
+        ),
     ] {
         let fixture = Fixture::new("complete");
-        let mut request = fixture.request();
-        request["role"][field] = value;
-        let (ok, result) = fixture.invoke_request(request);
+        let mut scope: Value = serde_json::from_str(
+            &std::fs::read_to_string(fixture.run_dir.join("scope.json")).unwrap(),
+        )
+        .unwrap();
+        scope["runtime"] = runtime;
+        std::fs::write(
+            fixture.run_dir.join("scope.json"),
+            serde_json::to_string(&scope).unwrap(),
+        )
+        .unwrap();
+        if let Some(policy) = policy {
+            std::fs::write(fixture.contract_dir.join("policy.md"), policy).unwrap();
+        }
+        let (ok, result) = fixture.invoke();
         assert!(!ok, "{result}");
-        assert!(!fixture.0.join("fixture-instructions.txt").exists());
+        assert!(
+            !fixture
+                .stub_root()
+                .join("fixture-instructions.txt")
+                .exists()
+        );
     }
-    // A binding pointing at an unprojected profile fails closed too.
+    // A binding pointing at an unprojected profile fails closed too: the
+    // contract names `other-reviewer` while the audit binding still
+    // resolves `synthetic-reviewer`.
     let fixture = Fixture::new("complete");
-    let mut request = fixture.request();
-    request["role"]["id"] = json!("other-reviewer");
-    let (ok, result) = fixture.invoke_request(request);
+    let mut contract: Value = serde_json::from_str(
+        &std::fs::read_to_string(fixture.contract_dir.join("contract.json")).unwrap(),
+    )
+    .unwrap();
+    contract["name"] = json!("other-reviewer");
+    std::fs::write(
+        fixture.contract_dir.join("contract.json"),
+        serde_json::to_string(&contract).unwrap(),
+    )
+    .unwrap();
+    let (ok, result) = fixture.invoke();
     assert!(!ok, "{result}");
-    assert!(!fixture.0.join("fixture-instructions.txt").exists());
+    assert!(
+        !fixture
+            .stub_root()
+            .join("fixture-instructions.txt")
+            .exists()
+    );
 }
 
 #[test]
@@ -240,26 +341,27 @@ fn an_exhausted_model_falls_back_within_the_same_session() {
     let fixture = Fixture::new("complete");
     // The declared model is quota-dead; the role's chain offers the next
     // free OpenCode model.
-    let mut document: Value =
-        serde_json::from_str(&std::fs::read_to_string(fixture.0.join("registry.json")).unwrap())
-            .unwrap();
+    let mut document = fixture.document();
     document["agents"]["opencode"]["command"]["env"]["sanitized"]["set"]["STUB_QUOTA"] =
         json!("opencode/stub-free");
+    fixture.write_document(&document);
+    let mut scope: Value =
+        serde_json::from_str(&std::fs::read_to_string(fixture.run_dir.join("scope.json")).unwrap())
+            .unwrap();
+    scope["runtime"]["models"] = json!(["opencode/glm-stub-free"]);
     std::fs::write(
-        fixture.0.join("registry.json"),
-        serde_json::to_string(&document).unwrap(),
+        fixture.run_dir.join("scope.json"),
+        serde_json::to_string(&scope).unwrap(),
     )
     .unwrap();
-    let mut request = fixture.request();
-    request["role"]["models"] = json!(["opencode/glm-stub-free"]);
-    let (ok, result) = fixture.invoke_request(request);
+    let (ok, result) = fixture.invoke();
     assert!(ok, "{result}");
     assert_eq!(result["completed"], true);
     assert_eq!(result["served"]["agent"], "opencode");
     assert_eq!(result["served"]["model"], "opencode/glm-stub-free");
     // One session, one model switch: prompt@stub-free → set_config_option →
     // prompt@glm-stub-free.
-    let trace: Vec<Value> = std::fs::read_to_string(fixture.0.join("stub-trace.jsonl"))
+    let trace: Vec<Value> = std::fs::read_to_string(fixture.stub_root().join("stub-trace.jsonl"))
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
@@ -287,15 +389,9 @@ fn an_exhausted_model_falls_back_within_the_same_session() {
 #[test]
 fn an_unavailable_agent_yields_to_the_declared_fallback() {
     let fixture = Fixture::new("complete");
-    let mut document: Value =
-        serde_json::from_str(&std::fs::read_to_string(fixture.0.join("registry.json")).unwrap())
-            .unwrap();
+    let mut document = fixture.document();
     document["agents"]["opencode"]["command"]["program"] = json!("/nonexistent-agent");
-    std::fs::write(
-        fixture.0.join("registry.json"),
-        serde_json::to_string(&document).unwrap(),
-    )
-    .unwrap();
+    fixture.write_document(&document);
     let (ok, result) = fixture.invoke();
     assert!(ok, "{result}");
     assert_eq!(result["completed"], true);
@@ -304,13 +400,17 @@ fn an_unavailable_agent_yields_to_the_declared_fallback() {
     assert_eq!(result["served"]["model"], "swe-2-max");
     // The fallback is a fresh session on a different agent, but the role —
     // policy, binding prompt, task — lands identically.
-    assert_eq!(
-        std::fs::read_to_string(fixture.0.join("fixture-instructions.txt")).unwrap(),
-        "Only inspect synthetic evidence.\n\nBinding context.\n\nsynthetic audit"
+    let composed =
+        std::fs::read_to_string(fixture.stub_root().join("fixture-instructions.txt")).unwrap();
+    assert!(
+        composed.starts_with(
+            "Only inspect synthetic evidence.\n\nBinding context.\n\nReview date (UTC): "
+        ) && composed.ends_with("\n\nsynthetic audit"),
+        "{composed}"
     );
     assert_eq!(
         serde_json::from_str::<Value>(
-            &std::fs::read_to_string(fixture.0.join("session.json")).unwrap()
+            &std::fs::read_to_string(fixture.run_dir.join("audit-session.json")).unwrap()
         )
         .unwrap()["session_id"],
         "devin-stub-session"
@@ -320,18 +420,12 @@ fn an_unavailable_agent_yields_to_the_declared_fallback() {
 #[test]
 fn a_missing_agent_program_is_classified_without_local_details() {
     let fixture = Fixture::new("complete");
-    let mut document: Value =
-        serde_json::from_str(&std::fs::read_to_string(fixture.0.join("registry.json")).unwrap())
-            .unwrap();
+    let mut document = fixture.document();
     // Every declared candidate is absent: the chain exhausts and the
     // refusal still carries no local paths.
     document["agents"]["opencode"]["command"]["program"] = json!("/nonexistent-agent");
     document["agents"]["devin"]["command"]["program"] = json!("/nonexistent-fallback");
-    std::fs::write(
-        fixture.0.join("registry.json"),
-        serde_json::to_string(&document).unwrap(),
-    )
-    .unwrap();
+    fixture.write_document(&document);
     let (ok, result) = fixture.invoke();
     assert!(!ok);
     assert_eq!(result["completed"], false);

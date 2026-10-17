@@ -10,11 +10,20 @@ use sha2::Digest as _;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// The two well-known roots every checker lives under.
+/// The two well-known roots every checker lives under. The profile root is
+/// GitVault's own data home — checkers are independent of any other agent
+/// system's profile namespace.
 fn profile_root() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
-        .join(".hermes")
-        .join("profiles")
+    let base = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+                .join(".local")
+                .join("share")
+        });
+    base.join("gitvault").join("profiles")
 }
 
 fn skill_root() -> PathBuf {
@@ -42,6 +51,16 @@ fn config_file() -> PathBuf {
     base.join("gitvault").join("config.toml")
 }
 
+/// The audit policy lives in its own signed file beside the routing table, so
+/// audits can run before the routing table is asked for a blessing. The
+/// sibling convention matches `Policy::path_for` in the main binary.
+fn policy_file() -> PathBuf {
+    config_file()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("checkers.toml")
+}
+
 fn sha256(text: &str) -> String {
     sha2::Sha256::digest(text.as_bytes())
         .iter()
@@ -57,63 +76,6 @@ fn payload_of(contract: &Contract) -> Vec<&'static str> {
         payload.push("documents.json");
     }
     payload
-}
-
-/// The audit agent home: an isolated XDG tree the OpenCode audit session runs
-/// under. The runner fills it at launch (`config`, `data`, `state`, `cache`);
-/// the only host material is a credentials link into the operator's existing
-/// OpenCode store - never a credential copy, never a host configuration.
-fn prepare_agent_home(profile: &Path) -> Result<String, String> {
-    let home_root = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    let host_data = std::env::var("XDG_DATA_HOME")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(&home_root).join(".local").join("share"));
-    let store = host_data.join("opencode");
-    let links: Vec<PathBuf> = ["auth.json", "account.json"]
-        .iter()
-        .map(|name| store.join(name))
-        .filter(|source| source.is_file())
-        .collect();
-    if links.is_empty() {
-        return Err("An existing OpenCode sign-in is required for the audit runtime".to_string());
-    }
-    let home = profile.join("opencode");
-    for leaf in ["config", "data", "state", "cache"] {
-        std::fs::create_dir_all(home.join(leaf)).map_err(|e| e.to_string())?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
-    }
-    let data = home.join("data").join("opencode");
-    std::fs::create_dir_all(&data).map_err(|e| e.to_string())?;
-    for source in links {
-        let link = data.join(source.file_name().unwrap_or_default());
-        if link.is_symlink() {
-            let points = std::fs::canonicalize(&link).map_err(|e| e.to_string())?;
-            if points != std::fs::canonicalize(&source).map_err(|e| e.to_string())? {
-                return Err(format!(
-                    "The audit agent home's {} link points to a different account store",
-                    source.display()
-                ));
-            }
-        } else if link.exists() {
-            return Err(format!(
-                "The audit agent home already contains an independent {}",
-                source.display()
-            ));
-        } else {
-            std::os::unix::fs::symlink(
-                std::fs::canonicalize(&source).map_err(|e| e.to_string())?,
-                &link,
-            )
-            .map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(home.to_string_lossy().into_owned())
 }
 
 /// The per-run OpenCode configuration the declared agent spec carries:
@@ -164,19 +126,11 @@ fn write_registry_document(
     opencode: &str,
     devin: &str,
 ) -> Result<(), String> {
-    let isolated_xdg: Vec<String> = [
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-        "XDG_STATE_HOME",
-        "XDG_CACHE_HOME",
-    ]
-    .iter()
-    .map(|key| key.to_string())
-    .collect();
     let mut spec = a4aa_opencode::spec();
     spec.command.program = opencode.to_string();
-    spec.command.env = a4aa::EnvPolicy::Sanitized {
-        inherit: isolated_xdg.clone(),
+    // The agent inherits the operator's full environment — the audit's
+    // posture lives in the injected config, not in walls around the child.
+    spec.command.env = a4aa::EnvPolicy::InheritAll {
         set: BTreeMap::from([(
             "OPENCODE_CONFIG_CONTENT".to_string(),
             a4aa::EnvValue::Literal(opencode_config().to_string()),
@@ -193,16 +147,21 @@ fn write_registry_document(
     };
     serve.command.args = vec!["serve".to_string(), "--port".to_string(), "0".to_string()];
     // The cross-agent fallback: same audit role on `devin acp`. Credentials
-    // never enter the document — the lane's `auth_key` resolves the host's
-    // DEVIN_API_KEY at session establishment, and a host without one simply
-    // exhausts the chain. DEVIN_MODEL pins the declared model at spawn so the
-    // selection holds whether or not the session advertises a model
-    // configOption.
+    // never enter the document — the lane's `auth_key` is a secret reference
+    // the host resolves at session establishment (explicit DEVIN_API_KEY,
+    // then the Devin CLI's own credential store), and a host without one
+    // simply exhausts the chain. DEVIN_MODEL pins the declared model at
+    // spawn so the selection holds whether or not the session advertises a
+    // model configOption.
     const FALLBACK_MODEL: &str = "swe-2-max";
     let mut fallback = a4aa_devin::spec();
+    if let a4aa::LaneSpec::Acp { auth_key, .. } = &mut fallback.lane {
+        *auth_key = Some(a4aa::EnvSource::Secret {
+            secret: "devin-api-key".to_string(),
+        });
+    }
     fallback.command.program = devin.to_string();
-    fallback.command.env = a4aa::EnvPolicy::Sanitized {
-        inherit: isolated_xdg,
+    fallback.command.env = a4aa::EnvPolicy::InheritAll {
         set: BTreeMap::from([(
             "DEVIN_MODEL".to_string(),
             a4aa::EnvValue::Literal(FALLBACK_MODEL.to_string()),
@@ -292,8 +251,8 @@ fn devin_program() -> String {
 /// refusing keeps an installed checker updatable: the command embeds absolute
 /// paths, so a machine that refused to touch an existing entry would be
 /// stranded on whatever was written first.
-fn register(config: &Path, name: &str, block: &str) -> Result<&'static str, String> {
-    let text = std::fs::read_to_string(config).unwrap_or_default();
+fn register(policy: &Path, name: &str, block: &str) -> Result<&'static str, String> {
+    let text = std::fs::read_to_string(policy).unwrap_or_default();
     let mut segments: Vec<String> = Vec::new();
     let mut current = String::new();
     for line in text.split_inclusive('\n') {
@@ -325,14 +284,50 @@ fn register(config: &Path, name: &str, block: &str) -> Result<&'static str, Stri
         segments.push(format!("{separator}{block}"));
     }
     let updated = segments.concat();
-    toml::from_str::<toml::Value>(&updated).map_err(|error| format!("config.toml: {error}"))?;
-    std::fs::write(config, updated).map_err(|e| e.to_string())?;
+    toml::from_str::<toml::Value>(&updated).map_err(|error| format!("checkers.toml: {error}"))?;
+    std::fs::write(policy, updated).map_err(|e| e.to_string())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(config, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(policy, std::fs::Permissions::from_mode(0o600));
     }
     Ok(action)
+}
+
+/// Bind the policy file into the routing table: `audit_policy` is a top-level
+/// key, so it must be inserted ahead of the first table header. The signed
+/// declaration is what stops an audit from being skipped by deleting the
+/// policy file - an absent declared policy refuses to run.
+fn declare_policy(config: &Path) -> Result<(), String> {
+    let text = std::fs::read_to_string(config).unwrap_or_default();
+    // A top-level key before the first table header is already a declaration.
+    let already = text
+        .lines()
+        .take_while(|l| !l.trim_start().starts_with('['))
+        .any(|l| l.trim_start().starts_with("audit_policy"));
+    if already {
+        return Ok(());
+    }
+    let declaration = "audit_policy = \"checkers.toml\"\n\n";
+    // Insert before the first line that opens a table - a top-level key found
+    // under a table header would silently belong to that table.
+    let offset = text
+        .char_indices()
+        .scan(true, |bol, (i, c)| {
+            let at_bol = *bol;
+            *bol = c == '\n';
+            Some((i, at_bol))
+        })
+        .find(|(i, at_bol)| *at_bol && text[*i..].trim_start().starts_with('['))
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    let mut updated = String::with_capacity(text.len() + declaration.len());
+    updated.push_str(&text[..offset]);
+    updated.push_str(declaration);
+    updated.push_str(&text[offset..]);
+    toml::from_str::<toml::Value>(&updated).map_err(|e| format!("config.toml: {e}"))?;
+    std::fs::write(config, updated).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn read_installation(target: &Path) -> Option<Map<String, Value>> {
@@ -479,8 +474,15 @@ fn checker_block(contract: &Contract, target: &Path) -> Result<String, String> {
 /// Install a checker from its source directory (`tools/<checker>/`).
 pub fn install(source: &Path) -> Result<String, String> {
     let contract = contract::load(&source.join("contract.json"))?;
-    let (Some(opencode), Some(runner)) = (which("opencode"), which("gitvault-audit-agent")) else {
-        return Err("OpenCode and gitvault-audit-agent (the A4AA runner) are required".to_string());
+    let (Some(opencode), Some(runner), Some(review)) = (
+        which("opencode"),
+        which("gitvault-audit-agent"),
+        which("gitvault-review"),
+    ) else {
+        return Err(
+            "OpenCode, gitvault-review and gitvault-audit-agent (the A4AA runner) are required"
+                .to_string(),
+        );
     };
     let profile = profile_root().join(&contract.name);
     let target = profile.join("plugins").join(&contract.name);
@@ -493,13 +495,12 @@ pub fn install(source: &Path) -> Result<String, String> {
         ));
     }
     std::fs::create_dir_all(&target).map_err(|e| e.to_string())?;
-    let agent_home = prepare_agent_home(&profile)?;
     install_payload(source, &target, &contract)?;
     write_registry_document(&target, &contract, &opencode, &devin_program())?;
     let previous = read_installation(&target).unwrap_or_default();
     let mut settings = json!({
         "program": opencode,
-        "agent_home": agent_home,
+        "review": review,
         "agent_runner": runner,
         "profile": profile.to_string_lossy(),
         "skill_dir": skill_root().join(&contract.name).to_string_lossy(),
@@ -517,16 +518,20 @@ pub fn install(source: &Path) -> Result<String, String> {
     if !registry.exists() {
         std::fs::write(&registry, "").map_err(|e| e.to_string())?;
     }
-    let action = register(
-        &registry,
-        &contract.name,
-        &checker_block(&contract, &target)?,
-    )?;
+    // The policy file is declared in the routing table so its absence refuses
+    // an audit rather than silently running none; rows left in config.toml
+    // migrate out at `gitvault config sign`, which certifies both files.
+    declare_policy(&registry)?;
+    let policy = policy_file();
+    if !policy.exists() {
+        std::fs::write(&policy, "").map_err(|e| e.to_string())?;
+    }
+    let action = register(&policy, &contract.name, &checker_block(&contract, &target)?)?;
     Ok(format!(
         "{} installed: blocking {}; registry entry {action} in {}",
         contract.title,
         contract.on.join(", "),
-        registry.display()
+        policy.display()
     ))
 }
 
@@ -549,8 +554,15 @@ const RETIRED_PAYLOAD: [&str; 10] = [
 /// re-register its entry; the retired Python payload files leave with it.
 pub fn update(source: &Path) -> Result<String, String> {
     let contract = contract::load(&source.join("contract.json"))?;
-    let (Some(opencode), Some(runner)) = (which("opencode"), which("gitvault-audit-agent")) else {
-        return Err("OpenCode and gitvault-audit-agent (the A4AA runner) are required".to_string());
+    let (Some(opencode), Some(runner), Some(review)) = (
+        which("opencode"),
+        which("gitvault-audit-agent"),
+        which("gitvault-review"),
+    ) else {
+        return Err(
+            "OpenCode, gitvault-review and gitvault-audit-agent (the A4AA runner) are required"
+                .to_string(),
+        );
     };
     let profile = profile_root().join(&contract.name);
     let target = profile.join("plugins").join(&contract.name);
@@ -558,16 +570,18 @@ pub fn update(source: &Path) -> Result<String, String> {
         return Err(format!("{} is not installed", contract.title));
     };
     // Legacy records predate the OpenCode runtime; the record migrates in
-    // place so the checker never consults a removed harness.
+    // place so the checker never consults a removed harness or home.
     settings.remove("hermes");
     settings.remove("pi");
     settings.remove("credential_file");
     settings.remove("python");
     settings.remove("codex");
     settings.remove("codex_home");
+    settings.remove("agent_home");
     settings.insert("program".into(), json!(opencode));
+    settings.insert("review".into(), json!(review));
     settings.insert("agent_runner".into(), json!(runner));
-    settings.insert("agent_home".into(), json!(prepare_agent_home(&profile)?));
+    settings.insert("profile".into(), json!(profile.to_string_lossy()));
     for retired in RETIRED_PAYLOAD {
         let _ = std::fs::remove_file(target.join(retired));
     }
@@ -581,11 +595,12 @@ pub fn update(source: &Path) -> Result<String, String> {
     );
     write_settings(&target, &Value::Object(settings))?;
     let registry = config_file();
-    let action = register(
-        &registry,
-        &contract.name,
-        &checker_block(&contract, &target)?,
-    )?;
+    declare_policy(&registry)?;
+    let policy = policy_file();
+    if !policy.exists() {
+        std::fs::write(&policy, "").map_err(|e| e.to_string())?;
+    }
+    let action = register(&policy, &contract.name, &checker_block(&contract, &target)?)?;
     Ok(format!(
         "Updated {} payload and registry entry ({action})",
         contract.title
@@ -745,7 +760,7 @@ fn pull_with(
 
 #[cfg(test)]
 mod tests {
-    use super::{bundle_manifest, check_url, payload_of, pull_with, register};
+    use super::{bundle_manifest, check_url, declare_policy, payload_of, pull_with, register};
     use crate::contract;
     use serde_json::{Value, json};
     use std::io::{BufRead, BufReader, Write};
@@ -794,19 +809,19 @@ mod tests {
     #[test]
     fn registry_blocks_replace_by_name_and_validate_as_toml() {
         let dir = tempdir();
-        let config = dir.join("config.toml");
-        std::fs::write(&config, "[identities.a]\nname = 'A'\n").unwrap();
+        let policy = dir.join("checkers.toml");
+        std::fs::write(&policy, "# audit policy\n").unwrap();
         let block_a =
             "[[checkers]]\nname = \"one\"\non = [\"pre-push\"]\ncommand = [\"/bin/true\"]\n";
-        assert_eq!(register(&config, "one", block_a).unwrap(), "added");
+        assert_eq!(register(&policy, "one", block_a).unwrap(), "added");
         let block_b = "[[checkers]]\nname = \"two\"\non = [\"pr\"]\ncommand = [\"/bin/false\"]\n";
-        assert_eq!(register(&config, "two", block_b).unwrap(), "added");
+        assert_eq!(register(&policy, "two", block_b).unwrap(), "added");
         let block_new = "[[checkers]]\nname = \"one\"\non = [\"pr\"]\ncommand = [\"/bin/sh\"]\n";
-        assert_eq!(register(&config, "one", block_new).unwrap(), "replaced");
-        let text = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(register(&policy, "one", block_new).unwrap(), "replaced");
+        let text = std::fs::read_to_string(&policy).unwrap();
         assert!(
-            text.contains("[identities.a]"),
-            "unrelated sections survive"
+            text.contains("# audit policy"),
+            "the file's own header survives"
         );
         assert!(text.contains("/bin/sh"), "the replacement landed");
         assert!(!text.contains("/bin/true\""), "the old block is gone");
@@ -814,6 +829,27 @@ mod tests {
             text.contains("name = \"two\""),
             "the other checker survives"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn declare_policy_places_the_key_before_any_table() {
+        let dir = tempdir();
+        let config = dir.join("config.toml");
+        std::fs::write(&config, "# heading\n\n[identities.a]\nname = 'A'\n").unwrap();
+        declare_policy(&config).unwrap();
+        let text = std::fs::read_to_string(&config).unwrap();
+        let declaration = text.find("audit_policy").unwrap();
+        let first_table = text.find("[identities.a]").unwrap();
+        assert!(
+            declaration < first_table,
+            "a top-level key under a table header would silently belong to it: {text}"
+        );
+        toml::from_str::<toml::Value>(&text).expect("the declaration keeps the file parseable");
+        // Idempotent: a second declaration must not appear.
+        declare_policy(&config).unwrap();
+        let twice = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(twice.matches("audit_policy").count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

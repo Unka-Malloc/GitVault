@@ -53,7 +53,7 @@ gitvault-review update --source tools/security-enhancer   # refresh payload and 
 ```
 
 The installer creates the checker's private home
-`~/.hermes/profiles/security-enhancer`, installs the contract payload and writes the checker's declared AwP registry
+`~/.local/share/gitvault/profiles/security-enhancer`, installs the contract payload and writes the checker's declared AwP registry
 document (the audit agent spec and binding the runner resolves), links the shared
 skill directory `~/.agents/skills/security-enhancer` into every agent skill
 directory it finds, and registers (or replaces in place) this entry in
@@ -99,7 +99,7 @@ Credential containers (`.env`, `*.pem`, `*.key`, `secrets/`, `credentials*`,
 `.ssh/**`, `.npmrc`, `*.db`) are judged by the static stage and never handed to
 the semantic stage, because sending a key file to a cloud model is itself a
 leak. Receipts are sanitized before they are written; reports live under
-`~/.hermes/profiles/security-enhancer/security-enhancer-runs/` and the run
+`~/.local/share/gitvault/profiles/security-enhancer/security-enhancer-runs/` and the run
 scope file is deleted when the run ends.
 
 ## Syncing a published profile

@@ -50,12 +50,19 @@ fn fixture(checker: &str) -> Fixture {
     checked(&root, &["add", "."]);
     checked(&root, &["commit", "-qm", "base"]);
     std::fs::write(root.join("checker.sh"), checker).unwrap();
+    // The audit policy is its own file beside the routing table: checker rows
+    // declare executable commands, so they are certified (and refused) on
+    // their own signature, not the routing table's.
     let cfg = format!(
-        "record_dir = '{}'\n[identities.fixture]\nname = 'Synthetic'\nemail = 'synthetic@example.invalid'\n[rules]\ndefault = 'fixture'\n[[checkers]]\nname = 'money-saver-fixture'\non = ['prepare-commit-msg', 'pre-applypatch']\ntimeout_secs = 0\ncommand = ['/bin/sh', '{}', '{{repo}}']\n",
-        root.join("runs").display(),
-        root.join("checker.sh").display()
+        "record_dir = '{}'\n[identities.fixture]\nname = 'Synthetic'\nemail = 'synthetic@example.invalid'\n[rules]\ndefault = 'fixture'\n",
+        root.join("runs").display()
     );
     std::fs::write(root.join("config.toml"), cfg).unwrap();
+    let policy = format!(
+        "[[checkers]]\nname = 'money-saver-fixture'\non = ['prepare-commit-msg', 'pre-applypatch']\ntimeout_secs = 0\ncommand = ['/bin/sh', '{}', '{{repo}}']\n",
+        root.join("checker.sh").display()
+    );
+    std::fs::write(root.join("checkers.toml"), policy).unwrap();
     let hook = root.join("hooks/prepare-commit-msg");
     std::fs::write(
         &hook,
@@ -123,11 +130,15 @@ fn pull_request_event_runs_registered_checkers() {
     )
     .unwrap();
     let cfg = format!(
-        "record_dir = '{}'\n[identities.fixture]\nname = 'Synthetic'\nemail = 'synthetic@example.invalid'\n[rules]\ndefault = 'fixture'\n[[checkers]]\nname = 'publication'\non = ['pr']\ncommand = ['/bin/sh', '{}', '{{repo}}']\n",
-        root.join("runs").display(),
-        checker.display()
+        "record_dir = '{}'\n[identities.fixture]\nname = 'Synthetic'\nemail = 'synthetic@example.invalid'\n[rules]\ndefault = 'fixture'\n",
+        root.join("runs").display()
     );
     std::fs::write(root.join("config.toml"), cfg).unwrap();
+    let policy = format!(
+        "[[checkers]]\nname = 'publication'\non = ['pr']\ncommand = ['/bin/sh', '{}', '{{repo}}']\n",
+        checker.display()
+    );
+    std::fs::write(root.join("checkers.toml"), policy).unwrap();
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_gitvault"))
         .env("GITVAULT_UNSIGNED_OK", "1")
         .args([
@@ -189,11 +200,15 @@ fn publication_fixture(events: &str, blocking: bool) -> Fixture {
     )
     .unwrap();
     let cfg = format!(
-        "record_dir = '{}'\n[identities.fixture]\nname = 'Synthetic'\nemail = 'synthetic@example.invalid'\n[rules]\ndefault = 'fixture'\n[[checkers]]\nname = 'publication'\non = [{events}]\ncommand = ['/bin/sh', '{}', '{{repo}}']\n",
-        root.join("runs").display(),
-        checker.display()
+        "record_dir = '{}'\n[identities.fixture]\nname = 'Synthetic'\nemail = 'synthetic@example.invalid'\n[rules]\ndefault = 'fixture'\n",
+        root.join("runs").display()
     );
     std::fs::write(root.join("config.toml"), cfg).unwrap();
+    let policy = format!(
+        "[[checkers]]\nname = 'publication'\non = [{events}]\ncommand = ['/bin/sh', '{}', '{{repo}}']\n",
+        checker.display()
+    );
+    std::fs::write(root.join("checkers.toml"), policy).unwrap();
     Fixture(root)
 }
 

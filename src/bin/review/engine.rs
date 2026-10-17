@@ -15,7 +15,6 @@ use crate::sanitize::sanitize;
 use crate::{ranges, stage1};
 use serde_json::{Map, Value, json};
 use sha2::Digest as _;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -48,7 +47,6 @@ fn sha256(text: &str) -> String {
 
 /// The checker installation record: paths and pins written by the installer.
 pub struct Settings {
-    pub agent_home: String,
     pub agent_runner: Option<String>,
     pub profile: PathBuf,
     pub skill_dir: PathBuf,
@@ -63,7 +61,6 @@ pub fn load_settings(contract_dir: &Path) -> Result<Settings, String> {
         serde_json::from_str(&raw).map_err(|error| format!("installation.json: {error}"))?;
     let text = |key: &str| value[key].as_str().unwrap_or("").to_string();
     Ok(Settings {
-        agent_home: text("agent_home"),
         agent_runner: value["agent_runner"].as_str().map(str::to_string),
         profile: PathBuf::from(text("profile")),
         skill_dir: PathBuf::from(text("skill_dir")),
@@ -246,40 +243,6 @@ fn role_identity(settings: &Settings, contract: &Contract) -> Value {
     })
 }
 
-/// The registry documents projected into the runner's role card. The role's
-/// `mcp_servers` is the checker's one tool surface — projected per run so the
-/// review server learns its contract and run directory from the gate, not
-/// from anything the profile could declare.
-fn role_card(
-    settings: &Settings,
-    runtime: &Map<String, Value>,
-    contract: &Contract,
-    tool_server: &Value,
-) -> Result<Value, String> {
-    let identity = role_identity(settings, contract);
-    let policy = std::fs::read_to_string(contract_dir_policy(settings, contract))
-        .map_err(|error| format!("policy.md: {error}"))?;
-    Ok(json!({
-        "id": identity["id"],
-        "name": contract.title,
-        "revision": identity["revision"],
-        "agent": runtime["harness"],
-        "model": runtime["model"],
-        "models": runtime.get("models").cloned().unwrap_or_else(|| json!([])),
-        "windows": runtime.get("windows").cloned().unwrap_or_else(|| json!([])),
-        "retry": runtime.get("retry").cloned().unwrap_or(Value::Null),
-        "effort": runtime.get("effort").cloned().unwrap_or(Value::Null),
-        "permission": "read-only",
-        "instructions": policy,
-        "mcpServers": [tool_server],
-        "extensions": {"provider": runtime["provider"]},
-    }))
-}
-
-fn contract_dir_policy(_settings: &Settings, contract: &Contract) -> PathBuf {
-    contract.dir.join("policy.md")
-}
-
 // ---------------------------------------------------------------------------
 // run directories: retention, resume keys, receipt reuse
 // ---------------------------------------------------------------------------
@@ -425,88 +388,6 @@ fn agent_review(
             })
         })
         .ok_or("The A4AA audit runner is not installed; update the checker installation")?;
-    let full = {
-        let scope: Value = serde_json::from_str(
-            &std::fs::read_to_string(run_dir.join("scope.json")).map_err(|e| e.to_string())?,
-        )
-        .map_err(|e| e.to_string())?;
-        scope["mode"].as_str() == Some("full-service")
-    };
-    let mut env: Vec<(String, String)> = Vec::new();
-    for key in ["HOME", "PATH", "LANG", "TMPDIR"] {
-        if let Some(value) = std::env::var_os(key) {
-            env.push((key.to_string(), value.to_string_lossy().into_owned()));
-        }
-    }
-    // The agent sees only its isolated XDG home: no host config, no host
-    // credentials beyond the credentials link the installer recorded.
-    let agent_home = Path::new(&settings.agent_home);
-    for (key, leaf) in [
-        ("XDG_CONFIG_HOME", "config"),
-        ("XDG_DATA_HOME", "data"),
-        ("XDG_STATE_HOME", "state"),
-        ("XDG_CACHE_HOME", "cache"),
-    ] {
-        env.push((
-            key.to_string(),
-            agent_home.join(leaf).to_string_lossy().into_owned(),
-        ));
-    }
-    let session_file = run_dir.join("audit-session.json");
-    let resume = std::fs::read_to_string(&session_file)
-        .ok()
-        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-        .and_then(|saved| saved["session_id"].as_str().map(str::to_string));
-    let task = if resume.is_some() && run_dir.join("report.json").exists() {
-        "The final review verdict has already been submitted and is preserved. \
-         Finish this resumed conversation without submitting another verdict or \
-         repeating the review. The publication gate will validate the stored verdict."
-            .to_string()
-    } else if resume.is_some() {
-        "Continue this same review from its preserved conversation and draft. \
-         Correct the outstanding report fields; reuse evidence and do not restart the audit."
-            .to_string()
-    } else if full {
-        contract
-            .task_full_service
-            .clone()
-            .unwrap_or_else(|| contract.task.clone())
-    } else {
-        contract.task.clone()
-    };
-    let tool_server = json!({
-        "type": "stdio",
-        "name": "gitvault-audit",
-        "command": std::env::current_exe().map_err(|e| e.to_string())?.to_string_lossy(),
-        "args": [
-            "serve",
-            "--contract",
-            contract.dir.join("contract.json").to_string_lossy(),
-            "--run",
-            run_dir.to_string_lossy(),
-        ],
-        "env": [],
-    });
-    let role = role_card(settings, runtime, contract, &tool_server)?;
-    // The review date is fresh-conversation context; a resumed session
-    // already carries it, so only the bare directive goes again.
-    let prompt = if resume.is_some() {
-        task
-    } else {
-        format!(
-            "Review date (UTC): {}\n\n{}",
-            crate::documents::today(),
-            task
-        )
-    };
-    let request = json!({
-        "document": contract.dir.join("registry.json").to_string_lossy(),
-        "prompt": prompt,
-        "role": role,
-        "resume": resume,
-        "session_file": session_file.to_string_lossy(),
-        "run_dir": run_dir.to_string_lossy(),
-    });
     let completion_path = run_dir.join("completion.json");
     let saved: Option<Value> = std::fs::read_to_string(&completion_path)
         .ok()
@@ -523,25 +404,21 @@ fn agent_review(
             saved["duration_ms"].as_u64().unwrap_or(0) as u128,
         )
     } else {
+        // The runner owns the conversation: fire the task with the contract
+        // and the run directory, inherit the operator's environment
+        // verbatim, and read back the settled outcome on stdout.
         let started = std::time::Instant::now();
-        let mut child = Command::new(&runner)
-            .stdin(Stdio::piped())
+        let result = Command::new(&runner)
+            .arg("--contract")
+            .arg(contract.dir.join("contract.json"))
+            .arg("--run")
+            .arg(run_dir)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .current_dir(run_dir)
-            .env_clear()
-            .envs(env)
-            .spawn()
+            .output()
             .map_err(|error| format!("The A4AA audit runner could not start: {error}"))?;
-        child
-            .stdin
-            .take()
-            .expect("piped runner stdin")
-            .write_all(request.to_string().as_bytes())
-            .map_err(|error| format!("The A4AA audit runner could not be fed: {error}"))?;
-        let result = child
-            .wait_with_output()
-            .map_err(|error| format!("The A4AA audit runner could not finish: {error}"))?;
         let duration_ms = started.elapsed().as_millis();
         let outcome = serde_json::from_str::<Value>(&String::from_utf8_lossy(&result.stdout))
             .unwrap_or(Value::Null);

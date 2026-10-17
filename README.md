@@ -43,9 +43,14 @@ removes:
 
 Adding capability means adding a registration, never editing the engine. An
 audit is one entry; a formatter, a commit-message policy or a build check are
-others.
+others. The registry is its own signed file — `checkers.toml` beside
+`config.toml` — because its rows declare executable commands: a signature on
+it means *these are the commands audits may run*, and it is certified
+independently of the routing table so audits can run **before** the operator
+is asked to bless anything.
 
 ```toml
+# checkers.toml
 [[checkers]]
 name = "privacy-audit"
 on = ["pre-commit", "pre-push"]

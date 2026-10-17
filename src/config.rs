@@ -190,8 +190,13 @@ pub struct Config {
     pub identities: BTreeMap<String, Identity>,
     #[serde(default)]
     pub rules: Rules,
+    /// Path of the signed audit policy file, relative to the configuration
+    /// directory when not absolute. Declaring it here binds the policy's
+    /// existence into the routing table's signature, so an audit cannot be
+    /// skipped by deleting the policy file: a declared policy that is absent
+    /// or uncertified refuses to run.
     #[serde(default)]
-    pub checkers: Vec<Checker>,
+    pub audit_policy: Option<PathBuf>,
     /// Where run records are written. Defaults to
     /// `$XDG_STATE_HOME/gitvault/runs` (or `~/.local/state/...`).
     #[serde(default)]
@@ -222,9 +227,12 @@ impl Config {
         config_dir().join("config.toml")
     }
 
-    /// The gate every operational surface funnels through: once `config.pub`
-    /// is root-owned, the file is attested or refused - a routing table anyone
-    /// can silently rewrite is no table at all.
+    /// The gate every credential-bearing surface funnels through: once
+    /// `config.pub` is root-owned, the routing table is attested or refused - a
+    /// table anyone can silently rewrite is no table at all.
+    ///
+    /// Audit surfaces must NOT use this: they run before the blessing, so they
+    /// take [`load_unverified`] and decide the signature question themselves.
     pub fn load(explicit: Option<&PathBuf>) -> Result<Self> {
         let path = match explicit {
             Some(p) => p.clone(),
@@ -240,15 +248,146 @@ impl Config {
         Self::load_path(&path)
     }
 
+    /// Parse and classify without consulting the signature anchor. Audit
+    /// surfaces take this so the audits can run and be shown BEFORE the
+    /// operator is asked to bless the file; the returned signature state is
+    /// checked after the report is produced, at the point a verdict or a
+    /// credential would otherwise depend on the routing table.
+    pub fn load_unverified(
+        explicit: Option<&PathBuf>,
+    ) -> Result<(Self, PathBuf, crate::configsig::SigState)> {
+        let path = match explicit {
+            Some(p) => p.clone(),
+            None => Self::default_path(),
+        };
+        if !path.exists() {
+            bail!(
+                "no configuration at {} - create it or pass --config",
+                path.display()
+            );
+        }
+        let signature = crate::configsig::signature_state(&path);
+        let cfg = Self::load_path(&path)?;
+        Ok((cfg, path, signature))
+    }
+
     /// Parse and validate a file without consulting the signature anchor. The
-    /// parser's own tests exercise this; every command path must use `load`.
+    /// parser's own tests exercise this; every command path must use `load`
+    /// or `load_unverified`.
     fn load_path(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("cannot read {}", path.display()))?;
+        // Checker rows declare executable commands, so they live in
+        // checkers.toml - signed independently so audits can run before the
+        // routing table's blessing. Rows left here are stale, not policy.
+        // Line-anchored so a comment that merely mentions the header cannot
+        // trip the refusal.
+        if raw
+            .lines()
+            .any(|l| l.trim_start().starts_with("[[checkers]]"))
+        {
+            bail!(
+                "{} still contains [[checkers]] entries - the audit policy lives in checkers.toml now\n  \
+                 migrate and certify both files: gitvault config sign",
+                path.display()
+            );
+        }
         let cfg: Config = toml::from_str(&raw)
             .with_context(|| format!("invalid configuration in {}", path.display()))?;
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Move `[[checkers]]` sections out of `config_path` into the policy file.
+    /// A same-named row in the policy wins over a stale row being migrated,
+    /// so certifying newer policy can never resurrect an old command.
+    /// Returns true when the file changed.
+    pub fn migrate_checkers(config_path: &Path) -> Result<bool> {
+        let text = std::fs::read_to_string(config_path)
+            .with_context(|| format!("cannot read {}", config_path.display()))?;
+        if !text
+            .lines()
+            .any(|l| l.trim_start().starts_with("[[checkers]]"))
+        {
+            return Ok(false);
+        }
+        // Split on table headers; a [[checkers]] segment runs until the next
+        // header line, comments ahead of it staying with the previous section.
+        let mut segments: Vec<String> = Vec::new();
+        let mut current = String::new();
+        for line in text.split_inclusive('\n') {
+            if line.trim_start().starts_with('[') && !current.is_empty() {
+                segments.push(std::mem::take(&mut current));
+            }
+            current.push_str(line);
+        }
+        if !current.is_empty() {
+            segments.push(current);
+        }
+        let mut kept = String::new();
+        let mut moved: Vec<String> = Vec::new();
+        for segment in segments {
+            if segment.trim_start().starts_with("[[checkers]]") {
+                moved.push(segment);
+            } else {
+                kept.push_str(&segment);
+            }
+        }
+        let policy_path = Policy::path_for(config_path);
+        let existing = std::fs::read_to_string(&policy_path).unwrap_or_default();
+        let mut policy = Policy::load_str(&existing)
+            .with_context(|| format!("invalid audit policy in {}", policy_path.display()))?;
+        #[derive(Deserialize)]
+        struct Row {
+            checkers: Vec<Checker>,
+        }
+        for block in &moved {
+            let parsed: Row = toml::from_str(block).context("cannot parse migrated checker row")?;
+            for row in parsed.checkers {
+                policy.checkers.retain(|c| c.name != row.name);
+                policy.checkers.push(row);
+            }
+        }
+        policy.validate()?;
+        let mut policy_text = String::from(
+            "# Audit policy: the commands GitVault may execute as checks.\n\
+             # Signed independently of config.toml (checkers.toml.sig) so audits\n\
+             # run BEFORE the routing table is asked for a blessing.\n\n",
+        );
+        for row in &policy.checkers {
+            policy_text.push_str(&toml::to_string(&Policy {
+                checkers: vec![row.clone()],
+            })?);
+            policy_text.push('\n');
+        }
+        toml::from_str::<toml::Value>(&policy_text).context("generated policy is invalid TOML")?;
+        // The moved rows only count as policy once the routing table declares
+        // the file: without the signed declaration, deleting checkers.toml
+        // would silently run no audit at all.
+        let declared = kept
+            .lines()
+            .take_while(|l| !l.trim_start().starts_with('['))
+            .any(|l| l.trim_start().starts_with("audit_policy"));
+        if !declared {
+            let declaration = "audit_policy = \"checkers.toml\"\n\n";
+            let offset = kept
+                .char_indices()
+                .scan(true, |bol, (i, c)| {
+                    let at_bol = *bol;
+                    *bol = c == '\n';
+                    Some((i, at_bol))
+                })
+                .find(|(i, at_bol)| *at_bol && kept[*i..].trim_start().starts_with('['))
+                .map(|(i, _)| i)
+                .unwrap_or(kept.len());
+            kept.insert_str(offset, declaration);
+        }
+        toml::from_str::<toml::Value>(&kept).context("config without checkers is invalid TOML")?;
+        std::fs::write(&policy_path, policy_text)
+            .with_context(|| format!("cannot write {}", policy_path.display()))?;
+        std::fs::write(config_path, kept)
+            .with_context(|| format!("cannot write {}", config_path.display()))?;
+        Ok(true)
     }
 
     fn validate(&self) -> Result<()> {
@@ -279,6 +418,89 @@ impl Config {
         {
             bail!("rules.default names unknown identity '{default}'");
         }
+        Ok(())
+    }
+}
+
+/// The audit policy: the checker registry, kept in its own signed file
+/// (`checkers.toml` beside `config.toml`) so the audit can run BEFORE the
+/// operator is asked to bless the routing table.
+///
+/// The split is what makes "audit first, sign after" sound. A signature on
+/// checkers.toml means "these are the commands audits may execute"; a
+/// signature on config.toml means "these identities may act". Audits never
+/// execute an uncertified command, and an uncertified routing table never
+/// reaches a credential - the two blessings are independent and each is asked
+/// only after the evidence it certifies has been produced.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Policy {
+    #[serde(default)]
+    pub checkers: Vec<Checker>,
+}
+
+impl Policy {
+    /// The policy file conventionally sits beside the routing table.
+    pub fn path_for(config_path: &Path) -> PathBuf {
+        config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("checkers.toml")
+    }
+
+    /// Where this routing table keeps its audit policy: the declared
+    /// `audit_policy` path, else the conventional `checkers.toml` sibling.
+    pub fn resolve(config_path: &Path, cfg: &Config) -> PathBuf {
+        match &cfg.audit_policy {
+            Some(p) if p.is_absolute() => p.clone(),
+            Some(p) => config_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(p),
+            None => Self::path_for(config_path),
+        }
+    }
+
+    /// Load the policy and its signature state WITHOUT gating on it. The
+    /// caller decides: a surface that is about to execute rows must refuse an
+    /// `Invalid` state (checker commands are arbitrary code), while an event
+    /// the policy says nothing about executes nothing and may proceed. The
+    /// declared rows are still readable for the refusal preview - showing a
+    /// command is not running it.
+    pub fn load_state(
+        config_path: &Path,
+        cfg: &Config,
+    ) -> Result<(Self, PathBuf, crate::configsig::SigState)> {
+        let path = Self::resolve(config_path, cfg);
+        if !path.exists() {
+            if cfg.audit_policy.is_some() {
+                bail!(
+                    "the routing table declares an audit policy at {} but the file is absent\n  \
+                     the declaration is signed, so its file cannot simply disappear\n  \
+                     restore it or amend and re-certify: gitvault config sign",
+                    path.display()
+                );
+            }
+            return Ok((Self::default(), path, crate::configsig::SigState::Inactive));
+        }
+        let policy = Self::load_path(&path)?;
+        let state = crate::configsig::signature_state(&path);
+        Ok((policy, path, state))
+    }
+
+    fn load_path(path: &Path) -> Result<Self> {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read {}", path.display()))?;
+        Self::load_str(&raw).with_context(|| format!("invalid audit policy in {}", path.display()))
+    }
+
+    fn load_str(raw: &str) -> Result<Self> {
+        let policy: Policy = toml::from_str(raw).context("expected [[checkers]] entries")?;
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    fn validate(&self) -> Result<()> {
         let mut seen = std::collections::BTreeSet::new();
         for checker in &self.checkers {
             if !seen.insert(checker.name.clone()) {
@@ -305,7 +527,7 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, Event, Severity};
+    use super::{Config, Event, Policy, Severity};
 
     const BASE: &str = r#"
 [identities.acme]
@@ -322,7 +544,9 @@ acme = "acme"
 
 [rules]
 default = "personal"
+"#;
 
+    const POLICY: &str = r#"
 [[checkers]]
 name = "audit"
 on = ["pre-commit", "pre-push"]
@@ -352,27 +576,78 @@ command = ["/bin/true"]
         loaded
     }
 
+    fn parse_policy(s: &str) -> anyhow::Result<Policy> {
+        Policy::load_str(s)
+    }
+
     #[test]
     fn accepts_a_well_formed_registry() {
-        let cfg = parse(BASE).expect("valid config");
-        assert_eq!(cfg.checkers.len(), 2);
-        assert_eq!(cfg.checkers_for(Event::PreCommit).len(), 2);
-        assert_eq!(cfg.checkers_for(Event::PrePush).len(), 1);
-        assert_eq!(cfg.checkers_for(Event::CommitMsg).len(), 0);
-        assert_eq!(cfg.checkers_for(Event::Pr).len(), 0);
-        assert_eq!(cfg.checkers[0].severity, Severity::Blocking);
-        assert_eq!(cfg.checkers[1].severity, Severity::Advisory);
+        let policy = parse_policy(POLICY).expect("valid policy");
+        assert_eq!(policy.checkers.len(), 2);
+        assert_eq!(policy.checkers_for(Event::PreCommit).len(), 2);
+        assert_eq!(policy.checkers_for(Event::PrePush).len(), 1);
+        assert_eq!(policy.checkers_for(Event::CommitMsg).len(), 0);
+        assert_eq!(policy.checkers_for(Event::Pr).len(), 0);
+        assert_eq!(policy.checkers[0].severity, Severity::Blocking);
+        assert_eq!(policy.checkers[1].severity, Severity::Advisory);
     }
 
     #[test]
     fn accepts_the_publication_boundary_events() {
         // `pre-push` and `pr` are the boundaries content crosses to become
         // public; a checker registered on `pr` is selected for that event only.
-        let with_pr = BASE.replace("on = [\"pre-commit\"]", "on = [\"pre-commit\", \"pr\"]");
-        let cfg = parse(&with_pr).expect("valid config");
-        assert_eq!(cfg.checkers_for(Event::Pr).len(), 1);
-        assert_eq!(cfg.checkers_for(Event::Pr)[0].name, "advisory");
-        assert_eq!(cfg.checkers_for(Event::PrePush).len(), 1);
+        let with_pr = POLICY.replace("on = [\"pre-commit\"]", "on = [\"pre-commit\", \"pr\"]");
+        let policy = parse_policy(&with_pr).expect("valid policy");
+        assert_eq!(policy.checkers_for(Event::Pr).len(), 1);
+        assert_eq!(policy.checkers_for(Event::Pr)[0].name, "advisory");
+        assert_eq!(policy.checkers_for(Event::PrePush).len(), 1);
+    }
+
+    #[test]
+    fn rejects_checker_rows_left_in_the_routing_table() {
+        // A [[checkers]] row in config.toml is executable code smuggled past
+        // the policy's own signature: stale rows must refuse, not silently run
+        // under the routing table's blessing.
+        let stale = format!("{BASE}\n{POLICY}");
+        let err = parse(&stale).expect_err("checker rows in config.toml must refuse");
+        assert!(
+            err.to_string().contains("checkers.toml"),
+            "the refusal points at the policy file: {err}"
+        );
+        // A comment that merely mentions the header is not a row.
+        let commented = format!("# policy rows live in [[checkers]] now\n{BASE}");
+        assert!(
+            parse(&commented).is_ok(),
+            "comments must not trip the refusal"
+        );
+    }
+
+    #[test]
+    fn migrate_moves_checker_rows_to_the_policy_file() {
+        let dir = std::env::temp_dir().join(format!("gv-mig-{}-{}", std::process::id(), 1));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.toml");
+        std::fs::write(&config, format!("{BASE}\n{POLICY}")).unwrap();
+
+        assert!(Config::migrate_checkers(&config).expect("migration runs"));
+        let kept = std::fs::read_to_string(&config).unwrap();
+        assert!(!kept.contains("[[checkers]]"), "rows left behind: {kept}");
+        // The declaration binds the policy file's existence into the routing
+        // signature: without it, deleting checkers.toml would run no audit.
+        let reloaded = Config::load_path(&config).expect("kept config parses");
+        assert_eq!(
+            reloaded.audit_policy.as_deref(),
+            Some(std::path::Path::new("checkers.toml")),
+            "migrated config must declare its policy: {kept}"
+        );
+        let policy = Policy::load_str(&std::fs::read_to_string(dir.join("checkers.toml")).unwrap())
+            .expect("migrated policy parses");
+        assert_eq!(policy.checkers.len(), 2);
+        assert_eq!(policy.checkers[0].name, "audit");
+        // Idempotent: nothing left to move.
+        assert!(!Config::migrate_checkers(&config).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -392,9 +667,9 @@ command = ["/bin/true"]
 
     #[test]
     fn rejects_duplicate_checker_names() {
-        let bad = format!("{BASE}\n[[checkers]]\nname = \"audit\"\ncommand = [\"/bin/true\"]\n");
+        let bad = format!("{POLICY}\n[[checkers]]\nname = \"audit\"\ncommand = [\"/bin/true\"]\n");
         assert!(
-            parse(&bad).is_err(),
+            parse_policy(&bad).is_err(),
             "duplicate names would make --only ambiguous"
         );
     }
@@ -412,10 +687,6 @@ command = ["/bin/true"]
         for bad in [
             BASE.replace("[rules]", "[rules]\nunknown_knob = true"),
             BASE.replace(
-                "severity = \"advisory\"",
-                "severity = \"advisory\"\nsevverity = \"blocking\"",
-            ),
-            BASE.replace(
                 "email = \"acme@example.invalid\"",
                 "email = \"acme@example.invalid\"\nworkspace = \"/tmp\"",
             ),
@@ -425,6 +696,14 @@ command = ["/bin/true"]
                 "an unknown key must be refused: {bad}"
             );
         }
+        let bad_policy = POLICY.replace(
+            "severity = \"advisory\"",
+            "severity = \"advisory\"\nsevverity = \"blocking\"",
+        );
+        assert!(
+            parse_policy(&bad_policy).is_err(),
+            "an unknown policy key must be refused"
+        );
     }
 
     #[test]
@@ -447,10 +726,34 @@ command = ["/bin/true"]
 
     #[test]
     fn rejects_an_unknown_hook_event() {
-        let bad = BASE.replace(
+        let bad = POLICY.replace(
             "on = [\"pre-commit\", \"pre-push\"]",
             "on = [\"post-commit\"]",
         );
-        assert!(parse(&bad).is_err());
+        assert!(parse_policy(&bad).is_err());
+    }
+
+    #[test]
+    fn a_declared_policy_cannot_disappear() {
+        // `audit_policy` is signed into the routing table: the file it names
+        // being absent refuses the audit outright, so removing checkers.toml
+        // is detected rather than silently running no checks.
+        let dir = std::env::temp_dir().join(format!("gv-decl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.toml");
+        std::fs::write(&config, format!("audit_policy = \"checkers.toml\"\n{BASE}")).unwrap();
+        let cfg = Config::load_path(&config).unwrap();
+        let err = Policy::load_state(&config, &cfg).expect_err("a declared policy file must exist");
+        assert!(
+            err.to_string().contains("absent"),
+            "the refusal names the disappearance: {err}"
+        );
+        // Without the declaration, an absent policy file is simply no registry.
+        let mut plain = cfg;
+        plain.audit_policy = None;
+        let (policy, _, _) = Policy::load_state(&config, &plain).unwrap();
+        assert!(policy.checkers.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

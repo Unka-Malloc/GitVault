@@ -42,10 +42,15 @@ fn git(repo: &Path, args: &[&str]) -> String {
 /// real session would see it.
 const RUNNER: &str = r#"#!/bin/bash
 set -euo pipefail
-req="$(cat)"
-run_dir="$(printf '%s' "$req" | sed -n 's/.*"run_dir":"\([^"]*\)".*/\1/p')"
-exe="$(printf '%s' "$req" | sed -n 's/.*"mcpServers":\[{[^}]*"command":"\([^"]*\)".*/\1/p')"
-contract="$(printf '%s' "$req" | sed -n 's/.*"--contract","\([^"]*\)".*/\1/p')"
+contract="" run_dir=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --contract) contract="$2"; shift 2 ;;
+    --run) run_dir="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+exe="$(sed -n 's/.*"review": *"\([^"]*\)".*/\1/p' "$(dirname "$contract")/installation.json")"
 touch "$(dirname "$0")/runner-was-here"
 printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}' \
@@ -114,14 +119,13 @@ fn fixture() -> (Fixture, String, String) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
-    std::fs::create_dir_all(root.join("agent-home")).unwrap();
     std::fs::write(
         plugin.join("installation.json"),
         serde_json::json!({
-            "agent_home": root.join("agent-home").to_string_lossy(),
             "agent_runner": runner.to_string_lossy(),
             "profile": profile.to_string_lossy(),
             "skill_dir": skills.to_string_lossy(),
+            "review": REVIEW,
         })
         .to_string(),
     )

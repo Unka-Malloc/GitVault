@@ -194,7 +194,7 @@ mod tests {
                 paths: Vec::<PathRule>::new(),
                 default: default.map(str::to_string),
             },
-            checkers: Vec::new(),
+            audit_policy: None,
             record_dir: None,
         }
     }

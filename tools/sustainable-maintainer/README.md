@@ -46,7 +46,7 @@ gitvault-review install --source tools/sustainable-maintainer            # first
 gitvault-review update --source tools/sustainable-maintainer   # refresh payload and skill links
 ```
 
-The installer creates the checker's private home `~/.hermes/profiles/sustainable-maintainer`,
+The installer creates the checker's private home `~/.local/share/gitvault/profiles/sustainable-maintainer`,
 installs the contract payload and writes the checker's declared AwP registry
 document (the audit agent spec and binding the runner resolves), links the shared skill directory `~/.agents/skills/sustainable-maintainer`
 into every agent skill directory it finds, and registers (or replaces in place)
@@ -105,7 +105,7 @@ review never needs to read a key file. The deterministic stage itself judges
 what hygiene never needs judgement — conflict markers, merge-tool artifacts
 and editor/OS junk. Receipts are sanitized before they are written; reports
 live under
-`~/.hermes/profiles/sustainable-maintainer/sustainable-maintainer-runs/` and
+`~/.local/share/gitvault/profiles/sustainable-maintainer/sustainable-maintainer-runs/` and
 the run scope file is deleted when the run ends.
 
 ## Syncing a published profile

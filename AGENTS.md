@@ -1,0 +1,27 @@
+# Agent rules for GitVault
+
+## Audit first, blessing after (hard rule)
+
+Audits always precede authorization. Run the certified audit policy and show
+its report before the operator is asked for any signature, unlock or
+credential — a blessing requested before the evidence exists lets the audit
+be bypassed. Never reorder this, and never execute checker rows from an
+uncertified policy file: the rows declare arbitrary commands.
+
+## Trust boundary
+
+`checkers.toml` (audit policy) and `config.toml` (routing table) are signed
+independently. The policy signature decides whether checker commands may run;
+the routing signature decides gated-event verdicts and every
+credential-bearing surface. `audit_policy` in the routing table binds the
+policy file's existence — deleting `checkers.toml` refuses rather than
+silently running no audit.
+
+Local events the policy does not gate (commits, messages) pass without a
+blessing; gated events (`pre-push`, `pr`, `release`) run the audits, then
+refuse an uncertified routing table — the refusal comes after the evidence is
+on screen.
+
+## Verify
+
+`cargo fmt && cargo clippy --all-targets && cargo test`

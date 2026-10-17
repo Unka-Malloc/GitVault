@@ -28,7 +28,7 @@ gitvault-review install --source tools/clean-auditor            # first install
 gitvault-review update --source tools/clean-auditor   # refresh payload and skill links
 ```
 
-The installer creates the checker's private home `~/.hermes/profiles/clean-auditor`,
+The installer creates the checker's private home `~/.local/share/gitvault/profiles/clean-auditor`,
 installs the contract payload and writes the checker's declared AwP registry
 document (the audit agent spec and binding the runner resolves), links the shared skill directory `~/.agents/skills/clean-auditor`
 into every agent skill directory it finds, and registers (or replaces in place)
@@ -123,7 +123,7 @@ The deterministic stage judges credential containers (`.env`, `*.pem`,
 `*.key`, `secrets/`, `credentials*`, `.ssh/**`, `*.db`) — they are never handed
 to the semantic stage, because sending a key file to a cloud model is itself a
 leak. Receipts are sanitized before they are written; reports live under
-`~/.hermes/profiles/clean-auditor/clean-auditor-runs/` and the run scope file
+`~/.local/share/gitvault/profiles/clean-auditor/clean-auditor-runs/` and the run scope file
 is deleted when the run ends.
 
 ## Syncing a published profile
