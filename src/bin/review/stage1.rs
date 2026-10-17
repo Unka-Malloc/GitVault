@@ -907,7 +907,9 @@ static PROTECTED_IGNORE: LazyLock<Regex> = LazyLock::new(|| {
         .unwrap()
 });
 static FROM_LINE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)^\s*FROM\s+(\S+)(?:\s+AS\s+\S+)?\s*$").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)^\s*FROM\s+(\S+)(?:\s+AS\s+(\S+))?\s*$").unwrap());
+static SUPPRESS_ALLOW: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"gv-allow:([A-Za-z0-9/_-]+)").unwrap());
 static WILDCARD_ORIGIN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?i)allow_origins\s*=\s*\[\s*["']\*["']\s*\]|Access-Control-Allow-Origin\s*:\s*\*"#,
@@ -1061,18 +1063,42 @@ fn security_audit(repo: &str, target: &Target) -> Result<(Vec<Hit>, Vec<Hit>), S
                         continue;
                     }
                     if rule.pattern.is_match(line) {
-                        group.sink(&mut regressions, &mut surfaces).push(Hit {
-                            path: path.clone(),
-                            line: *number,
-                            rule: rule.rule.into(),
-                            remedy: remedy(rule.rule),
-                        });
+                        // `gv-allow:<rule-id>` on the same line suppresses a
+                        // blocking hit where a documented compensating control
+                        // exists (e.g. SPKI pinning instead of CA rejection).
+                        // Suppressed hits stay visible as notices, never hidden.
+                        let suppressed = SUPPRESS_ALLOW
+                            .captures_iter(line)
+                            .any(|allow| &allow[1] == rule.rule);
+                        if suppressed {
+                            surfaces.push(Hit {
+                                path: path.clone(),
+                                line: *number,
+                                rule: format!("suppressed/{}", rule.rule),
+                                remedy: remedy(rule.rule),
+                            });
+                        } else {
+                            group.sink(&mut regressions, &mut surfaces).push(Hit {
+                                path: path.clone(),
+                                line: *number,
+                                rule: rule.rule.into(),
+                                remedy: remedy(rule.rule),
+                            });
+                        }
                         break;
                     }
                 }
             }
         }
         if dockerfile {
+            // Stage aliases declared elsewhere in the file are local build
+            // stages, not external images: `FROM deps AS build` has no base
+            // image to pin.
+            let stage_aliases: std::collections::HashSet<String> = added
+                .iter()
+                .filter_map(|(_, line)| FROM_LINE.captures(line))
+                .filter_map(|capture| capture.get(2).map(|alias| alias.as_str().to_string()))
+                .collect();
             for (number, line) in &added {
                 if let Some(arg) = SECRET_ARG.captures(line)
                     && SECRET_NAME.is_match(&arg[1])
@@ -1088,6 +1114,9 @@ fn security_audit(repo: &str, target: &Target) -> Result<(Vec<Hit>, Vec<Hit>), S
                 }
                 if let Some(image) = FROM_LINE.captures(line) {
                     let reference = &image[1];
+                    if stage_aliases.contains(reference) {
+                        continue;
+                    }
                     let tail = reference.rsplit('/').next().unwrap_or(reference);
                     if !reference.contains("@sha256:")
                         && (!tail.contains(':') || reference.ends_with(":latest"))
