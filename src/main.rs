@@ -1149,9 +1149,12 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
         .args(&immobilise)
         .status();
     let user = std::env::var("USER").context("USER is not set")?;
+    // chown refuses a missing path outright; a not-yet-installed target is
+    // the normal first-install case, so only existing paths are handed back.
+    let existing: Vec<&PathBuf> = immobilise.iter().filter(|p| p.exists()).collect();
     let status = std::process::Command::new("sudo")
         .args(["chown", "-R", &format!("{user}:staff")])
-        .args(&immobilise)
+        .args(&existing)
         .status()
         .context("failed to run sudo chown")?;
     if !status.success() {
