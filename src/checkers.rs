@@ -283,6 +283,11 @@ pub fn run_all(
     {
         report.outcomes.push(gate);
     }
+    if only.is_none()
+        && let Some(gate) = crate::attribution::gate(ctx)
+    {
+        report.outcomes.push(gate);
+    }
 
     // Run the checkers concurrently: they only read the shared snapshot, while
     // joining in registry order keeps the report deterministic and the run

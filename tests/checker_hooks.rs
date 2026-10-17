@@ -370,6 +370,213 @@ fn a_run_is_recorded_without_this_machines_paths() {
     );
 }
 
+/// A repository wired for `check --event pre-push|release`: the built-in
+/// attribution gate runs regardless of which checkers the policy registers,
+/// so the fixture keeps a single passing one.
+fn attribution_fixture() -> Fixture {
+    let root = std::env::temp_dir().join(format!(
+        "gitvault-attr-test-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    checked(&root, &["init", "-q"]);
+    checked(
+        &root,
+        &[
+            "config",
+            "core.hooksPath",
+            root.join("no-hooks").to_str().unwrap(),
+        ],
+    );
+    checked(&root, &["config", "commit.gpgsign", "false"]);
+    checked(&root, &["config", "user.name", "Synthetic"]);
+    checked(
+        &root,
+        &["config", "user.email", "synthetic@example.invalid"],
+    );
+    std::fs::write(root.join("one"), "base\n").unwrap();
+    checked(&root, &["add", "."]);
+    checked(&root, &["commit", "-qm", "base"]);
+    let checker = root.join("checker.sh");
+    std::fs::write(&checker, "#!/bin/sh\nexit 0\n").unwrap();
+    let cfg = format!(
+        "record_dir = '{}'\n[identities.fixture]\nname = 'Synthetic'\nemail = 'synthetic@example.invalid'\n[rules]\ndefault = 'fixture'\n",
+        root.join("runs").display()
+    );
+    std::fs::write(root.join("config.toml"), cfg).unwrap();
+    let policy = format!(
+        "[[checkers]]\nname = 'publication'\non = ['pre-push', 'pr', 'release']\ncommand = ['/bin/sh', '{}', '{{repo}}']\n",
+        checker.display()
+    );
+    std::fs::write(root.join("checkers.toml"), policy).unwrap();
+    Fixture(root)
+}
+
+/// `gitvault check --event pre-push` reading the ref line git would put on the
+/// hook's stdin.
+fn check_pre_push(root: &Path, refs_line: &str) -> Output {
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_gitvault"))
+        .env("GITVAULT_UNSIGNED_OK", "1")
+        .args([
+            "--config",
+            root.join("config.toml").to_str().unwrap(),
+            "check",
+            "--event",
+            "pre-push",
+            "--directory",
+            root.to_str().unwrap(),
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(refs_line.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+const ZERO_SHA: &str = "0000000000000000000000000000000000000000";
+
+#[test]
+fn pre_push_refuses_commits_with_ai_attribution() {
+    let fixture = attribution_fixture();
+    let root = fixture.0.clone();
+    checked(
+        &root,
+        &[
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "feat: a thing",
+            "-m",
+            "Co-Authored-By: Devin <devin-ai-integration[bot]@users.noreply.github.com>",
+        ],
+    );
+    let local = String::from_utf8(git(&root, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let remote = String::from_utf8(git(&root, &["rev-parse", "HEAD^"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let result = check_pre_push(
+        &root,
+        &format!("refs/heads/main {local} refs/heads/main {remote}\n"),
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        !result.status.success(),
+        "a tainted range must fail: {stderr}"
+    );
+    assert!(
+        stderr.contains(&local[..12]),
+        "the refused commit's sha must be named: {stderr}"
+    );
+    assert!(stderr.contains("AI attribution"), "stderr: {stderr}");
+}
+
+#[test]
+fn pre_push_passes_a_clean_range() {
+    let fixture = attribution_fixture();
+    let root = fixture.0.clone();
+    checked(&root, &["commit", "--allow-empty", "-qm", "feat: clean"]);
+    let local = String::from_utf8(git(&root, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let remote = String::from_utf8(git(&root, &["rev-parse", "HEAD^"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let result = check_pre_push(
+        &root,
+        &format!("refs/heads/main {local} refs/heads/main {remote}\n"),
+    );
+    assert!(
+        result.status.success(),
+        "a clean range must pass: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
+fn pre_push_passes_when_nothing_is_outgoing() {
+    // A deletion ref line (local sha all zeros) and an up-to-date line both
+    // contribute no outgoing commits - the gate must not invent a refusal.
+    let fixture = attribution_fixture();
+    let root = fixture.0.clone();
+    let head = String::from_utf8(git(&root, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    for refs_line in [
+        format!("refs/heads/main {ZERO_SHA} refs/heads/main {head}\n"),
+        format!("refs/heads/main {head} refs/heads/main {head}\n"),
+    ] {
+        let result = check_pre_push(&root, &refs_line);
+        assert!(
+            result.status.success(),
+            "range '{refs_line}' must pass: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}
+
+#[test]
+fn release_refuses_ai_attribution_in_the_tag_range() {
+    let fixture = attribution_fixture();
+    let root = fixture.0.clone();
+    checked(&root, &["tag", "v1.0.0"]);
+    checked(
+        &root,
+        &[
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "chore: notes",
+            "-m",
+            "Generated with [Claude Code](https://claude.com/claude-code)",
+        ],
+    );
+    let sha = String::from_utf8(git(&root, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    checked(&root, &["tag", "v2.0.0"]);
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_gitvault"))
+        .env("GITVAULT_UNSIGNED_OK", "1")
+        .args([
+            "--config",
+            root.join("config.toml").to_str().unwrap(),
+            "check",
+            "--event",
+            "release",
+            "--tag",
+            "v2.0.0",
+            "--directory",
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        !result.status.success(),
+        "a tainted release must fail: {stderr}"
+    );
+    assert!(
+        stderr.contains(&sha[..12]),
+        "the refused commit's sha must be named: {stderr}"
+    );
+}
+
 #[test]
 fn mandatory_hook_blocks_even_no_verify() {
     let f = fixture("exit 1\n");

@@ -6,6 +6,7 @@
 //! as an absolute argument rather than by changing into it.
 
 mod api;
+mod attribution;
 mod auth;
 mod checkers;
 mod config;
