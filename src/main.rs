@@ -8,20 +8,20 @@
 mod api;
 mod auth;
 mod checkers;
-mod configsig;
-mod records;
 mod config;
+mod configsig;
 mod git;
 mod identity;
+mod records;
 mod sign;
 mod ssh;
 mod unlock;
 mod vault;
 
 use std::io::Read;
-use std::path::PathBuf;
-use std::process::ExitCode;
 use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
 use anyhow::Context as _;
 use clap::{Parser, Subcommand};
@@ -72,7 +72,7 @@ enum Command {
         /// Run only this checker.
         #[arg(long)]
         only: Option<String>,
-        /// The release tag, for `--event release`.
+        /// The release tag or exact commit, for `--event release`.
         #[arg(long)]
         tag: Option<String>,
     },
@@ -447,9 +447,7 @@ enum AuthCommand {
     /// Create the vault key. Run once per machine.
     Init,
     /// Store a token for an account. Reads the token from stdin.
-    Add {
-        account: String,
-    },
+    Add { account: String },
     /// Remove stored material for an account.
     ///
     /// Scoped by default: removing a key does not touch the token. Pass --all to
@@ -514,7 +512,13 @@ fn main() -> ExitCode {
             directory,
             only,
             tag,
-        } => cmd_check(cli.config.as_ref(), &event, &directory, only.as_deref(), tag.as_deref()),
+        } => cmd_check(
+            cli.config.as_ref(),
+            &event,
+            &directory,
+            only.as_deref(),
+            tag.as_deref(),
+        ),
         Command::Records { command } => cmd_records(cli.config.as_ref(), command),
         Command::Checkers { json } => cmd_checkers(cli.config.as_ref(), json),
         Command::Auth { command } => cmd_auth(cli.config.as_ref(), command),
@@ -572,7 +576,7 @@ fn main() -> ExitCode {
 
 fn cmd_resolve(
     config: Option<&PathBuf>,
-    directory: &PathBuf,
+    directory: &Path,
     ignore_assertion: bool,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
@@ -584,10 +588,7 @@ fn cmd_resolve(
         println!("{}", serde_json::to_string_pretty(&outcome.to_json())?);
     } else {
         println!("repository : {}", repo.root.display());
-        println!(
-            "remote     : {}",
-            repo.remote().unwrap_or("(none)")
-        );
+        println!("remote     : {}", repo.remote().unwrap_or("(none)"));
         println!(
             "owner      : {}",
             repo.owner().unwrap_or_else(|| "(unparsed)".into())
@@ -647,7 +648,7 @@ fn cmd_checkers(config: Option<&PathBuf>, json: bool) -> anyhow::Result<ExitCode
 fn context_for(
     cfg: &config::Config,
     event: &str,
-    directory: &PathBuf,
+    directory: &Path,
     release_tag: Option<String>,
 ) -> anyhow::Result<checkers::Context> {
     let repo = git::Repo::discover(directory)?;
@@ -711,11 +712,7 @@ fn run_publication_gate(
     Ok(())
 }
 
-fn cmd_hook(
-    config: Option<&PathBuf>,
-    event: &str,
-    _args: &[String],
-) -> anyhow::Result<ExitCode> {
+fn cmd_hook(config: Option<&PathBuf>, event: &str, _args: &[String]) -> anyhow::Result<ExitCode> {
     let cfg = config::Config::load(config)?;
     // git runs hooks with cwd set to the top level of the working tree, so "."
     // resolves correctly and no directory argument is needed from the hook shim.
@@ -743,14 +740,25 @@ fn cmd_records(config: Option<&PathBuf>, command: RecordsCommand) -> anyhow::Res
                 let checkers: Vec<String> = record
                     .outcomes
                     .iter()
-                    .map(|o| format!("{} {} ({:.1}s)", o.name, o.outcome, o.duration_ms as f64 / 1000.0))
+                    .map(|o| {
+                        format!(
+                            "{} {} ({:.1}s)",
+                            o.name,
+                            o.outcome,
+                            o.duration_ms as f64 / 1000.0
+                        )
+                    })
                     .collect();
                 println!(
                     "{}  {}  {}  {}  {}",
                     records::iso8601(record.created_at),
                     record.id,
                     record.event,
-                    if record.repository.is_empty() { "-" } else { &record.repository },
+                    if record.repository.is_empty() {
+                        "-"
+                    } else {
+                        &record.repository
+                    },
                     if record.passed { "passed" } else { "REFUSED" }
                 );
                 for checker in checkers {
@@ -770,7 +778,10 @@ fn cmd_records(config: Option<&PathBuf>, command: RecordsCommand) -> anyhow::Res
             println!("repository : {}", record.repository);
             println!("identity   : {}", record.identity);
             println!("duration   : {:.1}s", record.duration_ms as f64 / 1000.0);
-            println!("verdict    : {}", if record.passed { "passed" } else { "refused" });
+            println!(
+                "verdict    : {}",
+                if record.passed { "passed" } else { "refused" }
+            );
             for outcome in &record.outcomes {
                 println!(
                     "\n[{}] {} — {} ({:.1}s)",
@@ -793,7 +804,7 @@ fn cmd_records(config: Option<&PathBuf>, command: RecordsCommand) -> anyhow::Res
 fn cmd_check(
     config: Option<&PathBuf>,
     event: &str,
-    directory: &PathBuf,
+    directory: &Path,
     only: Option<&str>,
     tag: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
@@ -809,7 +820,12 @@ fn cmd_auth(config: Option<&PathBuf>, command: AuthCommand) -> anyhow::Result<Ex
     match command {
         AuthCommand::Init => auth::cmd_init(&vault)?,
         AuthCommand::Add { account } => auth::cmd_add(&vault, &account)?,
-        AuthCommand::Remove { account, token, keys, all } => {
+        AuthCommand::Remove {
+            account,
+            token,
+            keys,
+            all,
+        } => {
             // Exactly one scope must be chosen. Guessing would risk discarding a
             // token the user cannot re-derive.
             let chosen = [token, keys, all].iter().filter(|x| **x).count();
@@ -867,7 +883,12 @@ fn cmd_unlock(ttl: Option<u64>) -> anyhow::Result<ExitCode> {
     if !vault.exists() {
         anyhow::bail!("no vault yet; run: gitvault auth init");
     }
-    unlock::ensure_open(&vault, "GitVault: confirm to open the credential vault", true, ttl)?;
+    unlock::ensure_open(
+        &vault,
+        "GitVault: confirm to open the credential vault",
+        true,
+        ttl,
+    )?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -953,9 +974,7 @@ fn cmd_config_keygen() -> anyhow::Result<ExitCode> {
 
 /// Bless the current configuration: editing the file is free, loading it is not.
 fn cmd_config_sign(config: Option<&PathBuf>) -> anyhow::Result<ExitCode> {
-    let path = config
-        .cloned()
-        .unwrap_or_else(config::Config::default_path);
+    let path = config.cloned().unwrap_or_else(config::Config::default_path);
     if !path.exists() {
         anyhow::bail!("nothing to sign at {}", path.display());
     }
@@ -974,9 +993,7 @@ fn cmd_config_sign(config: Option<&PathBuf>) -> anyhow::Result<ExitCode> {
 
 /// Report the attestation state. Read-only: it may advise, never gate.
 fn cmd_config_verify(config: Option<&PathBuf>) -> anyhow::Result<ExitCode> {
-    let path = config
-        .cloned()
-        .unwrap_or_else(config::Config::default_path);
+    let path = config.cloned().unwrap_or_else(config::Config::default_path);
     let anchor = configsig::anchor_path();
     match configsig::anchor_state(&anchor) {
         configsig::Anchor::Absent => {
@@ -1066,9 +1083,8 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
             )
         })?;
     }
-    std::fs::copy(&exe, &target).with_context(|| {
-        format!("cannot install {} to {}", exe.display(), target.display())
-    })?;
+    std::fs::copy(&exe, &target)
+        .with_context(|| format!("cannot install {} to {}", exe.display(), target.display()))?;
     if !sign_wrapper.exists() {
         std::fs::write(
             &sign_wrapper,
@@ -1134,7 +1150,9 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
         if !stub.exists() {
             std::fs::write(
                 &stub,
-                format!("#!/usr/bin/env bash\nexec \"$HOME/.git-hooks/_dispatch\" {event} \"$@\"\n"),
+                format!(
+                    "#!/usr/bin/env bash\nexec \"$HOME/.git-hooks/_dispatch\" {event} \"$@\"\n"
+                ),
             )?;
         }
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
@@ -1181,7 +1199,10 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
         println!("  {}", p.display());
     }
     if anchor_armed && anchor_ok {
-        println!("signature enforcement: armed ({} is root-owned)", anchor.display());
+        println!(
+            "signature enforcement: armed ({} is root-owned)",
+            anchor.display()
+        );
     } else {
         println!(
             "signature enforcement: inactive - no anchor yet\n  \
@@ -1220,7 +1241,9 @@ fn cmd_api(
                      pass --repo OWNER/NAME or --identity NAME"
                 ),
             },
-            Err(_) => anyhow::bail!("not in a repository; pass --repo OWNER/NAME or --identity NAME"),
+            Err(_) => {
+                anyhow::bail!("not in a repository; pass --repo OWNER/NAME or --identity NAME")
+            }
         },
     };
 
@@ -1291,10 +1314,7 @@ fn cmd_pr(
                     .current_branch()
                     .ok_or_else(|| anyhow::anyhow!("cannot determine the current branch"))?,
             };
-            let base = match base {
-                Some(b) => b,
-                None => String::new(),
-            };
+            let base = base.unwrap_or_default();
             // The publication boundary. A branch pushed through GitVault already
             // passed the same audit at pre-push -- a range that did is reused, not
             // paid for twice; content that reached the remote from elsewhere is
@@ -1321,7 +1341,12 @@ fn cmd_pr(
             if !base.is_empty() {
                 f.push(("base".to_string(), base));
             }
-            ("POST", format!("/repos/{slug}/pulls"), f, Some(".html_url".to_string()))
+            (
+                "POST",
+                format!("/repos/{slug}/pulls"),
+                f,
+                Some(".html_url".to_string()),
+            )
         }
         PrCommand::List { state, limit, json } => (
             "GET",
@@ -1337,7 +1362,11 @@ fn cmd_pr(
             "GET",
             format!("/repos/{slug}/pulls/{number}"),
             vec![],
-            if json { None } else { Some(".html_url".to_string()) },
+            if json {
+                None
+            } else {
+                Some(".html_url".to_string())
+            },
         ),
         PrCommand::Merge {
             number,
@@ -1412,7 +1441,9 @@ fn resolve_slug(explicit: Option<String>) -> anyhow::Result<String> {
     }
     git::Repo::discover(&PathBuf::from("."))?
         .slug()
-        .ok_or_else(|| anyhow::anyhow!("no origin remote here; pass OWNER/NAME or run in a checkout"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("no origin remote here; pass OWNER/NAME or run in a checkout")
+        })
 }
 
 fn emit(cfg: &config::Config, vault: &vault::Vault, req: api::Request) -> anyhow::Result<ExitCode> {
@@ -1450,7 +1481,11 @@ fn cmd_issue(
 
     let req = match command {
         IssueCommand::Create { title, body } => {
-            let mut r = get(format!("/repos/{slug}/issues"), slug.clone(), Some(".html_url".into()));
+            let mut r = get(
+                format!("/repos/{slug}/issues"),
+                slug.clone(),
+                Some(".html_url".into()),
+            );
             r.method = "POST".into();
             r.fields.push(("title".into(), title));
             if let Some(b) = body {
@@ -1461,7 +1496,11 @@ fn cmd_issue(
         IssueCommand::List { state, limit, json } => get(
             format!("/repos/{slug}/issues?state={state}&per_page={limit}"),
             slug.clone(),
-            if json { None } else { Some(".[].html_url".into()) },
+            if json {
+                None
+            } else {
+                Some(".[].html_url".into())
+            },
         ),
         IssueCommand::View { number, json } => get(
             format!("/repos/{slug}/issues/{number}"),
@@ -1511,7 +1550,11 @@ fn cmd_repo(config: Option<&PathBuf>, command: RepoCommand) -> anyhow::Result<Ex
     let req = match command {
         RepoCommand::View { slug, json } => {
             let slug = resolve_slug(slug)?;
-            let jq = if json { None } else { Some(".full_name".into()) };
+            let jq = if json {
+                None
+            } else {
+                Some(".full_name".into())
+            };
             get(format!("/repos/{slug}"), slug.clone(), jq)
         }
         RepoCommand::List {
@@ -1540,7 +1583,11 @@ fn cmd_repo(config: Option<&PathBuf>, command: RepoCommand) -> anyhow::Result<Ex
             get(
                 format!("{base}?per_page={limit}&type={visibility}"),
                 format!("{owner}/.github"),
-                if json { None } else { Some(".[].full_name".into()) },
+                if json {
+                    None
+                } else {
+                    Some(".[].full_name".into())
+                },
             )
         }
         RepoCommand::DefaultBranch { slug } => {
@@ -1565,14 +1612,15 @@ fn cmd_release(
     // does not depend on the vault, and a refusal must be possible even where
     // the vault is locked. Nothing reaches GitHub until the registry passes.
     if let ReleaseCommand::Create { tag, .. } = &command {
-        let ctx = context_for(&cfg, "release", &PathBuf::from("."), Some(tag.clone()))
-            .map_err(|err| {
+        let ctx = context_for(&cfg, "release", &PathBuf::from("."), Some(tag.clone())).map_err(
+            |err| {
                 anyhow::anyhow!(
                     "reviewing a release needs a checkout with the tagged commit\n  \
                      {err:#}\n  \
                      run this from the tagged working tree"
                 )
-            })?;
+            },
+        )?;
         run_publication_gate(&cfg, &ctx, "release", "release")?;
     }
     let vault = vault::Vault::open()?;
@@ -1582,7 +1630,11 @@ fn cmd_release(
         ReleaseCommand::List { limit, json } => get(
             format!("/repos/{slug}/releases?per_page={limit}"),
             slug.clone(),
-            if json { None } else { Some(".[].tag_name".into()) },
+            if json {
+                None
+            } else {
+                Some(".[].tag_name".into())
+            },
         ),
         ReleaseCommand::View { tag, json } => get(
             format!("/repos/{slug}/releases/tags/{tag}"),
@@ -1647,7 +1699,11 @@ fn cmd_run(
         RunCommand::List { limit, json } => get(
             format!("/repos/{slug}/actions/runs?per_page={limit}"),
             slug.clone(),
-            if json { None } else { Some(".workflow_runs[0].status".into()) },
+            if json {
+                None
+            } else {
+                Some(".workflow_runs[0].status".into())
+            },
         ),
         RunCommand::View { id, json } => get(
             format!("/repos/{slug}/actions/runs/{id}"),

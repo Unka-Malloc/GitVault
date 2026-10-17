@@ -1,6 +1,0 @@
-name: clean-auditor
-version: "1.0.0"
-description: "Read-only source inspection and a single verdict for privacy and confidentiality review."
-provides_tools:
-  - clean_context
-  - clean_submit_review

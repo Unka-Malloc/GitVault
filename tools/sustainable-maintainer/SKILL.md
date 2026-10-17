@@ -20,7 +20,7 @@ A refusal is a verdict, not an obstacle:
   markers left in text, merge-tool artifacts (`*.orig`, `*.rej`,
   `*.LOCAL.*`), editor or OS junk (`.DS_Store`, `._*`, swap files) committed
   to the tree. The scan runs locally and never costs a token.
-- **semantic refusal** (stage two): the six domains judged by an isolated Pi
+- **semantic refusal** (stage two): the six domains judged by an isolated OpenCode
   conversation with a fresh context each run — structure, contracts, craft,
   duplication, tests, evolution.
 
@@ -56,6 +56,17 @@ test conventions; every superseded path of an authorized replacement removed;
 documentation updated to describe the system that exists. Fix what the list
 catches, then let the checker run anyway — self-check precedes the audit, it
 does not replace it.
+
+## Full-service review
+
+Beyond the gate, the operator can assign a repository-wide review with an
+explicit manifest of projects plus a review charter. The same six domains and
+the same gate/advice weights apply to the whole current source; coverage is
+accounted per project as well as per domain, and a finding must name an exact
+listed path and line the reviewer actually read. A full-service report is
+private to the operator: it never blocks publication and never approves a
+later commit. Full operation notes: `tools/sustainable-maintainer/README.md`
+in the GitVault repository.
 
 ## Boundaries worth knowing
 

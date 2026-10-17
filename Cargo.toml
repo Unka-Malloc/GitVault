@@ -1,25 +1,46 @@
 [package]
 name = "gitvault"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Git identity interceptor: resolve who may act on a repository, then run registered checkers before the action lands"
 license = "Apache-2.0"
 publish = false
+default-run = "gitvault"
 repository = "https://github.com/Unka-Malloc/gitvault"
 
 [[bin]]
 name = "gitvault"
 path = "src/main.rs"
 
+[[bin]]
+name = "gitvault-audit-agent"
+path = "src/bin/audit-agent.rs"
+
+[[bin]]
+name = "gitvault-review"
+path = "src/bin/review.rs"
+
 [dependencies]
+a4aa = { path = "../../Adapter-For-All-Agents", version = "0.2.0" }
+a4aa-devin = { path = "../../Adapter-For-All-Agents/crates/a4aa-devin", version = "0.2.0" }
+a4aa-opencode = { path = "../../Adapter-For-All-Agents/crates/a4aa-opencode", version = "0.2.0" }
+agents-with-profiles = { path = "../../Agents-With-Profiles", version = "0.1.0", default-features = false }
+async-trait = "0.1"
 anyhow = "1.0.104"
 base64 = "0.23.1"
 chacha20poly1305 = "0.11.0"
 clap = { version = "4.6.7", features = ["derive", "env"] }
 hmac = "0.13.0"
+jiff = "0.2"
 rand = "0.10.3"
+regex = "1"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+# preserve_order: the Python engine's dictionaries keep file order, and the
+# manifest's catalog enums are order-sensitive data. IndexMap-backed maps keep
+# the runtime byte-faithful to it.
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
 sha2 = "0.11.1"
 toml = "1.1.6"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 wait-timeout = "0.2.1"
+tokio = { version = "1", features = ["macros", "rt", "sync", "signal"] }

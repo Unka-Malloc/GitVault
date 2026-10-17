@@ -21,7 +21,7 @@ A refusal is a verdict, not an obstacle:
   value.
 - **semantic refusal** (stage two): the six domains and the two standing
   items — tooling hygiene and hardcoded parameters, including machine
-  paths and internal addresses — judged by an isolated Pi conversation
+  paths and internal addresses — judged by an isolated OpenCode conversation
   with a fresh context each run.
 
 Repair the change (remove or generalize the content), then publish again. Do

@@ -1,6 +1,0 @@
-name: security-enhancer
-version: "1.0.0"
-description: "Read-only source inspection and a single verdict for pre-release security hardening."
-provides_tools:
-  - security_context
-  - security_submit_review

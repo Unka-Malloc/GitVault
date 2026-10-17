@@ -105,7 +105,7 @@ impl From<EntryWire> for Entry {
                 ssh_key: f.ssh_key,
                 signing_key: f.signing_key,
                 passphrase: f.passphrase,
-            }
+            },
         }
     }
 }
@@ -145,10 +145,7 @@ impl Store {
     }
 
     pub fn insert(&mut self, account: &str, token: &str) {
-        self.accounts
-            .entry(account.to_string())
-            .or_default()
-            .token = Some(token.to_string());
+        self.accounts.entry(account.to_string()).or_default().token = Some(token.to_string());
     }
 
     pub fn set_ssh_key(&mut self, account: &str, key: &str) {
@@ -175,7 +172,12 @@ impl Store {
     /// Drop an entry once nothing is held for it, so a listing does not show an
     /// account with no material behind it.
     pub fn prune(&mut self, account: &str) {
-        if self.accounts.get(account).map(Entry::is_empty).unwrap_or(false) {
+        if self
+            .accounts
+            .get(account)
+            .map(Entry::is_empty)
+            .unwrap_or(false)
+        {
             self.accounts.remove(account);
         }
     }
@@ -285,9 +287,7 @@ impl Vault {
     /// The configuration signing key, or an error naming the fix.
     pub fn config_key(&self) -> Result<String> {
         self.load()?.config_key.clone().ok_or_else(|| {
-            anyhow!(
-                "no configuration signing key held\n  run: gitvault config keygen"
-            )
+            anyhow!("no configuration signing key held\n  run: gitvault config keygen")
         })
     }
 
@@ -306,9 +306,7 @@ impl Vault {
     pub fn token_for(&self, account: &str) -> Result<String> {
         let store = self.load()?;
         store.get(account).map(str::to_string).ok_or_else(|| {
-            anyhow!(
-                "no stored token for '{account}'\n  run: gitvault auth add {account}"
-            )
+            anyhow!("no stored token for '{account}'\n  run: gitvault auth add {account}")
         })
     }
 
@@ -323,16 +321,18 @@ impl Vault {
             bail!("vault file is truncated: {}", self.path.display());
         }
         if &blob[..MAGIC.len()] != MAGIC {
-            bail!("vault file has an unrecognised format: {}", self.path.display());
+            bail!(
+                "vault file has an unrecognised format: {}",
+                self.path.display()
+            );
         }
         let nonce: &Nonce = blob[MAGIC.len()..MAGIC.len() + NONCE_LEN]
             .try_into()
             .expect("a NONCE_LEN window is NONCE_LEN bytes");
         let ciphertext = &blob[MAGIC.len() + NONCE_LEN..];
         let key = self.encryption_key()?;
-        let cipher = ChaCha20Poly1305::new(
-            (&key[..]).try_into().expect("a vault key is KEY_LEN bytes"),
-        );
+        let cipher =
+            ChaCha20Poly1305::new((&key[..]).try_into().expect("a vault key is KEY_LEN bytes"));
         let plain = cipher
             .decrypt(nonce, ciphertext)
             .map_err(|_| anyhow!("vault could not be decrypted (wrong key or corrupted file)"))?;
@@ -353,9 +353,8 @@ impl Vault {
     pub fn save(&self, store: &Store) -> Result<()> {
         let key = self.encryption_key_or_create()?;
         let plain = serde_json::to_vec(store)?;
-        let cipher = ChaCha20Poly1305::new(
-            (&key[..]).try_into().expect("a vault key is KEY_LEN bytes"),
-        );
+        let cipher =
+            ChaCha20Poly1305::new((&key[..]).try_into().expect("a vault key is KEY_LEN bytes"));
         // A fresh random nonce per write. ChaCha20-Poly1305 requires nonce
         // uniqueness under a given key, and the key is long-lived, so it is
         // generated here rather than derived.
@@ -402,9 +401,10 @@ impl Vault {
             )
         })?;
         let key = decode_key(&raw)?;
-        crate::unlock::cache_key(&key, std::time::Duration::from_secs(
-            crate::unlock::default_ttl_secs(),
-        ));
+        crate::unlock::cache_key(
+            &key,
+            std::time::Duration::from_secs(crate::unlock::default_ttl_secs()),
+        );
         Ok(key)
     }
 
@@ -412,10 +412,10 @@ impl Vault {
         if let Some(key) = crate::unlock::cached_key() {
             return Ok(key);
         }
-        if let Some(raw) = keychain_get(&keychain_service()) {
-            if let Ok(k) = decode_key(&raw) {
-                return Ok(k);
-            }
+        if let Some(raw) = keychain_get(&keychain_service())
+            && let Ok(k) = decode_key(&raw)
+        {
+            return Ok(k);
         }
         let key: [u8; KEY_LEN] = rand::random();
         keychain_set(&keychain_service(), &B64.encode(key))?;
@@ -542,7 +542,10 @@ mod tests {
         let back: Store = serde_json::from_str(&json).unwrap();
         assert_eq!(back.get("A"), Some("tok"));
         assert_eq!(back.entry("A").unwrap().ssh_key.as_deref(), Some("KEY"));
-        assert_eq!(back.entry("A").unwrap().signing_key.as_deref(), Some("SIGN"));
+        assert_eq!(
+            back.entry("A").unwrap().signing_key.as_deref(),
+            Some("SIGN")
+        );
     }
 
     #[test]
@@ -581,7 +584,11 @@ mod tests {
         let nested = base.join("a").join("b");
         create_hardened(&nested).unwrap();
 
-        assert_eq!(mode(&base), 0o755, "a pre-existing ancestor must keep its mode");
+        assert_eq!(
+            mode(&base),
+            0o755,
+            "a pre-existing ancestor must keep its mode"
+        );
         assert_eq!(mode(&base.join("a")), 0o700);
         assert_eq!(mode(&nested), 0o700);
 

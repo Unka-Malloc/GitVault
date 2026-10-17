@@ -1,5 +1,9 @@
 # Security Enhancer
 
+Agent execution uses the shared A4AA-backed `gitvault-audit-agent` runner.
+Build and install it as described in the [GitVault runtime setup](../../README.md#agent-profiles)
+before installing or updating this checker.
+
 Security Enhancer is a blocking GitVault checker that reviews what a push, a
 pull request, a merge or a release is about to publish, in two stages:
 
@@ -7,9 +11,9 @@ pull request, a merge or a release is about to publish, in two stages:
    objects of the outgoing range. No repository code is executed and no
    repository script is parsed: a change never certifies itself. A regression
    refuses immediately and costs no tokens.
-2. **Semantic, isolated Pi review** — only if stage one finds no regression: a
-   fresh, unsaved Pi session over the same immutable range, on the
-   provider/model/effort the synced `profile.json` declares, judging
+2. **Semantic, isolated OpenCode review** — only if stage one finds no regression: a
+   fresh, durable OpenCode session over the same immutable range, on the
+   provider/model the synced `profile.json` declares, judging
    dependency_supply_chain / ci_workflow_authority /
    secret_handling / transport_security / authz_defaults / container_runtime /
    release_artifacts.
@@ -44,14 +48,13 @@ line, so an internal host name or a build-arg value never lands in a log.
 ## Install
 
 ```sh
-python3 tools/security-enhancer/install.py            # first install
-python3 tools/security-enhancer/install.py --update   # refresh payload and skill links
+gitvault-review install --source tools/security-enhancer            # first install
+gitvault-review update --source tools/security-enhancer   # refresh payload and skill links
 ```
 
 The installer creates the checker's private home
-`~/.hermes/profiles/security-enhancer`, copies the payload (including the
-`pi-bridge.ts` extension that forwards Pi tool calls into the Python
-`--serve-tools` process), links the shared
+`~/.hermes/profiles/security-enhancer`, installs the contract payload and writes the checker's declared AwP registry
+document (the audit agent spec and binding the runner resolves), links the shared
 skill directory `~/.agents/skills/security-enhancer` into every agent skill
 directory it finds, and registers (or replaces in place) this entry in
 `$XDG_CONFIG_HOME/gitvault/config.toml` (or `~/.config/gitvault/config.toml`):
@@ -70,17 +73,15 @@ them.
 
 ## Ranges
 
-- `pre-push`: one range per pushed ref, against the published tip (or the
-  merge-base with the default branch). A deletion publishes nothing; an
+Every event judges one object: the whole tree at the operation's head commit.
+There is no narrower mirror to widen later — the snapshot a push review passed
+is the same object the release gate judges.
+
+- `pre-push`: the head of each pushed ref. A deletion publishes nothing; an
   already-published tip is skipped.
-- `pr create`: base..head of the branch being proposed.
-- `pr merge`: the merge request's head fetched into `FETCH_HEAD` (no ref is
-  created), judged against its base.
-- `release create`: **previous tag..release commit** — the content the release
-  publishes. A release commit is normally already on the default branch, so a
-  merge-base against the default branch would describe an empty range and the
-  release would never be reviewed at all. With no previous release the tree is
-  scanned whole (`fallback: snapshot-no-previous-release`).
+- `pr create` / `pr merge`: the branch or merge-request head, fetched into
+  `FETCH_HEAD` when it is not available locally (no ref is created).
+- `release create`: the whole tree at the release commit.
 
 ## Boundaries an operator must know
 
@@ -104,12 +105,12 @@ scope file is deleted when the run ends.
 ## Syncing a published profile
 
 The prompt and skill this agent runs on are hosted in a profile registry (`GITVAULT_PROFILES_URL`,
-which must be set explicitly; the local development registry is `http://127.0.0.1:8891`) and versioned by git tag. `install.py` seeds them once; after
+which must be set explicitly; the local development registry is `http://127.0.0.1:8891`) and versioned by git tag. `gitvault-review install` seeds them once; after
 that the registry is the source:
 
 ```sh
-python3 tools/security-enhancer/install.py --pull                 # newest published version
-python3 tools/security-enhancer/install.py --pull profile/security-enhancer/v2   # a pinned version
+gitvault-review pull --source tools/security-enhancer                 # newest published version
+gitvault-review pull --source tools/security-enhancer --tag profile/security-enhancer/v2   # a pinned version
 ```
 
 The download is checked file by file (and as a whole, by manifest) before

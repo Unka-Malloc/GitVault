@@ -19,7 +19,7 @@
 //! temporary file for `ssh-keygen -y`, and that file is removed when its guard
 //! drops. Signing a commit never takes that path.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
@@ -91,7 +91,7 @@ pub fn parse(args: &[String]) -> Result<Invocation> {
                 key = args.get(i + 1).cloned();
                 i += 2;
             }
-            "-O" => i += 2, // e.g. -Overify-time=...
+            "-O" => i += 2,                            // e.g. -Overify-time=...
             other if other.starts_with('-') => i += 1, // -U and any other bare flag
             other => {
                 positional.push(other.to_string());
@@ -115,7 +115,7 @@ pub fn parse(args: &[String]) -> Result<Invocation> {
     })
 }
 
-pub fn run(cfg: &Config, vault: &Vault, args: &[String], cwd: &PathBuf) -> Result<i32> {
+pub fn run(cfg: &Config, vault: &Vault, args: &[String], cwd: &Path) -> Result<i32> {
     // git runs `gpg.ssh.program` for verification too, not only for signing. Observed
     // calls, all with the same configured program:
     //
@@ -301,7 +301,9 @@ fn public_key_from_agent(sock: &str, expected_fingerprint: &str) -> Result<Strin
         .find(|l| l.starts_with("ssh-ed25519 ") || l.starts_with("ssh-rsa "))
         .map(str::to_string)
         .ok_or_else(|| {
-            anyhow::anyhow!("the temporary agent holds no usable key (wanted {expected_fingerprint})")
+            anyhow::anyhow!(
+                "the temporary agent holds no usable key (wanted {expected_fingerprint})"
+            )
         })?;
     Ok(format!("{key}\n"))
 }
@@ -344,7 +346,9 @@ mod tests {
         for a in [
             vec!["-Y", "find-principals", "-f", "signers", "-s", "sig"],
             vec!["-Y", "check-novalidate", "-n", "git", "-s", "sig"],
-            vec!["-Y", "verify", "-n", "git", "-f", "signers", "-I", "p", "-s", "sig"],
+            vec![
+                "-Y", "verify", "-n", "git", "-f", "signers", "-I", "p", "-s", "sig",
+            ],
         ] {
             let args: Vec<String> = a.iter().map(|s| s.to_string()).collect();
             assert!(

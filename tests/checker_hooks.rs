@@ -14,6 +14,8 @@ fn git(repo: &Path, args: &[&str]) -> Output {
         .arg("-C")
         .arg(repo)
         .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .output()
         .unwrap()
 }
@@ -94,9 +96,19 @@ fn pull_request_event_runs_registered_checkers() {
     checked(&root, &["init", "-q"]);
     // Neutral hooks: this fixture must not run the machine's real hook chain,
     // and its own commit must not reach the installed gates.
-    checked(&root, &["config", "core.hooksPath", root.join("no-hooks").to_str().unwrap()]);
+    checked(
+        &root,
+        &[
+            "config",
+            "core.hooksPath",
+            root.join("no-hooks").to_str().unwrap(),
+        ],
+    );
     checked(&root, &["config", "user.name", "Synthetic"]);
-    checked(&root, &["config", "user.email", "synthetic@example.invalid"]);
+    checked(
+        &root,
+        &["config", "user.email", "synthetic@example.invalid"],
+    );
     std::fs::write(root.join("one"), "base\n").unwrap();
     checked(&root, &["add", "."]);
     checked(&root, &["commit", "-qm", "base"]);
@@ -148,9 +160,19 @@ fn publication_fixture(events: &str, blocking: bool) -> Fixture {
     ));
     std::fs::create_dir_all(&root).unwrap();
     checked(&root, &["init", "-q"]);
-    checked(&root, &["config", "core.hooksPath", root.join("no-hooks").to_str().unwrap()]);
+    checked(
+        &root,
+        &[
+            "config",
+            "core.hooksPath",
+            root.join("no-hooks").to_str().unwrap(),
+        ],
+    );
     checked(&root, &["config", "user.name", "Synthetic"]);
-    checked(&root, &["config", "user.email", "synthetic@example.invalid"]);
+    checked(
+        &root,
+        &["config", "user.email", "synthetic@example.invalid"],
+    );
     std::fs::write(root.join("one"), "base\n").unwrap();
     checked(&root, &["add", "."]);
     checked(&root, &["commit", "-qm", "base"]);
@@ -183,14 +205,28 @@ fn release_event_runs_registered_checkers_with_the_tag() {
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_gitvault"))
         .env("GITVAULT_UNSIGNED_OK", "1")
         .args([
-            "--config", root.join("config.toml").to_str().unwrap(),
-            "check", "--event", "release", "--tag", "v1.0.0", "--directory", root.to_str().unwrap(),
+            "--config",
+            root.join("config.toml").to_str().unwrap(),
+            "check",
+            "--event",
+            "release",
+            "--tag",
+            "v1.0.0",
+            "--directory",
+            root.to_str().unwrap(),
         ])
         .output()
         .unwrap();
-    assert!(result.status.success(), "release check failed: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.status.success(),
+        "release check failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     let recorded = std::fs::read_to_string(&marker).unwrap();
-    assert!(recorded.starts_with("release|v1.0.0|"), "checker saw '{recorded}'");
+    assert!(
+        recorded.starts_with("release|v1.0.0|"),
+        "checker saw '{recorded}'"
+    );
 }
 
 #[test]
@@ -202,8 +238,13 @@ fn release_create_is_refused_before_any_credential_is_touched() {
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_gitvault"))
         .env("GITVAULT_UNSIGNED_OK", "1")
         .args([
-            "--config", root.join("config.toml").to_str().unwrap(),
-            "release", "create", "v1.0.0", "--repo", "Owner/Name",
+            "--config",
+            root.join("config.toml").to_str().unwrap(),
+            "release",
+            "create",
+            "v1.0.0",
+            "--repo",
+            "Owner/Name",
         ])
         .current_dir(&root)
         .output()
@@ -212,8 +253,10 @@ fn release_create_is_refused_before_any_credential_is_touched() {
     assert!(!result.status.success(), "a blocked release must fail");
     assert!(stderr.contains("refused this release"), "stderr: {stderr}");
     for credential_error in ["unlock", "authentication", "credential"] {
-        assert!(!stderr.to_lowercase().contains(credential_error),
-                "the gate must run before any credential is touched: {stderr}");
+        assert!(
+            !stderr.to_lowercase().contains(credential_error),
+            "the gate must run before any credential is touched: {stderr}"
+        );
     }
 }
 
@@ -224,8 +267,13 @@ fn merge_is_refused_before_the_api_call() {
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_gitvault"))
         .env("GITVAULT_UNSIGNED_OK", "1")
         .args([
-            "--config", root.join("config.toml").to_str().unwrap(),
-            "pr", "merge", "7", "--repo", "Owner/Name",
+            "--config",
+            root.join("config.toml").to_str().unwrap(),
+            "pr",
+            "merge",
+            "7",
+            "--repo",
+            "Owner/Name",
         ])
         .current_dir(&root)
         .output()
@@ -247,20 +295,38 @@ fn a_run_is_recorded_without_this_machines_paths() {
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_gitvault"))
         .env("GITVAULT_UNSIGNED_OK", "1")
         .args([
-            "--config", root.join("config.toml").to_str().unwrap(),
-            "check", "--event", "pr", "--directory", root.to_str().unwrap(),
+            "--config",
+            root.join("config.toml").to_str().unwrap(),
+            "check",
+            "--event",
+            "pr",
+            "--directory",
+            root.to_str().unwrap(),
         ])
         .output()
         .unwrap();
-    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
 
-    let runs: Vec<_> = std::fs::read_dir(root.join("runs")).unwrap().flatten().collect();
+    let runs: Vec<_> = std::fs::read_dir(root.join("runs"))
+        .unwrap()
+        .flatten()
+        .collect();
     assert_eq!(runs.len(), 1, "exactly one run was recorded");
     let record = std::fs::read_to_string(runs[0].path().join("engine.json")).unwrap();
     for leaked in ["/Users", "/var/folders", "/home/"] {
-        assert!(!record.contains(leaked), "the record describes this machine: {record}");
+        assert!(
+            !record.contains(leaked),
+            "the record describes this machine: {record}"
+        );
     }
-    assert!(record.contains("[LOCAL_PATH]"), "the printed path is marked: {record}");
+    assert!(
+        record.contains("[LOCAL_PATH]"),
+        "the printed path is marked: {record}"
+    );
     assert!(record.contains("\"event\": \"pr\""), "{record}");
     assert!(record.contains("\"name\": \"publication\""), "{record}");
 
@@ -268,15 +334,25 @@ fn a_run_is_recorded_without_this_machines_paths() {
     let listed = std::process::Command::new(env!("CARGO_BIN_EXE_gitvault"))
         .env("GITVAULT_UNSIGNED_OK", "1")
         .args([
-            "--config", root.join("config.toml").to_str().unwrap(),
-            "records", "list", "--json",
+            "--config",
+            root.join("config.toml").to_str().unwrap(),
+            "records",
+            "list",
+            "--json",
         ])
         .output()
         .unwrap();
     let json = String::from_utf8_lossy(&listed.stdout);
-    assert!(listed.status.success(), "{}", String::from_utf8_lossy(&listed.stderr));
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
     assert!(json.contains("\"outcomes\""), "{json}");
-    assert!(!json.contains("stdout"), "the list projection leaves the transcript out: {json}");
+    assert!(
+        !json.contains("stdout"),
+        "the list projection leaves the transcript out: {json}"
+    );
 }
 
 #[test]

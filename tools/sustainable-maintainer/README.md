@@ -1,5 +1,9 @@
 # Sustainable Maintainer
 
+Agent execution uses the shared A4AA-backed `gitvault-audit-agent` runner.
+Build and install it as described in the [GitVault runtime setup](../../README.md#agent-profiles)
+before installing or updating this checker.
+
 Sustainable Maintainer is a blocking GitVault checker that reviews what a push
 or a pull request is about to publish, in two stages:
 
@@ -8,8 +12,8 @@ or a pull request is about to publish, in two stages:
    artifacts (`*.orig`, `*.rej`, `*.LOCAL.*`), editor and OS junk
    (`.DS_Store`, `._*`, swap files). Nothing leaves the machine, nothing is
    written, and a refusal here costs no tokens.
-2. **Semantic, isolated Pi review** — only if stage one passes: a fresh,
-   unsaved Pi session over the same immutable range, on the provider/model/effort
+2. **Semantic, isolated OpenCode review** — only if stage one passes: a fresh,
+   durable OpenCode session over the same immutable range, on the provider/model
    the synced `profile.json` declares, judging structure / contracts / craft /
    duplication / tests / evolution, and returning advisory findings with
    architecture advice for long-term maintainability.
@@ -38,13 +42,13 @@ its structure when a real recurring constraint justifies it.
 ## Install
 
 ```sh
-python3 tools/sustainable-maintainer/install.py            # first install
-python3 tools/sustainable-maintainer/install.py --update   # refresh payload and skill links
+gitvault-review install --source tools/sustainable-maintainer            # first install
+gitvault-review update --source tools/sustainable-maintainer   # refresh payload and skill links
 ```
 
 The installer creates the checker's private home `~/.hermes/profiles/sustainable-maintainer`,
-copies the payload (including the `pi-bridge.ts` extension that forwards Pi tool
-calls into the Python `--serve-tools` process), links the shared skill directory `~/.agents/skills/sustainable-maintainer`
+installs the contract payload and writes the checker's declared AwP registry
+document (the audit agent spec and binding the runner resolves), links the shared skill directory `~/.agents/skills/sustainable-maintainer`
 into every agent skill directory it finds, and registers (or replaces in place)
 this entry in `$XDG_CONFIG_HOME/gitvault/config.toml` (or `~/.config/gitvault/config.toml`):
 
@@ -60,14 +64,32 @@ timeout_secs = 0
 Hook files are owned by `~/.git-hooks/_dispatch`; the installer never writes
 them.
 
+## Explicit full-service review
+
+`audit.py --manifest <manifest.json> --request <charter.json> --output
+<new-private-directory>` runs the same reviewer over the whole current source
+of explicitly selected projects, including nonignored unstaged/untracked
+changes. The manifest maps project labels to local source roots under
+`projects`; the charter carries the authorized conversation URL and the exact
+original messages. Optional `reuse` maps a second selected project to its
+primary copy so byte-identical files share evidence while distinct code
+remains independently inspectable.
+
+The reviewer must read the charter and account for every project and every
+domain before submitting; findings must name an exact listed path and an
+existing line the reviewer actually read this run. Unknown coverage cannot
+pass. The report stays in the private output directory: it never blocks
+publication and never approves a later commit. Resume a failed review with
+`audit.py --resume <run-directory>`; a submitted report is never re-audited.
+
 ## Boundaries an operator must know
 
 - `git push --no-verify` skips the `pre-push` hook — git offers no counter to
   it. The boundary that cannot be bypassed is the one GitVault itself
   controls: `pr create`, `pr merge`.
-- A range with no published content to compare against (a brand-new branch with
-  no remote base) is scanned whole and the receipt records
-  `fallback: snapshot-no-merge-base`.
+- Every event is scanned whole: the review object is the tree at the
+  operation's head commit, so no later gate can widen what an earlier review
+  passed.
 - The semantic stage is not paid for twice: the deterministic stage runs on
   every operation, but a range that already passed the semantic review is
   reused — for as long as the judged items are the same ones. A receipt written
@@ -89,12 +111,12 @@ the run scope file is deleted when the run ends.
 ## Syncing a published profile
 
 The prompt and skill this agent runs on are hosted in a profile registry (`GITVAULT_PROFILES_URL`,
-which must be set explicitly; the local development registry is `http://127.0.0.1:8891`) and versioned by git tag. `install.py` seeds them once; after
+which must be set explicitly; the local development registry is `http://127.0.0.1:8891`) and versioned by git tag. `gitvault-review install` seeds them once; after
 that the registry is the source:
 
 ```sh
-python3 tools/sustainable-maintainer/install.py --pull                             # newest published version
-python3 tools/sustainable-maintainer/install.py --pull profile/sustainable-maintainer/v1   # a pinned version
+gitvault-review pull --source tools/sustainable-maintainer                             # newest published version
+gitvault-review pull --source tools/sustainable-maintainer --tag profile/sustainable-maintainer/v1   # a pinned version
 ```
 
 The download is checked file by file (and as a whole, by manifest) before

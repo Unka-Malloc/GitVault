@@ -79,8 +79,7 @@ pub fn parse(args: &[String]) -> Result<Invocation> {
     // The repository is the last quoted or bare path in the command.
     let slug = command
         .split_whitespace()
-        .filter(|t| t.contains('/'))
-        .next_back()
+        .rfind(|t| t.contains('/'))
         .map(|t| t.trim_matches(|c| c == '\'' || c == '"').to_string())
         .and_then(|path| {
             let path = path.trim_end_matches(".git");
@@ -325,7 +324,10 @@ pub fn load_key(
     let mut child = cmd.spawn().context("failed to run ssh-add")?;
     {
         use std::io::Write;
-        let mut stdin = child.stdin.take().ok_or_else(|| anyhow::anyhow!("no ssh-add stdin"))?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("no ssh-add stdin"))?;
         stdin.write_all(key.as_bytes())?;
     }
     let out = child.wait_with_output()?;
@@ -354,7 +356,10 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(inv.host, "git@github.com-acme");
-        assert_eq!(inv.operation.as_deref(), Some("git-receive-pack 'acme/protocol.git'"));
+        assert_eq!(
+            inv.operation.as_deref(),
+            Some("git-receive-pack 'acme/protocol.git'")
+        );
         assert_eq!(inv.slug.as_deref(), Some("acme/protocol"));
         assert!(!inv.config_query);
     }
@@ -377,7 +382,13 @@ mod tests {
 
     #[test]
     fn recognises_the_configuration_query() {
-        let inv = parse(&args(&["-G", "-o", "SendEnv=GIT_PROTOCOL", "git@github.com-acme"])).unwrap();
+        let inv = parse(&args(&[
+            "-G",
+            "-o",
+            "SendEnv=GIT_PROTOCOL",
+            "git@github.com-acme",
+        ]))
+        .unwrap();
         assert!(inv.config_query);
         assert_eq!(inv.slug, None);
     }
@@ -397,7 +408,12 @@ mod tests {
 
     #[test]
     fn strips_quotes_and_the_git_suffix() {
-        let inv = parse(&args(&["git@github.com", "git-upload-pack", "\"Owner/Repo.git\""])).unwrap();
+        let inv = parse(&args(&[
+            "git@github.com",
+            "git-upload-pack",
+            "\"Owner/Repo.git\"",
+        ]))
+        .unwrap();
         assert_eq!(inv.slug.as_deref(), Some("Owner/Repo"));
     }
 
@@ -420,7 +436,10 @@ mod tests {
         let b = TempSecret::write("second", 0o600).unwrap();
         assert_ne!(a.path(), b.path(), "secret files must not collide");
         let mode = std::fs::metadata(a.path()).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "the file must be private from creation, not chmodded after");
+        assert_eq!(
+            mode, 0o600,
+            "the file must be private from creation, not chmodded after"
+        );
         assert!(a.path().exists());
         let held = a.path().to_path_buf();
         drop(a);

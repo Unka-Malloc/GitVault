@@ -93,7 +93,11 @@ pub fn iso8601(secs: u64) -> String {
     let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
     let month_prime = (5 * day_of_year + 2) / 153;
     let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = if month_prime < 10 { month_prime + 3 } else { month_prime - 9 };
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
     let year = if month <= 2 { year + 1 } else { year };
     format!(
         "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
@@ -109,7 +113,13 @@ pub fn iso8601(secs: u64) -> String {
 /// where their own receipts live. That path describes the machine, not the
 /// work, so it is replaced before it reaches the store.
 pub fn redact(text: &str) -> String {
-    const MARKERS: [&str; 5] = ["/Users/", "/home/", "/var/folders/", "C:\\Users\\", "C:/Users/"];
+    const MARKERS: [&str; 5] = [
+        "/Users/",
+        "/home/",
+        "/var/folders/",
+        "C:\\Users\\",
+        "C:/Users/",
+    ];
     const STOPS: [char; 8] = [' ', '\t', '\n', '\r', '"', '\'', '`', '<'];
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -231,10 +241,18 @@ pub fn begin(cfg: &Config, selected: usize) -> Option<Run> {
     if selected == 0 {
         return None;
     }
-    let dir = run_dir(cfg).join(format!("{:010}-{:04x}", epoch_secs(), rand::random::<u16>()));
+    let dir = run_dir(cfg).join(format!(
+        "{:010}-{:04x}",
+        epoch_secs(),
+        rand::random::<u16>()
+    ));
     std::fs::create_dir_all(&dir).ok()?;
     restrict(&dir, 0o700);
-    Some(Run { id: dir.file_name()?.to_string_lossy().into_owned(), dir, started_ms: now_ms() })
+    Some(Run {
+        id: dir.file_name()?.to_string_lossy().into_owned(),
+        dir,
+        started_ms: now_ms(),
+    })
 }
 
 fn exit_of(kind: &OutcomeKind) -> Option<i32> {
@@ -350,7 +368,7 @@ pub fn show(cfg: &Config, id: &str) -> Result<Record> {
 
 #[cfg(test)]
 mod tests {
-    use super::{capture, iso8601, prune, redact, MAX_AGE_SECS, MAX_CAPTURE, MAX_RUNS};
+    use super::{MAX_AGE_SECS, MAX_CAPTURE, MAX_RUNS, capture, iso8601, prune, redact};
 
     #[test]
     fn pruning_keeps_the_newest_runs_and_drops_expired_ones() {
@@ -362,8 +380,12 @@ mod tests {
         std::fs::create_dir_all(dir.join(&expired)).unwrap();
         let newest = MAX_RUNS as u64 + 4;
         for index in 0..=newest {
-            std::fs::create_dir_all(dir.join(format!("{:010}-{:04x}", now - 10_000 + index, index)))
-                .unwrap();
+            std::fs::create_dir_all(dir.join(format!(
+                "{:010}-{:04x}",
+                now - 10_000 + index,
+                index
+            )))
+            .unwrap();
         }
         prune(&dir);
         let left: Vec<String> = std::fs::read_dir(&dir)
@@ -371,7 +393,11 @@ mod tests {
             .flatten()
             .filter_map(|e| e.file_name().into_string().ok())
             .collect();
-        assert_eq!(left.len(), MAX_RUNS, "the store holds exactly {MAX_RUNS} runs");
+        assert_eq!(
+            left.len(),
+            MAX_RUNS,
+            "the store holds exactly {MAX_RUNS} runs"
+        );
         assert!(!left.contains(&expired), "an expired run is dropped");
         // The newest run survives: pruning must never trade today for history.
         assert!(left.contains(&format!("{:010}-{:04x}", now - 10_000 + newest, newest)));
@@ -393,7 +419,12 @@ mod tests {
                     linux: /home/other/notes.txt\n\
                     windows: C:\\Users\\who\\AppData\\x\n";
         let redacted = redact(text);
-        for leaked in ["/Users/someone", "/var/folders/ab", "/home/other", "C:\\Users\\who"] {
+        for leaked in [
+            "/Users/someone",
+            "/var/folders/ab",
+            "/home/other",
+            "C:\\Users\\who",
+        ] {
             assert!(!redacted.contains(leaked), "leaked {leaked} in {redacted}");
         }
         // The whole path goes, exactly as the checkers' own sanitizer renders

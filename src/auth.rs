@@ -29,7 +29,10 @@ pub fn cmd_init(vault: &Vault) -> Result<()> {
     // works before any credential depends on it.
     vault.save(&Store::default())?;
     println!("vault created at {}", vault.path().display());
-    println!("the key is in the keychain under service '{}'", crate::vault::keychain_service());
+    println!(
+        "the key is in the keychain under service '{}'",
+        crate::vault::keychain_service()
+    );
     Ok(())
 }
 
@@ -78,9 +81,7 @@ fn read_token(account: &str) -> Result<String> {
 /// Minimal hidden-input reader. Avoids a dependency for one prompt; falls back to
 /// a plain read when the terminal cannot be put in no-echo mode.
 fn rpassword_fallback() -> Result<String> {
-    let status = std::process::Command::new("stty")
-        .arg("-echo")
-        .status();
+    let status = std::process::Command::new("stty").arg("-echo").status();
     let mut line = String::new();
     let read = io::stdin().lock().read_line(&mut line);
     if status.map(|s| s.success()).unwrap_or(false) {
@@ -97,11 +98,7 @@ fn rpassword_fallback() -> Result<String> {
 /// token that may not be re-derivable. Verified by doing exactly that to a live
 /// PAT. Removal now names what is being removed, and an unscoped removal of an
 /// entry holding more than one kind of material requires `--all`.
-pub fn cmd_remove(
-    vault: &Vault,
-    account: &str,
-    what: RemoveWhat,
-) -> Result<()> {
+pub fn cmd_remove(vault: &Vault, account: &str, what: RemoveWhat) -> Result<()> {
     let mut store = vault.load()?;
     let Some(entry) = store.entry(account) else {
         println!("nothing stored for '{account}'");
@@ -170,7 +167,11 @@ pub fn cmd_remove_key(vault: &Vault, account: &str, signing: bool) -> Result<()>
     let label = if signing { "signing-key" } else { "ssh-key" };
     let mut found = false;
     if let Some(e) = store.accounts.get_mut(account) {
-        let slot = if signing { &mut e.signing_key } else { &mut e.ssh_key };
+        let slot = if signing {
+            &mut e.signing_key
+        } else {
+            &mut e.ssh_key
+        };
         found = slot.take().is_some();
         // A passphrase with no key left to unlock is dead weight.
         if !signing && e.ssh_key.is_none() && e.signing_key.is_none() {
@@ -273,8 +274,8 @@ pub fn cmd_import_key(
     signing: bool,
     passphrase: Option<String>,
 ) -> Result<()> {
-    let material = std::fs::read_to_string(file)
-        .with_context(|| format!("cannot read {}", file.display()))?;
+    let material =
+        std::fs::read_to_string(file).with_context(|| format!("cannot read {}", file.display()))?;
     if !material.contains("PRIVATE KEY") {
         bail!(
             "{} does not look like a private key (no PRIVATE KEY marker)",
@@ -288,10 +289,10 @@ pub fn cmd_import_key(
     } else {
         store.set_ssh_key(account, &material);
     }
-    if let Some(pass) = passphrase {
-        if !pass.is_empty() {
-            store.set_passphrase(account, &pass);
-        }
+    if let Some(pass) = passphrase
+        && !pass.is_empty()
+    {
+        store.set_passphrase(account, &pass);
     }
     vault.save(&store)?;
 
@@ -300,10 +301,7 @@ pub fn cmd_import_key(
         if signing { "signing key" } else { "ssh key" },
         file.display()
     );
-    println!(
-        "  fingerprint: {}",
-        Store::fingerprint(&material)
-    );
+    println!("  fingerprint: {}", Store::fingerprint(&material));
     println!("  the file on disk is now redundant; deleting it is the point of importing");
     Ok(())
 }
@@ -393,7 +391,10 @@ mod tests {
         v.save(&store_with(true, true, false)).unwrap();
         assert!(cmd_remove(&v, "acct", RemoveWhat::Token).is_err());
         let e = v.load().unwrap().entry("acct").unwrap().clone();
-        assert!(e.token.is_some() && e.ssh_key.is_some(), "a refused removal must change nothing");
+        assert!(
+            e.token.is_some() && e.ssh_key.is_some(),
+            "a refused removal must change nothing"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -448,4 +449,3 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-

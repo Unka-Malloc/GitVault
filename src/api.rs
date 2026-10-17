@@ -99,7 +99,6 @@ fn authorize(cfg: &Config, target: &Target, vault: &Vault) -> Result<String> {
                 );
             }
 
-
             // Every authenticated operation requires an open window, reads included.
             //
             // Gating only writes was wrong. A read of a private repository returns
@@ -168,7 +167,10 @@ fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, String)> 
     // JSON object on writes - form encoding is refused by the API. -f values
     // are always strings; -F values are typed literals (true, false, null,
     // numbers, or @file for a file's contents).
-    let is_read = matches!(req.method.to_ascii_uppercase().as_str(), "GET" | "HEAD" | "OPTIONS");
+    let is_read = matches!(
+        req.method.to_ascii_uppercase().as_str(),
+        "GET" | "HEAD" | "OPTIONS"
+    );
     if is_read {
         let query: Vec<String> = req
             .fields
@@ -446,7 +448,10 @@ mod tests {
     #[test]
     fn request_url_keeps_the_token_on_the_api_origin() {
         assert_eq!(request_url("user").unwrap(), "https://api.github.com/user");
-        assert_eq!(request_url("/repos/a/b").unwrap(), "https://api.github.com/repos/a/b");
+        assert_eq!(
+            request_url("/repos/a/b").unwrap(),
+            "https://api.github.com/repos/a/b"
+        );
         assert_eq!(
             request_url("https://api.github.com/user").unwrap(),
             "https://api.github.com/user"
@@ -474,7 +479,10 @@ mod tests {
         // Iteration. Regression: without it a listing could only be reduced to one
         // element, and `.[].name` — the natural way to ask for names — had no
         // equivalent at all.
-        assert_eq!(apply_jq(body, ".items[]").unwrap(), "{\n  \"id\": 7\n}\n{\n  \"id\": 8\n}");
+        assert_eq!(
+            apply_jq(body, ".items[]").unwrap(),
+            "{\n  \"id\": 7\n}\n{\n  \"id\": 8\n}"
+        );
         assert_eq!(apply_jq(body, ".items[].id").unwrap(), "7\n8");
         // `[]` on a non-array is an error, and `.[]` here iterates the *root object*,
         // whose values are not arrays. The correct answer is a refusal, not a guess.
@@ -491,7 +499,10 @@ mod tests {
     fn jq_iteration_refuses_rather_than_guessing() {
         let body = r#"{"items":[{"id":7}]}"#;
         assert!(apply_jq(body, ".items[].nope").is_err());
-        assert!(apply_jq(body, ".login[]").is_err(), "[] on a non-array is an error");
+        assert!(
+            apply_jq(body, ".login[]").is_err(),
+            "[] on a non-array is an error"
+        );
     }
 
     #[test]
@@ -531,6 +542,9 @@ mod tests {
         };
         let repo = Repo::for_test("/tmp/x", Some("git@github.com:Attacker/Repo.git"));
         let outcome = crate::identity::resolve(&cfg, &repo, false).unwrap();
-        assert!(outcome.via_default, "an unrouted repository must not look routed");
+        assert!(
+            outcome.via_default,
+            "an unrouted repository must not look routed"
+        );
     }
 }

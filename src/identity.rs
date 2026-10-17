@@ -78,10 +78,7 @@ fn read_assertion(repo: &Repo, cfg: &Config) -> Result<Option<String>> {
         return Ok(None);
     };
     if !cfg.identities.contains_key(&value) {
-        bail!(
-            "{} names unknown identity '{value}'",
-            path.display()
-        );
+        bail!("{} names unknown identity '{value}'", path.display());
     }
     Ok(Some(value))
 }
@@ -124,10 +121,7 @@ pub fn resolve(cfg: &Config, repo: &Repo, ignore_assertion: bool) -> Result<Outc
     } else if let Some(rule) = owner_rule.clone() {
         (
             rule,
-            format!(
-                "rules.owners['{}']",
-                owner.clone().unwrap_or_default()
-            ),
+            format!("rules.owners['{}']", owner.clone().unwrap_or_default()),
             None,
             false,
         )
@@ -212,8 +206,8 @@ mod tests {
 
     impl AssertingTree {
         fn new(tag: &str, assertion: &str) -> Self {
-            let root = std::env::temp_dir()
-                .join(format!("gv-identity-{tag}-{}", std::process::id()));
+            let root =
+                std::env::temp_dir().join(format!("gv-identity-{tag}-{}", std::process::id()));
             std::fs::create_dir_all(&root).unwrap();
             std::fs::write(root.join(ASSERTION_FILE), format!("{assertion}\n")).unwrap();
             Self { root }

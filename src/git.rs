@@ -101,7 +101,6 @@ impl Repo {
             .filter(|s| !s.is_empty() && s != "HEAD")
     }
 
-
     /// The email git will actually stamp on a commit here.
     ///
     /// This is the value that decides GitHub attribution, and it is NOT
@@ -116,7 +115,6 @@ impl Repo {
             .filter(|s| !s.is_empty())
     }
 
-
     /// Resolve a revision to a commit id; refuses when it does not exist. Used
     /// by the release boundary, where a tag that is not in this checkout means
     /// the content cannot be reviewed from here.
@@ -127,7 +125,6 @@ impl Repo {
         )?;
         Ok(out.trim().to_string())
     }
-
 }
 
 /// The `<owner>/<repo>` portion of a remote across the forms that occur in
@@ -214,11 +211,15 @@ mod tests {
     #[test]
     fn slug_is_owner_slash_repo() {
         assert_eq!(
-            repo_for("git@github.com-acme:acme/launcher.git").slug().as_deref(),
+            repo_for("git@github.com-acme:acme/launcher.git")
+                .slug()
+                .as_deref(),
             Some("acme/launcher")
         );
         assert_eq!(
-            repo_for("https://github.com/platform-org/engine.git").slug().as_deref(),
+            repo_for("https://github.com/platform-org/engine.git")
+                .slug()
+                .as_deref(),
             Some("platform-org/engine")
         );
         assert_eq!(repo_for("https://github.com/acme").slug(), None);

@@ -1,7 +1,0 @@
-name: money-saver
-version: "1.0.0"
-description: "Read-only source, original-request and official-document tools for Money Saver publication-range and full-service audits."
-provides_tools:
-  - money_context
-  - money_official_doc
-  - money_submit_review

@@ -76,6 +76,7 @@ gitvault resolve [DIR] [--json] [--ignore-assertion]
 gitvault checkers [--json]
 gitvault check --event pre-commit --directory DIR [--only NAME]
 gitvault check --event release --tag v1.2.0 --directory DIR
+gitvault check --event release --tag COMMIT_SHA --directory DIR # preflight before creating a tag
 gitvault records list [--json]               # what the gates did, newest first
 gitvault records show RUN_ID [--json]
 gitvault hook pre-commit                     # wired as core.hooksPath
@@ -130,8 +131,10 @@ is documented in [`docs/security-model.md`](docs/security-model.md).
   self-answer. The checker engine itself is platform-neutral; anything that
   touches the vault needs a Mac.
 - `git`, `curl`, `ssh-agent`/`ssh-add` for the SSH path.
-- Python 3 for the bundled checkers under `tools/`; the semantic review stage
-  uses the `pi` agent harness with a provider configured in the synced profile.
+- `gitvault-review` and `gitvault-audit-agent` on PATH for the bundled
+  checkers under `tools/`; the semantic review stage
+  uses OpenCode (`opencode acp`) through A4AA with the runtime declared in the synced profile.
+  Python 3 only when a registered checker uses `kind = "python"`.
 
 ## License
 
@@ -139,26 +142,67 @@ Apache-2.0. See [LICENSE](LICENSE).
 
 ## Agent profiles
 
+The four audit checkers invoke `gitvault-audit-agent`. Each checker is
+materialized as an AwP `Profile` and selected through an AwP `Binding`:
+`money-saver`, `clean-auditor`, `security-enhancer`, and
+`sustainable-maintainer` are distinct `profile:<id>` principals. The profile
+carries its policy, model, effort and explicit published revision; the
+binding carries the current review context. AwP owns role resolution and
+instruction composition. The existing signed registry documents remain
+the source, projected into AwP's native types without a second persisted
+card copy or another profile merge implementation.
+
+The installer writes each checker's declared AwP registry document — the
+`a4aa-opencode` agent spec and the `audit` binding — which the runner loads
+through AwP's standard registry rather than wiring a specific agent itself.
+The engine's role projection supplies the checker's review tools as the
+role's one MCP server, materialized onto the ACP lane by AwP. The review
+engine owns scope, evidence and verdicts; a
+completed turn alone cannot pass a gate. Receipts record the AwP principal and revision;
+receipt reuse and unfinished-run selection also match the role and version.
+
+The declared runtime is OpenCode on a free model,
+`opencode/deepseek-v4.1-flash-free`. Each checker has an isolated XDG home
+with no host configuration, plugins, skills or shell tools; the per-run
+config denies edits, shell, web and sub-agent calls and enables only the
+`opencode` provider wall. Authentication links the operator's existing
+OpenCode sign-in files; no API key is copied into the checker or passed
+through the runner request. Durable session bindings resume unfinished
+reviews of the same target and runtime. Agent failures
+refuse publication; there is no fallback or review deadline.
+Report submission alone does not finalize a review. Recovery resumes the same
+conversation after transport failure, or reuses verified completion evidence
+when only local receipt finalization failed. Unfinished reviews retain their
+progress independently of completed-receipt cleanup.
+
+Build both binaries with `cargo build --release`. Install the runner beside
+`gitvault` on PATH, then run `gitvault-review update --source tools/<checker>`
+for each checker and sync each published OpenCode profile with
+`gitvault-review pull --source tools/<checker>`. The workspace
+uses `a4aa` and `a4aa-opencode` from `../../Adapter-For-All-Agents`, and
+`agents-with-profiles` from `../../Agents-With-Profiles` with default
+features disabled (the OpenCode adapter is the only adapter needed).
+The runner does not access GitHub credentials or the vault.
+
 The prompt and skill each audit agent runs on are hosted in a profile
 registry (`GITVAULT_PROFILES_URL`; the default points at a local development
 registry) and versioned by git tag. A machine installs a version explicitly:
 
 ```sh
-python3 tools/clean-auditor/install.py --pull          # newest published version
-python3 tools/clean-auditor/install.py --pull profile/clean-auditor/v2
+gitvault-review pull --source tools/clean-auditor                          # newest published version
+gitvault-review pull --source tools/clean-auditor --tag profile/clean-auditor/v2
 ```
 
 A profile carries a name, a summary, a tool list, prose and a runtime
-declaration — provider, model and reasoning effort for the semantic review.
+declaration — harness, provider and model for the semantic review.
 There is no field for a command or an argument, so an edit made in a browser
-can change what an agent is *told* and *which provider and credential it runs
-on*, never an executable the machine launches: the profile selects the
-provider and model, and the matching `*_API_KEY` is the one credential passed
-to the Pi child. That is still trusted input — treat the registry as part of
+can change what an agent is *told* and its declared model and reasoning
+settings, never the executable it launches. This implementation accepts only
+OpenCode on a free `opencode/`-namespaced model. The registry remains part of
 the machine's security boundary. The download is verified file by file and as
 a whole before anything is written, and a local edit to a synced document
 makes the checker refuse the operation until it is synced again: a prompt
-this machine edited is not the prompt that was reviewed. `install.py` seeds
+this machine edited is not the prompt that was reviewed. `gitvault-review install` seeds
 the documents only on a machine that has never pulled; after that the
 registry is the source.
 
@@ -181,10 +225,10 @@ identity gate alone on a local commit — are not recorded at all.
 ## Money Saver
 
 [Money Saver](tools/money-saver/README.md) is an operations-cost checker running
-an isolated Pi review on the runtime its synced profile declares. It is registered for
-`pre-push`: the refs a push carries are reviewed once per push, and the engine's
-`pr` event runs the same checker over a pull request's base..head range, so both
-publication boundaries are covered without auditing local commits. The engine also
+an isolated OpenCode review on the runtime its synced profile declares. It is registered for
+`pre-push`: the whole tree at each pushed ref's head is reviewed once per push, and
+the engine's `pr` event judges the same checker at a pull request's head commit, so
+both publication boundaries are covered without auditing local commits. The engine also
 accepts `timeout_secs = 0`
 for reviewers that must be allowed to finish. Installation, evidence requirements,
 checks and privacy verification are documented with the checker.
@@ -193,8 +237,8 @@ checks and privacy verification are documented with the checker.
 
 [Clean Auditor](tools/clean-auditor/README.md) is a blocking privacy and
 confidentiality checker on `pre-push` and `pr`. A local deterministic scan runs
-first over each outgoing range (a refusal there costs no token); only if it
-passes does an isolated Pi conversation judge privacy, business secrets,
+first over the outgoing snapshot (a refusal there costs no token); only if it
+passes does an isolated OpenCode conversation judge privacy, business secrets,
 operational data, machine paths, personal information and credentials. It never
 modifies the repository and never reads a skip switch.
 
@@ -208,7 +252,7 @@ action, a world-writable step, a manifest moving without its lockfile, an ignore
 rule that was protecting a key file). New execution or egress surfaces (an added
 install hook, a URL dependency source, a private address, a plaintext endpoint)
 are recorded and handed to the semantic stage instead of refused. Only if the
-static stage finds no regression does an isolated Pi conversation judge the
+static stage finds no regression does an isolated OpenCode conversation judge the
 seven hardening domains. A release is judged as everything since the previous
 tag, because a release commit is normally already on the default branch.
 
@@ -217,7 +261,7 @@ tag, because a release commit is normally already on the default branch.
 [Sustainable Maintainer](tools/sustainable-maintainer/README.md) is a blocking
 maintainability checker on `pre-push` and `pr`. A local hygiene scan refuses
 conflict markers, merge artifacts and editor/OS junk before any token is spent;
-only if it passes does an isolated Pi conversation judge the six domains —
+only if it passes does an isolated OpenCode conversation judge the six domains —
 structure, contracts, craft, duplication, tests and evolution — and return
 advisory findings with architecture advice for long-term maintainability. It
 never modifies the repository and never reads a skip switch.

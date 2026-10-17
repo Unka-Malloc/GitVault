@@ -274,10 +274,10 @@ impl Config {
                 );
             }
         }
-        if let Some(default) = &self.rules.default {
-            if !self.identities.contains_key(default) {
-                bail!("rules.default names unknown identity '{default}'");
-            }
+        if let Some(default) = &self.rules.default
+            && !self.identities.contains_key(default)
+        {
+            bail!("rules.default names unknown identity '{default}'");
         }
         let mut seen = std::collections::BTreeSet::new();
         for checker in &self.checkers {
@@ -288,8 +288,7 @@ impl Config {
                 bail!("checker '{}' has an empty command", checker.name);
             }
             for event in &checker.on {
-                Event::parse(event)
-                    .with_context(|| format!("checker '{}'", checker.name))?;
+                Event::parse(event).with_context(|| format!("checker '{}'", checker.name))?;
             }
         }
         Ok(())
@@ -344,11 +343,7 @@ command = ["/bin/true"]
         use std::sync::atomic::{AtomicUsize, Ordering};
         static SEQ: AtomicUsize = AtomicUsize::new(0);
         let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "gv-cfg-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let dir = std::env::temp_dir().join(format!("gv-cfg-{}-{}", std::process::id(), n));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         std::fs::write(&path, s).unwrap();
@@ -383,7 +378,10 @@ command = ["/bin/true"]
     #[test]
     fn rejects_an_owner_rule_pointing_at_an_undefined_identity() {
         let bad = BASE.replace("acme = \"acme\"", "acme = \"nobody\"");
-        assert!(parse(&bad).is_err(), "must reject an unknown identity target");
+        assert!(
+            parse(&bad).is_err(),
+            "must reject an unknown identity target"
+        );
     }
 
     #[test]
@@ -395,7 +393,10 @@ command = ["/bin/true"]
     #[test]
     fn rejects_duplicate_checker_names() {
         let bad = format!("{BASE}\n[[checkers]]\nname = \"audit\"\ncommand = [\"/bin/true\"]\n");
-        assert!(parse(&bad).is_err(), "duplicate names would make --only ambiguous");
+        assert!(
+            parse(&bad).is_err(),
+            "duplicate names would make --only ambiguous"
+        );
     }
 
     #[test]
@@ -410,10 +411,19 @@ command = ["/bin/true"]
         // configuration: the operator believes it is on.
         for bad in [
             BASE.replace("[rules]", "[rules]\nunknown_knob = true"),
-            BASE.replace("severity = \"advisory\"", "severity = \"advisory\"\nsevverity = \"blocking\""),
-            BASE.replace("email = \"acme@example.invalid\"", "email = \"acme@example.invalid\"\nworkspace = \"/tmp\""),
+            BASE.replace(
+                "severity = \"advisory\"",
+                "severity = \"advisory\"\nsevverity = \"blocking\"",
+            ),
+            BASE.replace(
+                "email = \"acme@example.invalid\"",
+                "email = \"acme@example.invalid\"\nworkspace = \"/tmp\"",
+            ),
         ] {
-            assert!(parse(&bad).is_err(), "an unknown key must be refused: {bad}");
+            assert!(
+                parse(&bad).is_err(),
+                "an unknown key must be refused: {bad}"
+            );
         }
     }
 
@@ -423,15 +433,24 @@ command = ["/bin/true"]
         // header is parsed as part of that table, and without unknown-key
         // rejection it is dropped without a word.
         let misplaced = BASE.replace("[rules]", "[rules]\nrecord_dir = \"/tmp/runs\"");
-        assert!(parse(&misplaced).is_err(), "a misplaced top-level key must be refused");
+        assert!(
+            parse(&misplaced).is_err(),
+            "a misplaced top-level key must be refused"
+        );
         let placed = format!("record_dir = \"/tmp/runs\"\n{BASE}");
         let cfg = parse(&placed).expect("a top-level key before every header parses");
-        assert_eq!(cfg.record_dir.as_deref(), Some(std::path::Path::new("/tmp/runs")));
+        assert_eq!(
+            cfg.record_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/runs"))
+        );
     }
 
     #[test]
     fn rejects_an_unknown_hook_event() {
-        let bad = BASE.replace("on = [\"pre-commit\", \"pre-push\"]", "on = [\"post-commit\"]");
+        let bad = BASE.replace(
+            "on = [\"pre-commit\", \"pre-push\"]",
+            "on = [\"post-commit\"]",
+        );
         assert!(parse(&bad).is_err());
     }
 }

@@ -30,7 +30,7 @@ tokens or traffic and then throw the completed progress away.
 Before every push and pull request, allow GitVault's mandatory Money Saver checker
 to finish. It audits the outgoing content at the publication boundary; local commits
 never trigger it.
-It runs on Pi Agent under the provider, model and reasoning effort the synced profile declares.
+It runs on OpenCode under the provider, model and reasoning effort the synced profile declares.
 Fix blocking findings within the approved scope, then audit the changed candidate.
 An incomplete or failed audit does not pass. Do not disable hooks/checkers, use
 alternate hooksPath/commit-tree, forge receipts or switch providers to evade review.

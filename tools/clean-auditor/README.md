@@ -1,5 +1,9 @@
 # Clean Auditor
 
+Agent execution uses the shared A4AA-backed `gitvault-audit-agent` runner.
+Build and install it as described in the [GitVault runtime setup](../../README.md#agent-profiles)
+before installing or updating this checker.
+
 Clean Auditor is a blocking GitVault checker that reviews what a push, a pull
 request or a merge request is about to publish, in two stages:
 
@@ -7,8 +11,8 @@ request or a merge request is about to publish, in two stages:
    revision: withheld names over the whole revision, and credential shapes by
    format. One `git grep` answers both, nothing leaves the machine, nothing is
    written, and a refusal here costs no tokens.
-2. **Semantic, isolated Pi review** — only if stage one passes: a fresh,
-   unsaved Pi session over the same immutable range, on the provider/model/effort
+2. **Semantic, isolated OpenCode review** — only if stage one passes: a fresh,
+   durable OpenCode session over the same immutable range, on the provider/model
    the synced `profile.json` declares, judging privacy / business_secret /
    operations_data / machine_path /
    personal_info / credentials, plus the two standing items below.
@@ -20,13 +24,13 @@ environment variable that widens the judgement.
 ## Install
 
 ```sh
-python3 tools/clean-auditor/install.py            # first install
-python3 tools/clean-auditor/install.py --update   # refresh payload and skill links
+gitvault-review install --source tools/clean-auditor            # first install
+gitvault-review update --source tools/clean-auditor   # refresh payload and skill links
 ```
 
 The installer creates the checker's private home `~/.hermes/profiles/clean-auditor`,
-copies the payload (including the `pi-bridge.ts` extension that forwards Pi tool
-calls into the Python `--serve-tools` process), links the shared skill directory `~/.agents/skills/clean-auditor`
+installs the contract payload and writes the checker's declared AwP registry
+document (the audit agent spec and binding the runner resolves), links the shared skill directory `~/.agents/skills/clean-auditor`
 into every agent skill directory it finds, and registers (or replaces in place)
 this entry in `$XDG_CONFIG_HOME/gitvault/config.toml` (or `~/.config/gitvault/config.toml`):
 
@@ -104,9 +108,9 @@ review, and `unknown` cannot pass.
 - `git push --no-verify` skips the `pre-push` hook — git offers no counter to
   it. The boundaries that cannot be bypassed are the ones GitVault itself
   controls: `pr create`, `pr merge`, `release create`.
-- A range with no published content to compare against (a brand-new branch with
-  no remote base) is scanned whole, and the receipt records
-  `fallback: snapshot-no-merge-base`.
+- Every event is scanned whole: the review object is the tree at the
+  operation's head commit, so no later gate can widen what an earlier review
+  passed.
 - The semantic stage is not paid for twice: the deterministic stage runs on
   every operation, but a range that already passed the semantic review is
   reused — for as long as the judged items are the same ones. A receipt written
@@ -125,12 +129,12 @@ is deleted when the run ends.
 ## Syncing a published profile
 
 The prompt and skill this agent runs on are hosted in a profile registry (`GITVAULT_PROFILES_URL`,
-which must be set explicitly; the local development registry is `http://127.0.0.1:8891`) and versioned by git tag. `install.py` seeds them once; after
+which must be set explicitly; the local development registry is `http://127.0.0.1:8891`) and versioned by git tag. `gitvault-review install` seeds them once; after
 that the registry is the source:
 
 ```sh
-python3 tools/clean-auditor/install.py --pull                 # newest published version
-python3 tools/clean-auditor/install.py --pull profile/clean-auditor/v2   # a pinned version
+gitvault-review pull --source tools/clean-auditor                 # newest published version
+gitvault-review pull --source tools/clean-auditor --tag profile/clean-auditor/v2   # a pinned version
 ```
 
 The download is checked file by file (and as a whole, by manifest) before

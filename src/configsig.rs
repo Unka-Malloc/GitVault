@@ -44,7 +44,10 @@ pub const PRINCIPAL: &str = "gitvault-config";
 /// enforcement - the trust root must not follow the file it protects.
 pub fn anchor_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    Path::new(&home).join(".config").join("gitvault").join("config.pub")
+    Path::new(&home)
+        .join(".config")
+        .join("gitvault")
+        .join("config.pub")
 }
 
 /// The signature sidecar for a configuration path.
@@ -75,7 +78,10 @@ pub fn anchor_state(anchor: &Path) -> Anchor {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if std::fs::metadata(anchor).map(|m| m.uid() == 0).unwrap_or(false) {
+        if std::fs::metadata(anchor)
+            .map(|m| m.uid() == 0)
+            .unwrap_or(false)
+        {
             Anchor::Anchored
         } else {
             Anchor::Unanchored

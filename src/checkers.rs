@@ -79,7 +79,10 @@ impl Context {
             .replace("{pr_head}", self.pr_head.as_deref().unwrap_or(""))
             .replace("{pr_number}", self.pr_number.as_deref().unwrap_or(""))
             .replace("{release_tag}", self.release_tag.as_deref().unwrap_or(""))
-            .replace("{release_commit}", self.release_commit.as_deref().unwrap_or(""))
+            .replace(
+                "{release_commit}",
+                self.release_commit.as_deref().unwrap_or(""),
+            )
     }
 }
 
@@ -252,10 +255,10 @@ pub fn run_all(cfg: &Config, ctx: &Context, only: Option<&str>) -> Result<Report
     let run = records::begin(cfg, selected.len());
     let mut report = Report::default();
 
-    if only.is_none() {
-        if let Some(gate) = identity_gate(ctx) {
-            report.outcomes.push(gate);
-        }
+    if only.is_none()
+        && let Some(gate) = identity_gate(ctx)
+    {
+        report.outcomes.push(gate);
     }
 
     // Run the checkers concurrently: they only read the shared snapshot, while
@@ -341,7 +344,10 @@ fn run_one(
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", std::env::var("HOME").unwrap_or_default())
         .env("LANG", std::env::var("LANG").unwrap_or_else(|_| "C".into()))
-        .env("TMPDIR", std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into()))
+        .env(
+            "TMPDIR",
+            std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into()),
+        )
         .env("GITVAULT_EVENT", &ctx.event)
         .env("GITVAULT_IDENTITY", &ctx.identity)
         .env("GITVAULT_REPO", ctx.repo_root.display().to_string())
@@ -349,10 +355,7 @@ fn run_one(
             "GITVAULT_REPO_SLUG",
             ctx.repo_slug.clone().unwrap_or_default(),
         )
-        .env(
-            "GITVAULT_ACCOUNT",
-            ctx.account.clone().unwrap_or_default(),
-        )
+        .env("GITVAULT_ACCOUNT", ctx.account.clone().unwrap_or_default())
         .env(
             "GITVAULT_EMAIL",
             ctx.expected_email.clone().unwrap_or_default(),
@@ -404,12 +407,12 @@ fn run_one(
         Err(e) => return fail(format!("{program}: {e}")),
     };
 
-    if let Some(mut stdin) = child.stdin.take() {
-        if let Some(data) = &ctx.stdin {
-            let _ = stdin.write_all(data.as_bytes());
-        }
-        // Dropping closes the pipe; a checker that reads stdin sees EOF.
+    if let Some(mut stdin) = child.stdin.take()
+        && let Some(data) = &ctx.stdin
+    {
+        let _ = stdin.write_all(data.as_bytes());
     }
+    // Dropping closes the pipe; a checker that reads stdin sees EOF.
 
     // Drain both pipes on separate threads. Reading them after the wait would
     // deadlock as soon as a checker writes more than a pipe buffer holds.
@@ -483,7 +486,11 @@ fn python_safe_path_flag() -> Option<&'static str> {
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    if text.trim() == "True" { Some("-P") } else { None }
+    if text.trim() == "True" {
+        Some("-P")
+    } else {
+        None
+    }
 }
 
 fn tempdir(tag: &str) -> Result<PathBuf> {
@@ -492,12 +499,8 @@ fn tempdir(tag: &str) -> Result<PathBuf> {
         .chars()
         .map(|c| if c == '/' || c == '\\' { '-' } else { c })
         .collect();
-    let dir = PathBuf::from(base).join(format!(
-        "gitvault-checker-{}-{tag}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("cannot create {}", dir.display()))?;
+    let dir = PathBuf::from(base).join(format!("gitvault-checker-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
     Ok(dir)
 }
 
@@ -530,7 +533,10 @@ mod tests {
         let ctx = context();
         assert_eq!(ctx.substitute("{pr_base}..{pr_head}"), "main..feature");
         assert_eq!(ctx.substitute("{repo_slug} {event}"), "Owner/Repo pr");
-        assert_eq!(ctx.substitute("{pr_number}/{release_tag}/{release_commit}"), "7/v1.0.0/c0ffee");
+        assert_eq!(
+            ctx.substitute("{pr_number}/{release_tag}/{release_commit}"),
+            "7/v1.0.0/c0ffee"
+        );
         // An event without a range substitutes empty, never the last range.
         let mut hook = context();
         hook.pr_base = None;

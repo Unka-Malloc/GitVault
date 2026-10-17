@@ -44,12 +44,11 @@ pub fn default_ttl_secs() -> u64 {
     // an arbitrary TTL and one biometric confirmation would cover it forever.
     // A person asking for a longer window passes `gitvault unlock --ttl`, an
     // explicit act - the variable is a test hook in debug builds only.
-    if cfg!(debug_assertions) {
-        if let Ok(v) = std::env::var("GITVAULT_UNLOCK_TTL") {
-            if let Ok(secs) = v.parse() {
-                return secs;
-            }
-        }
+    if cfg!(debug_assertions)
+        && let Ok(v) = std::env::var("GITVAULT_UNLOCK_TTL")
+        && let Ok(secs) = v.parse()
+    {
+        return secs;
     }
     900
 }
@@ -58,10 +57,10 @@ pub fn state_path() -> PathBuf {
     // The state path is fixed in release builds: a path a caller could rewrite
     // is a window record the caller chose the location of. GITVAULT_UNLOCK_STATE
     // remains a test hook in debug builds only, like GITVAULT_TOUCHID.
-    if cfg!(debug_assertions) {
-        if let Ok(explicit) = std::env::var("GITVAULT_UNLOCK_STATE") {
-            return PathBuf::from(explicit);
-        }
+    if cfg!(debug_assertions)
+        && let Ok(explicit) = std::env::var("GITVAULT_UNLOCK_STATE")
+    {
+        return PathBuf::from(explicit);
     }
     crate::config::config_dir().join("unlock-until")
 }
@@ -195,8 +194,8 @@ pub fn ensure_open(
 /// longer needs the window at all. An automated process that cannot reach the
 /// vault key cannot produce a record this gate accepts.
 fn window_mac(key: &[u8], expiry: u64, boot: u64) -> String {
-    use hmac::{Hmac, Mac};
     use hmac::digest::KeyInit;
+    use hmac::{Hmac, Mac};
     use sha2::Sha256;
     let mut mac =
         <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("hmac accepts a key of any length");
@@ -218,15 +217,21 @@ pub fn mark_unlocked(ttl: Duration, key: &[u8]) -> Result<SystemTime> {
     let boot = boot_time().unwrap_or(0);
 
     let path = state_path();
-    if let Some(parent) = path.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent)?;
-            let _ = restrict(parent, 0o700);
-        }
+    if let Some(parent) = path.parent()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent)?;
+        let _ = restrict(parent, 0o700);
     }
     // "<expiry> <boot-time> <hmac>": the boot stamp makes a stale file
     // detectable; the tag makes a fabricated one detectable.
-    std::fs::write(&path, format!("{until_secs} {boot} {}\n", window_mac(key, until_secs, boot)))?;
+    std::fs::write(
+        &path,
+        format!(
+            "{until_secs} {boot} {}\n",
+            window_mac(key, until_secs, boot)
+        ),
+    )?;
     restrict(&path, 0o600)?;
     Ok(until)
 }
@@ -354,9 +359,18 @@ mod tests {
             assert!(remaining(&vault) > 50);
 
             // A forged record — right shape, tag nobody minted — is still locked.
-            let forged = format!("{} {} {}\n", now_secs() + 3600, boot_time().unwrap_or(0), "0".repeat(64));
+            let forged = format!(
+                "{} {} {}\n",
+                now_secs() + 3600,
+                boot_time().unwrap_or(0),
+                "0".repeat(64)
+            );
             std::fs::write(state_path(), forged).unwrap();
-            assert_eq!(remaining(&vault), 0, "a tag the vault key did not mint must lock");
+            assert_eq!(
+                remaining(&vault),
+                0,
+                "a tag the vault key did not mint must lock"
+            );
             // A record minted under a different key is equally void.
             let boot = boot_time().unwrap_or(0);
             let expiry = now_secs() + 3600;
@@ -377,7 +391,11 @@ mod tests {
             let key = b"synthetic-window-key-01234567890";
             let vault = seeded_vault(key);
             let boot = boot_time().unwrap_or(0);
-            std::fs::write(state_path(), format!("1 {boot} {}\n", window_mac(key, 1, boot))).unwrap();
+            std::fs::write(
+                state_path(),
+                format!("1 {boot} {}\n", window_mac(key, 1, boot)),
+            )
+            .unwrap();
             assert_eq!(remaining(&vault), 0);
             assert!(!is_unlocked(&vault));
         });
@@ -417,8 +435,16 @@ mod tests {
             assert_eq!(remaining(&vault), 0);
             // The legacy two-field record predates the integrity tag; it cannot
             // stand in for a window nobody confirmed.
-            std::fs::write(state_path(), format!("{} {}\n", now_secs() + 3600, boot_time().unwrap_or(0))).unwrap();
-            assert_eq!(remaining(&vault), 0, "a record without an integrity tag must lock");
+            std::fs::write(
+                state_path(),
+                format!("{} {}\n", now_secs() + 3600, boot_time().unwrap_or(0)),
+            )
+            .unwrap();
+            assert_eq!(
+                remaining(&vault),
+                0,
+                "a record without an integrity tag must lock"
+            );
         });
     }
 
@@ -435,6 +461,9 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("GITVAULT_TOUCHID", v) },
             None => unsafe { std::env::remove_var("GITVAULT_TOUCHID") },
         }
-        assert!(result.is_err(), "a missing helper must not read as approval");
+        assert!(
+            result.is_err(),
+            "a missing helper must not read as approval"
+        );
     }
 }
