@@ -183,6 +183,17 @@ fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, String)> 
             url.push_str(&format!("{sep}{}", query.join("&")));
         }
     } else if let Some(body) = &req.body {
+        // The API only accepts JSON bodies, so an --input payload gets the
+        // type declared unless the caller already named one - a manual -H
+        // 'Content-Type: ...' would otherwise send the header twice.
+        let content_type_set = req.headers.iter().any(|h| {
+            h.split_once(':')
+                .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("content-type"))
+        });
+        if !content_type_set {
+            args.push("-H".into());
+            args.push("Content-Type: application/json".into());
+        }
         args.push("--data-binary".into());
         args.push(body.clone());
     } else if !req.fields.is_empty() || !req.raw_fields.is_empty() {
@@ -318,7 +329,8 @@ fn prettify(body: &str) -> String {
     }
 }
 
-/// A deliberately tiny subset of jq: dotted paths and array indices.
+/// A deliberately tiny subset of jq: dotted paths, array indices, one `[]`
+/// iterator, and comma-separated branches.
 ///
 /// It exists because agents habitually write `--jq .field`, and failing outright
 /// on that is worse than supporting the common cases. Anything more complex is
@@ -329,6 +341,41 @@ pub fn apply_jq(body: &str, expr: &str) -> Result<String> {
     if expr == "." || expr.is_empty() {
         return Ok(serde_json::to_string_pretty(&v)?);
     }
+    // `a, b` evaluates each branch against the same input and emits one result
+    // per line - the multi-select that create/read responses are asked for.
+    let parts = split_top_level_commas(expr);
+    let mut out = Vec::with_capacity(parts.len());
+    for part in parts {
+        let part = part.trim();
+        if part.is_empty() {
+            bail!("jq: empty branch in comma expression");
+        }
+        out.push(apply_jq_path(&v, part)?);
+    }
+    Ok(out.join("\n"))
+}
+
+/// Commas inside a `[]` selector belong to the selector, not the expression.
+fn split_top_level_commas(expr: &str) -> Vec<&str> {
+    let mut depth = 0i32;
+    let mut last = 0usize;
+    let mut out = Vec::new();
+    for (i, c) in expr.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => depth -= 1,
+            ',' if depth <= 0 => {
+                out.push(&expr[last..i]);
+                last = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&expr[last..]);
+    out
+}
+
+fn apply_jq_path(v: &Value, expr: &str) -> Result<String> {
     // `.[]` maps over an array; everything before it is a path to that array.
     // Without this, listing the names in a response is impossible: `.[].name` is the
     // natural way to ask, and every alternative (`.[0].name`) answers a different
@@ -372,7 +419,7 @@ pub fn apply_jq(body: &str, expr: &str) -> Result<String> {
         segments.push((name, sel));
     }
 
-    let mut cur = &v;
+    let mut cur = v;
     let mut iterate: Option<usize> = None;
     for (i, (name, sel)) in segments.iter().enumerate() {
         if !name.is_empty() {
@@ -487,6 +534,15 @@ mod tests {
         // `[]` on a non-array is an error, and `.[]` here iterates the *root object*,
         // whose values are not arrays. The correct answer is a refusal, not a guess.
         assert!(apply_jq(body, ".[].id").is_err());
+
+        // Comma branches each evaluate against the same input - the multi-select
+        // agents write when reading created resources (`.id, .enforcement`).
+        assert_eq!(apply_jq(body, ".login, .n.deep").unwrap(), "x\n42");
+        assert_eq!(apply_jq(body, ".items[].id, .login").unwrap(), "7\n8\nx");
+        assert!(apply_jq(body, ".login, ").is_err(), "empty branch refuses");
+        // A comma inside `[]` belongs to the selector, so it is never split and
+        // still fails as an unsupported index - never silently two outputs.
+        assert!(apply_jq(body, ".items[0,1].id").is_err());
 
         // The shape that matters for listings: iterate a top-level array and read a
         // field from each element.
