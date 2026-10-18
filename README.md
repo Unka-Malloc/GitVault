@@ -65,6 +65,10 @@ command = ["python3", "-m", "scanner", "scan", "--directory", "{repo}"]
 # (the checked-out or first head); every head still passes the full review.
 # `repos` scopes the row to origin slugs or path prefixes so `cargo test`
 # fires only where Rust lives.
+# `phase` groups rows into ordered pools: one phase runs concurrently, the
+# next starts only when no blocking failure is already on the report, and a
+# skipped row is recorded rather than executed - a refusal that is decided
+# never spends another checker's tokens. Default 0 pools every row.
 [[checkers]]
 name = "verify-cargo"
 kind = "verify"

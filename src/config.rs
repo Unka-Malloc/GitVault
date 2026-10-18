@@ -162,6 +162,12 @@ pub struct Checker {
     /// Extra environment for the checker. `{identity}`-style placeholders apply.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Orchestration phase: rows sharing a phase run concurrently, phases run
+    /// in ascending order, and a blocking failure in an earlier phase skips
+    /// every later phase so a refusal that is already decided never spends
+    /// another checker's tokens. The default 0 keeps every row in one pool.
+    #[serde(default)]
+    pub phase: u32,
 }
 
 impl Checker {

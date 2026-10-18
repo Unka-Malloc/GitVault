@@ -109,11 +109,15 @@ pub enum OutcomeKind {
     Failed(i32),
     Timeout,
     CouldNotRun(String),
+    /// A later-phase checker the gate short-circuited: not a failure - the
+    /// refusal was already decided - and not a pass, just evidence it never
+    /// spent its tokens.
+    Skipped,
 }
 
 impl OutcomeKind {
     fn is_failure(&self) -> bool {
-        !matches!(self, Self::Passed)
+        !matches!(self, Self::Passed | Self::Skipped)
     }
 
     pub(crate) fn label(&self) -> String {
@@ -122,6 +126,7 @@ impl OutcomeKind {
             Self::Failed(code) => format!("failed (exit {code})"),
             Self::Timeout => "timed out".into(),
             Self::CouldNotRun(why) => format!("could not run: {why}"),
+            Self::Skipped => "skipped: an earlier phase refused".into(),
         }
     }
 }
@@ -131,12 +136,16 @@ pub struct Report {
     pub outcomes: Vec<CheckerOutcome>,
 }
 
+fn count_blocking(outcomes: &[CheckerOutcome]) -> usize {
+    outcomes
+        .iter()
+        .filter(|o| o.severity == Severity::Blocking && o.outcome.is_failure())
+        .count()
+}
+
 impl Report {
     pub fn blocking_failures(&self) -> usize {
-        self.outcomes
-            .iter()
-            .filter(|o| o.severity == Severity::Blocking && o.outcome.is_failure())
-            .count()
+        count_blocking(&self.outcomes)
     }
 
     pub fn exit_code(&self) -> std::process::ExitCode {
@@ -155,6 +164,7 @@ impl Report {
         for o in &self.outcomes {
             let mark = match (&o.outcome, o.severity) {
                 (OutcomeKind::Passed, _) => "\x1b[32m✓\x1b[0m",
+                (OutcomeKind::Skipped, _) => "\x1b[2m-\x1b[0m",
                 (_, Severity::Advisory) => "\x1b[33m!\x1b[0m",
                 _ => "\x1b[31m✗\x1b[0m",
             };
@@ -298,30 +308,54 @@ pub fn run_all(
         report.outcomes.extend(crate::history::gates(ctx));
     }
 
-    // Run the checkers concurrently: they only read the shared snapshot, while
-    // joining in registry order keeps the report deterministic and the run
-    // record single-writer. The safe-path probe runs once here rather than once
-    // per thread.
+    // Checkers run per phase: rows sharing a phase run concurrently, phases
+    // ascend, and a blocking checker failure short-circuits every later
+    // phase - a refusal that is decided never spends another checker's
+    // tokens. Built-in gate outcomes deliberately do not short-circuit: a
+    // refused push still wants its audits on the record, and they cost
+    // nothing. Joining in declaration order keeps the report deterministic
+    // and the run record single-writer. The safe-path probe runs once here
+    // rather than once per thread.
     let safe_path = python_safe_path_flag();
-    let mut outcomes: Vec<CheckerOutcome> = std::thread::scope(|s| {
-        selected
-            .iter()
-            .map(|&checker| s.spawn(move || run_one(cfg, ctx, checker, safe_path)))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .zip(selected.iter())
-            .map(|(handle, checker)| {
-                handle.join().unwrap_or_else(|_| CheckerOutcome {
-                    name: checker.name.clone(),
-                    severity: checker.severity,
-                    outcome: OutcomeKind::CouldNotRun("checker thread panicked".into()),
-                    duration_ms: 0,
-                    stdout: String::new(),
-                    stderr: String::new(),
+    let mut phases: std::collections::BTreeMap<u32, Vec<&Checker>> =
+        std::collections::BTreeMap::new();
+    for checker in &selected {
+        phases.entry(checker.phase).or_default().push(*checker);
+    }
+    let mut outcomes: Vec<CheckerOutcome> = Vec::with_capacity(selected.len());
+    for group in phases.values() {
+        if count_blocking(&outcomes) > 0 {
+            outcomes.extend(group.iter().map(|checker| CheckerOutcome {
+                name: checker.name.clone(),
+                severity: checker.severity,
+                outcome: OutcomeKind::Skipped,
+                duration_ms: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            }));
+            continue;
+        }
+        let mut ran: Vec<CheckerOutcome> = std::thread::scope(|s| {
+            group
+                .iter()
+                .map(|&checker| s.spawn(move || run_one(cfg, ctx, checker, safe_path)))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .zip(group.iter())
+                .map(|(handle, checker)| {
+                    handle.join().unwrap_or_else(|_| CheckerOutcome {
+                        name: checker.name.clone(),
+                        severity: checker.severity,
+                        outcome: OutcomeKind::CouldNotRun("checker thread panicked".into()),
+                        duration_ms: 0,
+                        stdout: String::new(),
+                        stderr: String::new(),
+                    })
                 })
-            })
-            .collect()
-    });
+                .collect()
+        });
+        outcomes.append(&mut ran);
+    }
     report.outcomes.append(&mut outcomes);
     if let Some(run) = run {
         records::finish(cfg, run, ctx, &report, routing_sig);
@@ -704,7 +738,7 @@ fn tempdir(tag: &str) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Context, OutcomeKind, run_one, verify_ref};
+    use super::{Context, OutcomeKind, run_all, run_one, verify_ref};
     use crate::config::{Checker, Config, Kind, Severity};
     use std::path::{Path, PathBuf};
 
@@ -873,6 +907,7 @@ mod tests {
                 "test ! -f dirty && git rev-parse HEAD".into(),
             ],
             env: Default::default(),
+            phase: 0,
         };
         let outcome = run_one(&Config::default(), &ctx, &checker, None);
         assert!(
@@ -885,5 +920,72 @@ mod tests {
         let worktrees = git(&repo.0, &["worktree", "list", "--porcelain"]);
         assert_eq!(worktrees.matches("worktree ").count(), 1, "{worktrees}");
         assert!(!repo.0.join(".git/worktrees").exists());
+    }
+
+    /// A blocking refusal in phase 0 short-circuits phase 1: the later
+    /// checker never runs (its marker file proves it) and is reported as
+    /// skipped, which neither passes nor counts as another failure.
+    #[test]
+    fn an_earlier_phase_refusal_skips_later_phases() {
+        let repo = Repo::new();
+        let ctx = ctx_at(&repo, "pre-push");
+        let marker = repo.0.join("later-ran");
+        let row = |name: &str, phase: u32, cmd: &str| Checker {
+            name: name.into(),
+            kind: Kind::Exec,
+            on: vec!["pre-push".into()],
+            severity: Severity::Blocking,
+            timeout_secs: 60,
+            repos: Vec::new(),
+            command: vec!["sh".into(), "-c".into(), cmd.into()],
+            env: Default::default(),
+            phase,
+        };
+        let policy = crate::config::Policy {
+            checkers: vec![
+                row("gate", 0, "exit 3"),
+                row("later", 1, &format!("touch {}", marker.display())),
+            ],
+        };
+        let report = run_all(
+            &Config::default(),
+            &policy,
+            &ctx,
+            &crate::configsig::SigState::Inactive,
+            None,
+        )
+        .unwrap();
+        let later = report
+            .outcomes
+            .iter()
+            .find(|o| o.name == "later")
+            .expect("later outcome");
+        assert!(matches!(later.outcome, OutcomeKind::Skipped));
+        assert!(!marker.exists());
+        assert_eq!(report.blocking_failures(), 1);
+
+        // Same rows, one pool: phase defaults to 0 and both run.
+        let policy = crate::config::Policy {
+            checkers: vec![row("gate", 0, "exit 3"), {
+                let mut later = row("later", 0, &format!("touch {}", marker.display()));
+                later.severity = Severity::Advisory;
+                later
+            }],
+        };
+        let report = run_all(
+            &Config::default(),
+            &policy,
+            &ctx,
+            &crate::configsig::SigState::Inactive,
+            None,
+        )
+        .unwrap();
+        assert!(marker.exists());
+        assert!(
+            report
+                .outcomes
+                .iter()
+                .all(|o| !matches!(o.outcome, OutcomeKind::Skipped))
+        );
     }
 }

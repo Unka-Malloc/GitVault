@@ -2,6 +2,10 @@
 
 ## 0.2.0
 
+- `phase` on a checker row orchestrates the run into ordered pools: rows in
+  one phase run concurrently, later phases start only while no blocking
+  failure exists, and skipped rows are recorded without spending tokens.
+
 - Run the four publication auditors through AwP profiles and bindings over
   A4AA agent specs: the installer materializes each checker's registry
   document from the shared declarative template `tools/registry.json` —
