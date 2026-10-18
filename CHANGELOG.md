@@ -27,6 +27,12 @@
 - Resume interrupted conversations even after report submission, and reuse
   validated completion evidence when only local receipt finalization failed.
   Retain unfinished review progress independently of completed-receipt cleanup.
+- Conceal finished audit conversations from the harness's own session list:
+  each gate run flags every session under the checker's run root with the
+  store's native archive bit — `hidden` on devin's sessions.db,
+  `time_archived` on opencode's session_v2 — so resumable transcripts stop
+  filling the operator's visible session lists. Concealment is best-effort
+  and never gates a run.
 - Remove the superseded Codex/Pi bridges and launcher configuration.
 - Validate annotated release tags against their reviewed commit when checking
   that the published reference has not changed during an audit.

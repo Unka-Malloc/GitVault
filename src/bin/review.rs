@@ -11,6 +11,8 @@
 // beside it in src/bin/ - where Cargo would auto-discover the module as yet
 // another binary. The explicit path keeps the module tree in its own
 // directory.
+#[path = "review/conceal.rs"]
+mod conceal;
 #[path = "review/contract.rs"]
 mod contract;
 #[path = "review/date.rs"]

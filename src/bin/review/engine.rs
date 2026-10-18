@@ -713,7 +713,9 @@ pub fn run(repo: &str, contract_path: &Path) -> Result<i32, String> {
     let settings = load_settings(contract.dir.as_path())?;
     assert_synced(&settings, contract.dir.as_path())?;
     let runtime = declared_runtime(&settings)?;
-    prune_runs(&settings.profile.join(format!("{}-runs", contract.name)));
+    let runs = settings.profile.join(format!("{}-runs", contract.name));
+    prune_runs(&runs);
+    crate::conceal::run_sessions(&runs);
     let targets = ranges::ranges(repo)?;
     if targets.is_empty() {
         println!(
