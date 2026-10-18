@@ -323,6 +323,7 @@ fn audited(
             && report["provider"] == runtime["provider"]
             && report["model"] == runtime["model"]
             && report["reasoning"] == runtime.get("effort").cloned().unwrap_or(Value::Null)
+            && crate::seal::valid(&report)
         {
             return true;
         }
@@ -653,6 +654,15 @@ fn review_target(
         if !target.fallback.is_empty() {
             report["fallback"] = json!(target.fallback);
         }
+        // Seal the receipt into the run history's chain: `audited` reuses a
+        // receipt only when the seal recomputes, so a hand-written
+        // `report.json` must at least join the chain honestly - and a receipt
+        // deleted from the middle leaves a dangling `seal_prev` an operator
+        // can see. Tamper-evidence, not tamper-proofing: the unforgeable
+        // attestation is the `gitvault/audited` status the push hook posts.
+        let seal_prev = crate::seal::latest(&runs, "report.json", Some(&run_dir));
+        report["seal_prev"] = json!(seal_prev);
+        report["seal"] = json!(crate::seal::seal(&seal_prev, &report));
         evidence::write_json(&report_path, &report)?;
         println!(
             "{}: {} — {}",
@@ -717,7 +727,13 @@ pub fn run(repo: &str, contract_path: &Path) -> Result<i32, String> {
         let opts = stage1::Opts {
             withheld_path: None,
         };
-        let (ok, found) = stage1::audit_all(repo, &targets, &stage1_contract.rules, &opts)?;
+        let (ok, found) = stage1::audit_all(
+            repo,
+            &targets,
+            &stage1_contract.rules,
+            &opts,
+            stage1_contract.surfaces,
+        )?;
         let stage_label = stage1_contract.label.as_deref().unwrap_or("deterministic");
         for summary in &found {
             let state = if summary.refused.is_empty() {

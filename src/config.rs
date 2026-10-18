@@ -136,9 +136,10 @@ impl std::fmt::Display for Severity {
 #[serde(deny_unknown_fields)]
 pub struct Checker {
     pub name: String,
-    /// `python` injects safe-path flags; `exec` runs the command verbatim.
-    /// Declaring the kind is what lets the engine apply language-specific
-    /// hardening without the user having to remember it.
+    /// `python` injects safe-path flags; `exec` runs the command verbatim;
+    /// `verify` runs it inside a detached worktree of the publication
+    /// candidate. Declaring the kind is what lets the engine apply
+    /// language-specific hardening without the user having to remember it.
     #[serde(default = "default_kind")]
     pub kind: Kind,
     #[serde(default = "default_event")]
@@ -148,12 +149,32 @@ pub struct Checker {
     #[serde(default = "default_timeout")]
     /// Zero waits for completion without a wall-clock deadline.
     pub timeout_secs: u64,
+    /// Repositories the row applies to, as origin slugs (`owner/repo`) or
+    /// work-tree path prefixes. An empty list applies everywhere. Scoping is
+    /// what lets a signed policy declare `cargo test` for Rust repositories
+    /// without demanding it of every other tree the machine touches.
+    #[serde(default)]
+    pub repos: Vec<String>,
     /// Command and arguments. Placeholders are substituted from the run context:
-    /// `{repo}`, `{event}`, `{identity}`, `{account}`, `{email}`.
+    /// `{repo}`, `{event}`, `{identity}`, `{account}`, `{email}`, and for a
+    /// `verify` row `{verify_head}` (the candidate revision it exercises).
     pub command: Vec<String>,
     /// Extra environment for the checker. `{identity}`-style placeholders apply.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+}
+
+impl Checker {
+    /// Whether the row is scoped to this repository: an empty `repos` applies
+    /// everywhere, otherwise any entry equal to the origin slug or a path
+    /// prefix of the repository root selects it.
+    pub fn applies_to(&self, slug: Option<&str>, root: &Path) -> bool {
+        self.repos.is_empty()
+            || self
+                .repos
+                .iter()
+                .any(|r| Some(r.as_str()) == slug || root.starts_with(r))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -162,6 +183,12 @@ pub enum Kind {
     #[default]
     Exec,
     Python,
+    /// Runs inside a worktree of the candidate revision: the signed policy -
+    /// never the repository - declares the command, and its exit status is
+    /// the correctness evidence for what is about to publish. This is the one
+    /// kind allowed a repository working directory, because a build or test
+    /// cannot run from a neutral one.
+    Verify,
 }
 
 fn default_kind() -> Kind {
@@ -601,6 +628,39 @@ command = ["/bin/true"]
         assert_eq!(policy.checkers_for(Event::Pr).len(), 1);
         assert_eq!(policy.checkers_for(Event::Pr)[0].name, "advisory");
         assert_eq!(policy.checkers_for(Event::PrePush).len(), 1);
+    }
+
+    /// A `verify` row is the only kind that runs in a repository worktree, so
+    /// `repos` is what keeps a signed `cargo test` from firing on trees that
+    /// are not Rust. Scoping must match on slug or path prefix and refuse
+    /// everywhere else.
+    #[test]
+    fn a_verify_row_scopes_to_named_repositories() {
+        let policy = parse_policy(
+            r#"
+[[checkers]]
+name = "verify-cargo"
+kind = "verify"
+on = ["pre-push"]
+repos = ["Owner/Repo", "/opt/rusty"]
+command = ["cargo", "test"]
+
+[[checkers]]
+name = "verify-any"
+kind = "verify"
+on = ["pre-push"]
+command = ["/bin/true"]
+"#,
+        )
+        .expect("valid policy");
+        let scoped = &policy.checkers[0];
+        assert_eq!(scoped.kind, super::Kind::Verify);
+        assert!(scoped.applies_to(Some("Owner/Repo"), std::path::Path::new("/x")));
+        assert!(scoped.applies_to(Some("Other/Repo"), std::path::Path::new("/opt/rusty/sub")));
+        assert!(!scoped.applies_to(Some("Other/Repo"), std::path::Path::new("/x")));
+        // An empty repos list applies everywhere - it is the default, not an
+        // opt-out the row has to spell.
+        assert!(policy.checkers[1].applies_to(Some("Any/Repo"), std::path::Path::new("/x")));
     }
 
     #[test]

@@ -85,12 +85,7 @@ impl Repo {
     /// `Owner/Repo` slug parsed from the origin remote, which is what external
     /// tooling (the audit scanner, for one) expects as a repository identifier.
     pub fn slug(&self) -> Option<String> {
-        let path = remote_path(self.remote.as_deref()?)?;
-        let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
-        if parts.len() < 2 {
-            return None;
-        }
-        Some(format!("{}/{}", parts[0], parts[1]))
+        slug_from_remote(self.remote.as_deref()?)
     }
 
     /// Short name of the checked-out branch, or None when detached.
@@ -127,6 +122,17 @@ impl Repo {
     }
 }
 
+/// `Owner/Repo` parsed out of a remote URL - the same extraction `Repo::slug`
+/// performs on a discovered checkout, for callers holding a URL not a handle.
+pub fn slug_from_remote(url: &str) -> Option<String> {
+    let path = remote_path(url)?;
+    let parts: Vec<&str> = path.split('/').filter(|p| !p.is_empty()).collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    Some(format!("{}/{}", parts[0], parts[1]))
+}
+
 /// The `<owner>/<repo>` portion of a remote across the forms that occur in
 /// the wild: `scheme://[user@]host[:port]/owner/repo` and the scp-like
 /// `user@host:owner/repo`.
@@ -150,6 +156,41 @@ pub fn parse_owner(remote: &str) -> Option<String> {
     // Require a repository component: "github.com/foo" alone is not owner/repo.
     parts.next()?;
     Some(owner.to_string())
+}
+
+/// Resolve a revision to a commit id inside `dir`, or None when it does not
+/// exist. The free-function form of `Repo::resolve_commit` for callers that
+/// hold a path rather than a handle.
+pub fn commit_at(dir: &Path, revision: &str) -> Option<String> {
+    let out = git(
+        dir,
+        &["rev-parse", "--verify", &format!("{revision}^{{commit}}")],
+    )
+    .ok()?;
+    let trimmed = out.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Whether any ref under `refs` reaches `commit` - the shared "already
+/// published" probe. The audit range filter asks about every remote mirror
+/// (`refs/remotes`); the attestation skip asks only about the remote the
+/// push targets (`refs/remotes/<remote>`), since the status it would post
+/// lives on that repository, not on an unrelated one.
+pub fn refs_containing(dir: &Path, commit: &str, refs: &[&str]) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "for-each-ref",
+            "--count=1",
+            "--contains",
+            commit,
+            "--format=%(refname)",
+        ])
+        .args(refs)
+        .output()
+        .map(|out| !String::from_utf8_lossy(&out.stdout).trim().is_empty())
+        .unwrap_or(false)
 }
 
 fn git(directory: &Path, args: &[&str]) -> Result<String> {

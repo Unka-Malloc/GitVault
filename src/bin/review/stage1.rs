@@ -297,6 +297,15 @@ fn default_withheld_path() -> PathBuf {
 /// returns the matched text: a refusal must be actionable without repeating
 /// the secret, and the developer can read their own line. `git grep -I`
 /// skips a blob when the first 8000 bytes hold a NUL; this scan does the same.
+///
+/// Two scans over two different objects:
+///
+/// * the head tree - what the publication looks like;
+/// * the `base..head` object range - every blob the push *introduces to
+///   history*. A credential committed in one commit and removed in a later
+///   commit of the same push is absent from the head tree but ships in the
+///   published history forever. Without this second scan the deterministic
+///   stage could not see it at all.
 fn clean_audit(repo: &str, target: &Target, opts: &Opts) -> Result<(String, Vec<Hit>), String> {
     let names = withheld_names(opts.withheld_path.as_ref(), &origin_slug(repo));
     let mut patterns: Vec<(&str, Regex)> = Vec::new();
@@ -315,6 +324,7 @@ fn clean_audit(repo: &str, target: &Target, opts: &Opts) -> Result<(String, Vec<
         ));
     }
     let mut hits = Vec::new();
+    let mut scanned: std::collections::HashSet<String> = Default::default();
     for record in git(repo, &["ls-tree", "-rz", &target.head])?
         .stdout
         .split(|byte| *byte == 0)
@@ -328,6 +338,9 @@ fn clean_audit(repo: &str, target: &Target, opts: &Opts) -> Result<(String, Vec<
         };
         if !metadata.starts_with("100644 ") && !metadata.starts_with("100755 ") {
             continue;
+        }
+        if let Some(oid) = metadata.split_whitespace().nth(2) {
+            scanned.insert(oid.to_string());
         }
         let blob = git(
             repo,
@@ -347,12 +360,104 @@ fn clean_audit(repo: &str, target: &Target, opts: &Opts) -> Result<(String, Vec<
                 rule: rule.to_string(),
                 remedy: None,
             });
-            if hits.len() >= 20 {
+            if hits.len() >= MAX_HITS {
                 break;
             }
         }
-        if hits.len() >= 20 {
+        if hits.len() >= MAX_HITS {
             break;
+        }
+    }
+    // The history pass: blobs the range adds that the head-tree pass did not
+    // already scan. `rev-list --objects` lists "<sha> <path>" for trees and
+    // blobs reachable from head but not base; commits carry no path. A first
+    // publication has no base, and then the head's whole history is the range
+    // - a first push can orphan credentials exactly like a later one.
+    {
+        let range = target
+            .base
+            .as_deref()
+            .filter(|b| !b.is_empty())
+            .map(|base| format!("{base}..{}", target.head))
+            .unwrap_or_else(|| target.head.clone());
+        let objects = git(repo, &["rev-list", "--objects", &range])?;
+        let mut blobs: Vec<(String, String)> = Vec::new();
+        for line in String::from_utf8_lossy(&objects.stdout).lines() {
+            let mut parts = line.splitn(2, ' ');
+            let Some(oid) = parts.next() else { continue };
+            let path = parts.next().unwrap_or("");
+            if !oid.is_empty() && !scanned.contains(oid) {
+                blobs.push((oid.to_string(), path.to_string()));
+            }
+        }
+        // Blob-or-tree is settled by cat-file --batch-check in one process
+        // rather than one probe per object. The oid list goes through a file:
+        // piped stdin plus wait_with_output deadlocks once the list outgrows
+        // the pipe buffer - the child stalls writing stdout nobody reads
+        // while the parent stalls writing stdin nobody drains.
+        if !blobs.is_empty() {
+            let list = std::env::temp_dir().join(format!(
+                "gv-oids-{}-{:04x}",
+                std::process::id(),
+                rand::random::<u16>()
+            ));
+            {
+                use std::io::Write as _;
+                let mut file = std::fs::File::create(&list)
+                    .map_err(|e| format!("Git could not read the review snapshot: {e}"))?;
+                for (oid, _) in &blobs {
+                    let _ = writeln!(file, "{oid}");
+                }
+            }
+            let checked = std::fs::File::open(&list)
+                .map_err(|e| format!("Git could not read the review snapshot: {e}"))
+                .and_then(|input| {
+                    Command::new("git")
+                        .arg("-C")
+                        .arg(repo)
+                        .args(["cat-file", "--batch-check=%(objectname) %(objecttype)"])
+                        .stdin(std::process::Stdio::from(input))
+                        .output()
+                        .map_err(|e| format!("Git could not read the review snapshot: {e}"))
+                });
+            let _ = std::fs::remove_file(&list);
+            let checked = checked?;
+            let is_blob: std::collections::HashSet<String> =
+                String::from_utf8_lossy(&checked.stdout)
+                    .lines()
+                    .filter(|l| l.ends_with(" blob"))
+                    .filter_map(|l| l.split(' ').next().map(str::to_string))
+                    .collect();
+            'objects: for (oid, path) in blobs {
+                if !is_blob.contains(&oid) {
+                    continue;
+                }
+                let blob = git(repo, &["cat-file", "blob", &oid])?;
+                if is_binary(&blob.stdout, 8000) {
+                    continue;
+                }
+                let label = if path.is_empty() {
+                    format!("history-blob {oid}")
+                } else {
+                    format!("{path} (range blob {oid})")
+                };
+                for (number, line) in String::from_utf8_lossy(&blob.stdout).lines().enumerate() {
+                    let Some((rule, _)) =
+                        patterns.iter().find(|(_, pattern)| pattern.is_match(line))
+                    else {
+                        continue;
+                    };
+                    hits.push(Hit {
+                        path: label.clone(),
+                        line: number as u64 + 1,
+                        rule: rule.to_string(),
+                        remedy: None,
+                    });
+                    if hits.len() >= MAX_HITS {
+                        break 'objects;
+                    }
+                }
+            }
         }
     }
     let refused = if hits.iter().any(|hit| hit.rule == "withheld-name") {
@@ -388,6 +493,9 @@ static BINARY_HINT: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 const MAX_FILE_BYTES: usize = 2 * 1024 * 1024;
+/// Reported hits are capped so a flooded report stays readable; the cap is one
+/// constant because the tree pass and the range-blob pass share the budget.
+const MAX_HITS: usize = 20;
 
 fn junk_name_hit(path: &str) -> &'static str {
     if MERGE_ARTIFACT.is_match(path) {
@@ -417,6 +525,102 @@ fn marker_lines(content: &[u8]) -> Vec<u64> {
     sides
 }
 
+/// The paths the range actually touched - added, modified or deleted - or
+/// None when the target carries no base to diff against, meaning everything
+/// outgoing is new. Snapshot-scoped targets still carry a base when the
+/// operation knows one, so this works under either scope.
+fn changed_paths(
+    repo: &str,
+    target: &Target,
+) -> Result<Option<std::collections::HashSet<String>>, String> {
+    let Some(base) = target.base.as_deref().filter(|b| !b.is_empty()) else {
+        return Ok(None);
+    };
+    let output = git(
+        repo,
+        &[
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            base,
+            &target.head,
+        ],
+    )?;
+    Ok(Some(
+        String::from_utf8_lossy(&output.stdout)
+            .split('\0')
+            .filter(|path| !path.is_empty())
+            .map(str::to_string)
+            .collect(),
+    ))
+}
+
+/// Paths matching `kind` that the range touched. With a base, the changed set
+/// is authoritative - it also names deletions the head tree no longer lists;
+/// without one, every outgoing path is new by definition.
+fn range_touched(
+    changed: &Option<std::collections::HashSet<String>>,
+    paths: &[String],
+    kind: fn(&str) -> bool,
+) -> Vec<String> {
+    let mut found: Vec<String> = match changed {
+        Some(set) => set.iter().filter(|p| kind(p)).cloned().collect(),
+        None => paths.iter().filter(|p| kind(p.as_str())).cloned().collect(),
+    };
+    found.sort();
+    found
+}
+
+/// Files an agent host reads as standing instructions or wiring: in this
+/// workflow repository text IS executable, so a change here is reviewed as an
+/// injection surface, not as documentation.
+fn is_instruction_channel(path: &str) -> bool {
+    const DIRS: [&str; 9] = [
+        ".agents/",
+        ".claude/",
+        ".codex/",
+        ".continue/",
+        ".cursor/",
+        ".devin/",
+        ".githooks/",
+        ".opencode/",
+        ".windsurf/",
+    ];
+    if DIRS
+        .iter()
+        .any(|d| path.starts_with(d) || path.contains(&format!("/{d}")))
+    {
+        return true;
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.eq_ignore_ascii_case("agents.md")
+        || name.eq_ignore_ascii_case("claude.md")
+        || name.eq_ignore_ascii_case("gemini.md")
+        || name.eq_ignore_ascii_case("skill.md")
+        || matches!(
+            name,
+            ".cursorrules" | ".windsurfrules" | ".mcp.json" | "mcp.json" | "mcp.toml"
+        )
+}
+
+/// Files whose change IS a published-interface change: wire contracts,
+/// schemas and migration histories. The semantic stage adjudicates them; the
+/// static stage only guarantees they are never silently overlooked.
+fn is_interface_surface(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path).to_lowercase();
+    name.ends_with(".proto")
+        || name.ends_with(".graphql")
+        || name.ends_with(".thrift")
+        || name.ends_with(".avsc")
+        || name.ends_with(".avdl")
+        || name.ends_with(".d.ts")
+        || name.ends_with(".schema.json")
+        || name.starts_with("openapi")
+        || name.starts_with("swagger")
+        || path.split('/').any(|part| part == "migrations")
+}
+
 /// The paths the operation removes: a deletion is never a finding.
 fn deleted_paths(repo: &str, target: &Target) -> Result<std::collections::HashSet<String>, String> {
     if target.scope != "range" {
@@ -441,10 +645,34 @@ fn deleted_paths(repo: &str, target: &Target) -> Result<std::collections::HashSe
         .collect())
 }
 
-fn maintainer_audit(repo: &str, target: &Target) -> Result<Vec<Hit>, String> {
+fn maintainer_audit(
+    repo: &str,
+    target: &Target,
+    with_surfaces: bool,
+) -> Result<(Vec<Hit>, Vec<Hit>), String> {
     let mut hits = Vec::new();
     let deleted = deleted_paths(repo, target)?;
-    for path in outgoing_paths(repo, target)? {
+    let paths = outgoing_paths(repo, target)?;
+    // Published-interface changes the range touches are surfaced for the
+    // semantic stage to adjudicate: a migration, a schema or a versioned wire
+    // contract that moved must be answered, not merely noticed. A contract
+    // that does not echo surfaces has no consumer for the diff, so it is not
+    // computed - an empty set, not None, since None means "all paths are new".
+    let changed = if with_surfaces {
+        changed_paths(repo, target)?
+    } else {
+        Some(Default::default())
+    };
+    let surfaces: Vec<Hit> = range_touched(&changed, &paths, is_interface_surface)
+        .into_iter()
+        .map(|path| Hit {
+            path,
+            line: 1,
+            rule: "surface/interface-change".into(),
+            remedy: remedy("surface/interface-change"),
+        })
+        .collect();
+    for path in paths {
         if deleted.contains(&path) {
             continue;
         }
@@ -482,7 +710,7 @@ fn maintainer_audit(repo: &str, target: &Target) -> Result<Vec<Hit>, String> {
             });
         }
     }
-    Ok(hits)
+    Ok((hits, surfaces))
 }
 
 // ---------------------------------------------------------------------------
@@ -563,6 +791,12 @@ fn remedy(rule: &str) -> Option<&'static str> {
         }
         "surface/plaintext-endpoint" => {
             "confirm this plaintext endpoint is intended -- the semantic review will judge it"
+        }
+        "surface/instruction-channel" => {
+            "this file is read as standing instructions by agent hosts -- confirm the change is intended and not an injected directive"
+        }
+        "surface/interface-change" => {
+            "this change touches a published interface -- confirm a migration or version bump answers it"
         }
         _ => return None,
     })
@@ -958,7 +1192,11 @@ fn lockfiles_for(manifest: &str) -> &'static [&'static str] {
     }
 }
 
-fn security_audit(repo: &str, target: &Target) -> Result<(Vec<Hit>, Vec<Hit>), String> {
+fn security_audit(
+    repo: &str,
+    target: &Target,
+    with_surfaces: bool,
+) -> Result<(Vec<Hit>, Vec<Hit>), String> {
     let mut regressions = Vec::new();
     let mut surfaces = Vec::new();
     let paths: Vec<String> = outgoing_paths(repo, target)?
@@ -966,6 +1204,14 @@ fn security_audit(repo: &str, target: &Target) -> Result<(Vec<Hit>, Vec<Hit>), S
         .filter(|path| !is_skipped(path))
         .collect();
     let rules = line_rules();
+    // The changed-set feeds only surface classification; a contract that
+    // does not echo surfaces has no consumer for the diff. An empty set, not
+    // None, since None means "all paths are new".
+    let changed = if with_surfaces {
+        changed_paths(repo, target)?
+    } else {
+        Some(Default::default())
+    };
 
     // Files whose mere presence or newness is the finding.
     for path in &paths {
@@ -986,6 +1232,17 @@ fn security_audit(repo: &str, target: &Target) -> Result<(Vec<Hit>, Vec<Hit>), S
                 remedy: remedy("surface/install-hook-added"),
             });
         }
+    }
+
+    // Instruction-channel changes - agent-facing directives and harness
+    // wiring - are adjudicated by the semantic stage, and deletions count.
+    for path in range_touched(&changed, &paths, is_instruction_channel) {
+        surfaces.push(Hit {
+            path,
+            line: 1,
+            rule: "surface/instruction-channel".into(),
+            remedy: remedy("surface/instruction-channel"),
+        });
     }
 
     // A manifest that moves without the lockfile the repository keeps beside it.
@@ -1285,7 +1542,16 @@ fn regex_hits(repo: &str, target: &Target, rule: &Rule) -> Result<Vec<Hit>, Stri
 }
 
 /// One range under one contract's stage-1 rules, in contract order.
-pub fn audit(repo: &str, target: &Target, rules: &[Rule], opts: &Opts) -> Result<Summary, String> {
+/// `with_surfaces` is the contract's own `surfaces` declaration: a checker
+/// that did not opt into surface reporting does not emit the key, whatever
+/// its builtins collected.
+pub fn audit(
+    repo: &str,
+    target: &Target,
+    rules: &[Rule],
+    opts: &Opts,
+    with_surfaces: bool,
+) -> Result<Summary, String> {
     let mut hits = Vec::new();
     let mut surfaces: Option<Vec<Hit>> = None;
     let mut status = "clean".to_string();
@@ -1318,7 +1584,8 @@ pub fn audit(repo: &str, target: &Target, rules: &[Rule], opts: &Opts) -> Result
                     }
                 }
                 "maintainer-hygiene" => {
-                    let found = maintainer_audit(repo, target)?;
+                    let (found, found_surfaces) = maintainer_audit(repo, target, with_surfaces)?;
+                    surfaces.get_or_insert_with(Vec::new).extend(found_surfaces);
                     if !found.is_empty() {
                         status = "refused".into();
                         if refused.is_empty() {
@@ -1328,7 +1595,8 @@ pub fn audit(repo: &str, target: &Target, rules: &[Rule], opts: &Opts) -> Result
                     }
                 }
                 "security-static-checklist" => {
-                    let (regressions, found_surfaces) = security_audit(repo, target)?;
+                    let (regressions, found_surfaces) =
+                        security_audit(repo, target, with_surfaces)?;
                     surfaces.get_or_insert_with(Vec::new).extend(found_surfaces);
                     if !regressions.is_empty() {
                         status = "regression".into();
@@ -1354,7 +1622,7 @@ pub fn audit(repo: &str, target: &Target, rules: &[Rule], opts: &Opts) -> Result
         fallback: target.fallback.clone(),
         status,
         hits,
-        surfaces,
+        surfaces: if with_surfaces { surfaces } else { None },
         refused,
     })
 }
@@ -1366,10 +1634,11 @@ pub fn audit_all(
     targets: &[Target],
     rules: &[Rule],
     opts: &Opts,
+    with_surfaces: bool,
 ) -> Result<(bool, Vec<Summary>), String> {
     let mut summaries = Vec::new();
     for target in targets {
-        let summary = audit(repo, target, rules, opts)?;
+        let summary = audit(repo, target, rules, opts, with_surfaces)?;
         let refused = !summary.refused.is_empty();
         summaries.push(summary);
         if refused {
@@ -1381,7 +1650,10 @@ pub fn audit_all(
 
 #[cfg(test)]
 mod tests {
-    use super::{in_scope, marker_lines, name_pattern};
+    use super::{
+        Hit, clean_audit, in_scope, is_instruction_channel, is_interface_surface, marker_lines,
+        name_pattern, security_audit,
+    };
     use base64::Engine as _;
 
     #[test]
@@ -1559,6 +1831,7 @@ mod tests {
                     std::slice::from_ref(&target),
                     rules,
                     &opts,
+                    contract.stage1.as_ref().is_some_and(|s| s.surfaces),
                 )
                 .unwrap();
                 let produced = json!({
@@ -1568,5 +1841,164 @@ mod tests {
                 assert_eq!(produced, expected[name][checker], "{name}/{checker}");
             }
         }
+    }
+
+    // -- the range-aware behaviors the corpus cannot express -----------------
+
+    fn commit_all(root: &Path, message: &str) -> String {
+        git(root, &["add", "-A"]);
+        git(root, &["commit", "-qm", message]);
+        git(root, &["rev-parse", "HEAD"])
+    }
+
+    fn range_target(base: String, head: String) -> Target {
+        Target {
+            kind: "push".to_string(),
+            label: "range".to_string(),
+            scope: "range".to_string(),
+            base: Some(base),
+            head,
+            ref_: None,
+            fallback: String::new(),
+        }
+    }
+
+    /// A credential committed inside the range and deleted again before the
+    /// head is still published history: the head-tree pass cannot see it, so
+    /// the range-blob pass is what must not miss it.
+    #[test]
+    fn a_secret_removed_inside_the_range_is_still_scanned() {
+        let guard = CaseDir(std::env::temp_dir().join(format!(
+            "gv-range-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )));
+        let root = &guard.0;
+        std::fs::create_dir_all(root).unwrap();
+        git(root, &["init", "-q"]);
+        git(root, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("app.py"), "x = 1\n").unwrap();
+        let base = commit_all(root, "base");
+        // AWS's own documentation example key, base64-carried so this file
+        // never holds the shape the gate scans for.
+        let secret = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode("YXdzID0gIkFLSUFJT1NGT0ROTjdFWEFNUExFIgo=")
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join("leak.py"), secret).unwrap();
+        commit_all(root, "middle");
+        std::fs::remove_file(root.join("leak.py")).unwrap();
+        let head = commit_all(root, "head");
+
+        let target = range_target(base, head);
+        let opts = Opts {
+            withheld_path: None,
+        };
+        let (_, hits) = clean_audit(root.to_str().unwrap(), &target, &opts).unwrap();
+        assert!(
+            hits.iter()
+                .any(|h| h.rule == "aws-access-key" && h.path.contains("range blob")),
+            "the middle commit's blob is scanned: {}",
+            hits.iter()
+                .map(|h| format!("{}:{}", h.path, h.rule))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    /// `gv-allow:<rule>` demotes a blocking security hit into a surfaced
+    /// notice - visible, never hidden - while the same line unsuppressed stays
+    /// a regression.
+    #[test]
+    fn gv_allow_demotes_a_blocking_hit_to_a_visible_surface() {
+        let guard = CaseDir(std::env::temp_dir().join(format!(
+            "gv-allow-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )));
+        let root = &guard.0;
+        std::fs::create_dir_all(root).unwrap();
+        git(root, &["init", "-q"]);
+        git(root, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("app.py"), "x = 1\n").unwrap();
+        let base = commit_all(root, "base");
+        // The trigger lines ride base64-encoded, the corpus convention: this
+        // repository's own tree must never hold the shape its gate scans for.
+        let b64 = |s: &str| {
+            String::from_utf8(base64::engine::general_purpose::STANDARD.decode(s).unwrap()).unwrap()
+        };
+        std::fs::write(
+            root.join("suppressed.py"),
+            b64("ciA9IGdldCh1cmwsIHZlcmlmeSA9IEZhbHNlKSAgIyBndi1hbGxvdzpydW50aW1lL3Rscy12ZXJpZmljYXRpb24tZGlzYWJsZWQK"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("raw.py"),
+            b64("ciA9IGdldCh1cmwsIHZlcmlmeSA9IEZhbHNlKQo="),
+        )
+        .unwrap();
+        let head = commit_all(root, "head");
+
+        let target = range_target(base, head);
+        let (regressions, surfaces) =
+            security_audit(root.to_str().unwrap(), &target, true).unwrap();
+        let seen = |hits: &[Hit]| {
+            hits.iter()
+                .map(|h| format!("{}:{}", h.path, h.rule))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        assert!(
+            surfaces.iter().any(|h| {
+                h.rule == "suppressed/runtime/tls-verification-disabled"
+                    && h.path == "suppressed.py"
+            }),
+            "the suppression is a visible surface: {}",
+            seen(&surfaces)
+        );
+        assert_eq!(
+            regressions
+                .iter()
+                .filter(|h| h.rule == "runtime/tls-verification-disabled")
+                .map(|h| h.path.as_str())
+                .collect::<Vec<_>>(),
+            ["raw.py"],
+            "only the unsuppressed line regresses: {}",
+            seen(&regressions)
+        );
+    }
+
+    #[test]
+    fn instruction_and_interface_surfaces_are_classified() {
+        for path in [
+            "AGENTS.md",
+            "docs/claude.md",
+            "tools/x/SKILL.md",
+            ".claude/settings.json",
+            ".devin/skills/x.md",
+            "lib/.mcp.json",
+            "mcp.toml",
+        ] {
+            assert!(is_instruction_channel(path), "instruction: {path}");
+        }
+        assert!(!is_instruction_channel("src/main.rs"));
+        assert!(!is_instruction_channel("docs/agent-notes.txt"));
+
+        for path in [
+            "api/v2.proto",
+            "web/schema.graphql",
+            "include/types.d.ts",
+            // The repository's own published contract schema is itself an
+            // interface surface.
+            "docs/review-contract.schema.json",
+            "db/migrations/0042_init.sql",
+            "openapi.yaml",
+        ] {
+            assert!(is_interface_surface(path), "interface: {path}");
+        }
+        assert!(!is_interface_surface("src/api.rs"));
+        assert!(!is_interface_surface("docs/notes.json"));
     }
 }

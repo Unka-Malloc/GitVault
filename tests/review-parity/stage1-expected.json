@@ -117,7 +117,8 @@
               "rule": "conflict-marker"
             }
           ],
-          "refused": "conflict-marker"
+          "refused": "conflict-marker",
+          "surfaces": []
         }
       ]
     }
@@ -149,7 +150,8 @@
               "rule": "os-junk"
             }
           ],
-          "refused": "os-junk"
+          "refused": "os-junk",
+          "surfaces": []
         }
       ]
     }
@@ -165,7 +167,8 @@
           "status": "clean",
           "findings": 0,
           "hits": [],
-          "refused": ""
+          "refused": "",
+          "surfaces": []
         }
       ]
     }
@@ -181,7 +184,8 @@
           "status": "clean",
           "findings": 0,
           "hits": [],
-          "refused": ""
+          "refused": "",
+          "surfaces": []
         }
       ]
     }
@@ -554,7 +558,8 @@
               "rule": "conflict-marker"
             }
           ],
-          "refused": "os-junk"
+          "refused": "os-junk",
+          "surfaces": []
         }
       ]
     }

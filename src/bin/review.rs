@@ -23,6 +23,11 @@ mod engine;
 mod evidence;
 #[path = "review/fullservice.rs"]
 mod fullservice;
+// The review binary shares the main crate's git helpers and exercises only
+// the reachability probe - the rest of the module stays for that crate.
+#[allow(dead_code)]
+#[path = "../git.rs"]
+mod git;
 #[path = "review/install.rs"]
 mod install;
 #[path = "review/manifest.rs"]
@@ -31,6 +36,8 @@ mod manifest;
 mod ranges;
 #[path = "review/sanitize.rs"]
 mod sanitize;
+#[path = "../seal.rs"]
+mod seal;
 #[path = "review/serve.rs"]
 mod serve;
 #[path = "review/stage1.rs"]
@@ -278,7 +285,13 @@ fn main() -> ExitCode {
                 let opts = stage1::Opts {
                     withheld_path: withheld,
                 };
-                match stage1::audit_all(&repo.to_string_lossy(), &[target], rules, &opts) {
+                match stage1::audit_all(
+                    &repo.to_string_lossy(),
+                    &[target],
+                    rules,
+                    &opts,
+                    contract.stage1.as_ref().is_some_and(|s| s.surfaces),
+                ) {
                     Ok((ok, summaries)) => {
                         let json: Vec<_> = summaries.iter().map(|s| s.to_json()).collect();
                         println!(

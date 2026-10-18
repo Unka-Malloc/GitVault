@@ -185,8 +185,8 @@ fn the_gate_reviews_once_then_reuses_the_receipt() {
     assert!(stdout.contains("Sample Gate: pass — clean"), "{stdout}");
 
     // The receipt holds the full identity: snapshot, contract, runtime,
-    // engine. A push resolves to the whole tree at its head, so there is no
-    // base.
+    // engine. A push resolves to the whole tree at its head, and the base is
+    // the remote tip the push would move - the receipt binds both.
     let runs = root.join("profile/sample-gate-runs");
     let receipt_path = std::fs::read_dir(&runs)
         .unwrap()
@@ -198,7 +198,7 @@ fn the_gate_reviews_once_then_reuses_the_receipt() {
     let receipt: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&receipt_path).unwrap()).unwrap();
     assert_eq!(receipt["gate_status"], "passed");
-    assert!(receipt["review_base"].is_null());
+    assert_eq!(receipt["review_base"], base);
     assert_eq!(receipt["review_head"], head);
     assert_eq!(receipt["review_items"], serde_json::json!(["structure"]));
     assert_eq!(receipt["agent_profile"]["id"], "sample-gate");

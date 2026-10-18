@@ -55,6 +55,10 @@ pub struct Context {
     pub actual_email: Option<String>,
     /// For pre-push: the ref lines git supplies on stdin.
     pub stdin: Option<String>,
+    /// For pre-push: the remote the push targets (the hook's argv), so a
+    /// deletion is judged against that remote's mirror only - another
+    /// remote's same-named mirror legitimately keeps the tip reachable.
+    pub push_remote: Option<String>,
     /// For `pr`: the branch the request targets and the branch it proposes, as
     /// names the checker resolves in the local repository.
     pub pr_base: Option<String>,
@@ -266,6 +270,7 @@ pub fn run_all(
     let selected: Vec<&Checker> = policy
         .checkers_for(event)
         .into_iter()
+        .filter(|c| only.is_some() || c.applies_to(ctx.repo_slug.as_deref(), &ctx.repo_root))
         .filter(|c| only.is_none_or(|name| c.name == name))
         .collect();
     if let Some(name) = only {
@@ -288,6 +293,9 @@ pub fn run_all(
         && let Some(gate) = crate::attribution::gate(ctx)
     {
         report.outcomes.push(gate);
+    }
+    if only.is_none() {
+        report.outcomes.extend(crate::history::gates(ctx));
     }
 
     // Run the checkers concurrently: they only read the shared snapshot, while
@@ -337,14 +345,36 @@ fn run_one(
         stderr: String::new(),
     };
 
+    // A `verify` row first settles what it exercises: the publication
+    // candidate, never the possibly-dirty working tree.
+    let verify_ref = if checker.kind == Kind::Verify {
+        match verify_ref(ctx) {
+            Ok(None) => {
+                return CheckerOutcome {
+                    name: checker.name.clone(),
+                    severity: checker.severity,
+                    outcome: OutcomeKind::Passed,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    stdout: "no new revision publishes here; verification is vacuous".into(),
+                    stderr: String::new(),
+                };
+            }
+            Ok(Some(reference)) => Some(reference),
+            Err(why) => return fail(why),
+        }
+    } else {
+        None
+    };
+    let substitute = |raw: &str| {
+        ctx.substitute(raw)
+            .replace("{verify_head}", verify_ref.as_deref().unwrap_or(""))
+    };
+
     let program = match checker.command.first() {
-        Some(p) => ctx.substitute(p),
+        Some(p) => substitute(p),
         None => return fail("empty command".into()),
     };
-    let mut args: Vec<String> = checker.command[1..]
-        .iter()
-        .map(|a| ctx.substitute(a))
-        .collect();
+    let mut args: Vec<String> = checker.command[1..].iter().map(|a| substitute(a)).collect();
 
     // Language-specific hardening, applied by the engine so the registry entry
     // cannot forget it.
@@ -363,9 +393,40 @@ fn run_one(
         Err(e) => return fail(format!("no neutral working directory: {e}")),
     };
 
+    // The single exception: `verify` must exercise the candidate content
+    // itself, so it gets a detached worktree of the resolved revision inside
+    // its neutral directory. The command still comes from the signed policy;
+    // the repository never names its own test.
+    let mut worktree: Option<PathBuf> = None;
+    if let Some(reference) = &verify_ref {
+        let staged = neutral.join("candidate");
+        match Command::new("git")
+            .arg("-C")
+            .arg(&ctx.repo_root)
+            .args(["worktree", "add", "--detach"])
+            .arg(&staged)
+            .arg(reference)
+            .output()
+        {
+            Ok(out) if out.status.success() => worktree = Some(staged),
+            Ok(out) => {
+                let _ = std::fs::remove_dir_all(&neutral);
+                return fail(format!(
+                    "cannot stage the candidate worktree: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&neutral);
+                return fail(format!("cannot stage the candidate worktree: {e}"));
+            }
+        }
+    }
+    let run_dir = worktree.clone().unwrap_or_else(|| neutral.clone());
+
     let mut cmd = Command::new(&program);
     cmd.args(&args)
-        .current_dir(&neutral)
+        .current_dir(&run_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -379,10 +440,21 @@ fn run_one(
     // must not steer the checker.
     for (key, value) in std::env::vars_os() {
         if key.to_str().is_some_and(|k| {
-            matches!(k, "PATH" | "HOME" | "TMPDIR" | "LANG") || k.starts_with("LC_")
+            matches!(k, "PATH" | "HOME" | "TMPDIR" | "LANG")
+                || k.starts_with("LC_")
+                // A build or test legitimately reaches the network through the
+                // machine's proxy; the command itself is already signed policy.
+                || (checker.kind == Kind::Verify
+                    && matches!(
+                        k.to_ascii_uppercase().as_str(),
+                        "HTTP_PROXY" | "HTTPS_PROXY" | "ALL_PROXY" | "NO_PROXY"
+                    ))
         }) {
             cmd.env(key, value);
         }
+    }
+    if let Some(reference) = &verify_ref {
+        cmd.env("GITVAULT_VERIFY_HEAD", reference);
     }
     cmd.env("GITVAULT_EVENT", &ctx.event)
         .env("GITVAULT_IDENTITY", &ctx.identity)
@@ -434,13 +506,30 @@ fn run_one(
         cmd.env("GITVAULT_RELEASE_COMMIT", commit);
     }
     for (k, v) in &checker.env {
-        cmd.env(k, ctx.substitute(v));
+        cmd.env(k, substitute(v));
     }
+
+    // A staged worktree must leave through `git worktree remove`, not just
+    // directory deletion, or it leaks its administrative entry under .git.
+    let cleanup = |worktree: &Option<PathBuf>| {
+        if let Some(path) = worktree {
+            let _ = Command::new("git")
+                .arg("-C")
+                .arg(&ctx.repo_root)
+                .args(["worktree", "remove", "--force"])
+                .arg(path)
+                .output();
+        }
+        let _ = std::fs::remove_dir_all(&neutral);
+    };
 
     eprintln!("gitvault: running {}…", checker.name);
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => return fail(format!("{program}: {e}")),
+        Err(e) => {
+            cleanup(&worktree);
+            return fail(format!("{program}: {e}"));
+        }
     };
 
     if let Some(mut stdin) = child.stdin.take()
@@ -471,7 +560,7 @@ fn run_one(
             let _ = child.wait();
             let _ = out_reader.join();
             let _ = err_reader.join();
-            let _ = std::fs::remove_dir_all(&neutral);
+            cleanup(&worktree);
             return CheckerOutcome {
                 name: checker.name.clone(),
                 severity: checker.severity,
@@ -481,13 +570,16 @@ fn run_one(
                 stderr: format!("exceeded {}s", checker.timeout_secs),
             };
         }
-        Err(e) => return fail(format!("wait failed: {e}")),
+        Err(e) => {
+            cleanup(&worktree);
+            return fail(format!("wait failed: {e}"));
+        }
     };
 
     // Killing or exiting closes the pipes, so the readers terminate.
     let stdout = out_reader.join().unwrap_or_default();
     let stderr = err_reader.join().unwrap_or_default();
-    let _ = std::fs::remove_dir_all(&neutral);
+    cleanup(&worktree);
 
     let outcome = if status.success() {
         OutcomeKind::Passed
@@ -502,6 +594,76 @@ fn run_one(
         duration_ms: started.elapsed().as_millis() as u64,
         stdout,
         stderr,
+    }
+}
+
+/// The revision a `verify` checker must exercise: the publication candidate,
+/// never the possibly-dirty working tree. A push takes its pushed head
+/// (preferring the checked-out branch), a request its proposed head, a
+/// release its tagged commit; anything else verifies `HEAD`.
+///
+/// `Ok(None)` is vacuous - nothing on this event publishes a new revision, so
+/// there is no candidate to test. `Err` means a candidate should exist but
+/// cannot be resolved, which fails closed like any unverifiable evidence.
+fn verify_ref(ctx: &Context) -> Result<Option<String>, String> {
+    let rev = |r: &str| -> Option<String> { crate::git::commit_at(&ctx.repo_root, r) };
+    match ctx.event.as_str() {
+        "pre-push" => {
+            let heads: Vec<String> = ctx
+                .stdin
+                .as_deref()
+                .unwrap_or("")
+                .lines()
+                .filter_map(|line| line.split_whitespace().nth(1))
+                .filter(|sha| !sha.trim_matches('0').is_empty())
+                .map(str::to_string)
+                .collect();
+            if heads.is_empty() {
+                return Ok(None);
+            }
+            let current = rev("HEAD");
+            Ok(Some(
+                heads
+                    .iter()
+                    .find(|h| Some(h.as_str()) == current.as_deref())
+                    .unwrap_or(&heads[0])
+                    .clone(),
+            ))
+        }
+        "pr" => {
+            if let Some(head) = ctx.pr_head.as_deref().and_then(&rev) {
+                return Ok(Some(head));
+            }
+            // A merge names only a request number: fetch its head the same
+            // way the review range does, so the row verifies the merge head
+            // rather than whatever stale FETCH_HEAD or checkout happens to
+            // be. Falling back to HEAD would attest unreviewed content -
+            // unresolvable is a refusal, matching the release arm.
+            if let Some(number) = ctx.pr_number.as_deref().filter(|n| !n.is_empty()) {
+                let fetched = Command::new("git")
+                    .arg("-C")
+                    .arg(&ctx.repo_root)
+                    .args([
+                        "fetch",
+                        "--no-tags",
+                        "--quiet",
+                        "origin",
+                        &format!("refs/pull/{number}/head"),
+                    ])
+                    .output()
+                    .map(|out| out.status.success())
+                    .unwrap_or(false);
+                if fetched && let Some(head) = rev("FETCH_HEAD") {
+                    return Ok(Some(head));
+                }
+            }
+            Err("the pull request head is not available locally".to_string())
+        }
+        "release" => match ctx.release_commit.as_deref() {
+            Some(commit) if !commit.is_empty() => Ok(Some(commit.to_string())),
+            _ => Err("no release commit declared for verification".to_string()),
+        },
+        _ => Ok(rev("HEAD")),
     }
 }
 
@@ -542,8 +704,9 @@ fn tempdir(tag: &str) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::Context;
-    use std::path::PathBuf;
+    use super::{Context, OutcomeKind, run_one, verify_ref};
+    use crate::config::{Checker, Config, Kind, Severity};
+    use std::path::{Path, PathBuf};
 
     fn context() -> Context {
         Context {
@@ -556,6 +719,7 @@ mod tests {
             expected_email: Some("maintainer@example.invalid".into()),
             actual_email: Some("maintainer@example.invalid".into()),
             stdin: None,
+            push_remote: None,
             pr_base: Some("main".into()),
             pr_head: Some("feature".into()),
             pr_number: Some("7".into()),
@@ -582,5 +746,144 @@ mod tests {
         hook.release_commit = None;
         assert_eq!(hook.substitute(":{pr_base}:{pr_head}:"), ":::");
         assert_eq!(hook.substitute("{release_tag}/{pr_number}"), "/");
+    }
+
+    /// A scratch repository so `verify_ref` has real objects to resolve.
+    struct Repo(PathBuf);
+    impl Repo {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "gv-verify-{}-{:04x}",
+                std::process::id(),
+                rand::random::<u16>()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            git(&dir, &["init", "-b", "main"]);
+            Self(dir)
+        }
+        fn commit(&self, file: &str) -> String {
+            std::fs::write(self.0.join(file), file).unwrap();
+            git(&self.0, &["add", file]);
+            git(&self.0, &["commit", "-m", file]);
+            git(&self.0, &["rev-parse", "HEAD"])
+        }
+    }
+    impl Drop for Repo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Synthetic")
+            .env("GIT_AUTHOR_EMAIL", "synthetic@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Synthetic")
+            .env("GIT_COMMITTER_EMAIL", "synthetic@example.invalid")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn ctx_at(repo: &Repo, event: &str) -> Context {
+        Context {
+            event: event.into(),
+            repo_root: repo.0.clone(),
+            repo_slug: None,
+            identity: "synthetic".into(),
+            account: None,
+            via_default: false,
+            expected_email: None,
+            actual_email: None,
+            stdin: None,
+            push_remote: None,
+            pr_base: None,
+            pr_head: None,
+            pr_number: None,
+            release_tag: None,
+            release_commit: None,
+        }
+    }
+
+    /// The verify row exercises the publication candidate, resolved per event:
+    /// the pushed head for pre-push, the request's head for pr, the declared
+    /// commit for release - and a deletion-only push is vacuously verified.
+    #[test]
+    fn verify_head_is_the_candidate_each_event_publishes() {
+        let repo = Repo::new();
+        let a = repo.commit("a");
+        let zero = "0".repeat(40);
+
+        // pre-push: the pushed local sha is the candidate.
+        let mut c = ctx_at(&repo, "pre-push");
+        c.stdin = Some(format!("refs/heads/main {a} refs/heads/main {zero}"));
+        assert_eq!(verify_ref(&c).unwrap().as_deref(), Some(a.as_str()));
+
+        // A deletion-only push publishes nothing to verify.
+        c.stdin = Some(format!("refs/heads/gone {zero} refs/heads/gone {a}"));
+        assert_eq!(verify_ref(&c).unwrap(), None);
+
+        // pr: the request's head ref resolves.
+        let mut c = ctx_at(&repo, "pr");
+        c.pr_head = Some("main".into());
+        assert_eq!(verify_ref(&c).unwrap().as_deref(), Some(a.as_str()));
+
+        // release: the declared commit, and none declared is an error - a
+        // verify row must never silently exercise whatever HEAD happens to be.
+        let mut c = ctx_at(&repo, "release");
+        c.release_commit = Some(a.clone());
+        assert_eq!(verify_ref(&c).unwrap().as_deref(), Some(a.as_str()));
+        c.release_commit = None;
+        assert!(verify_ref(&c).is_err());
+    }
+
+    /// A `verify` row must see the candidate revision, not the dirty working
+    /// tree it shares, and the staged worktree must leave no administrative
+    /// residue in the repository when the run ends.
+    #[test]
+    fn a_verify_checker_runs_the_candidate_and_leaves_no_worktree() {
+        let repo = Repo::new();
+        let head = repo.commit("a");
+        // An uncommitted file proves the run did NOT happen in the checkout.
+        std::fs::write(repo.0.join("dirty"), "uncommitted").unwrap();
+        let mut ctx = ctx_at(&repo, "pre-push");
+        ctx.stdin = Some(format!(
+            "refs/heads/main {head} refs/heads/main {}",
+            "0".repeat(40)
+        ));
+        let checker = Checker {
+            name: "verify-head".into(),
+            kind: Kind::Verify,
+            on: vec!["pre-push".into()],
+            severity: Severity::Blocking,
+            timeout_secs: 60,
+            repos: Vec::new(),
+            // The detached worktree carries the candidate, not the checkout:
+            // the dirty file is absent and HEAD is the pushed sha.
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "test ! -f dirty && git rev-parse HEAD".into(),
+            ],
+            env: Default::default(),
+        };
+        let outcome = run_one(&Config::default(), &ctx, &checker, None);
+        assert!(
+            matches!(outcome.outcome, OutcomeKind::Passed),
+            "{:?} {}",
+            outcome.outcome,
+            outcome.stderr
+        );
+        assert_eq!(outcome.stdout.trim(), head);
+        let worktrees = git(&repo.0, &["worktree", "list", "--porcelain"]);
+        assert_eq!(worktrees.matches("worktree ").count(), 1, "{worktrees}");
+        assert!(!repo.0.join(".git/worktrees").exists());
     }
 }

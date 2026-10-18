@@ -210,6 +210,23 @@ pub struct Record {
     pub passed: bool,
     pub blocking_failures: usize,
     pub outcomes: Vec<Outcome>,
+    /// `sha256(seal of the previous record + this record without the seal)`,
+    /// chaining the log so a deleted or rewritten run is detectable on
+    /// inspection. Tamper-evidence, not tamper-proofing: the durable
+    /// attestation is the `gitvault/audited` status the hook posts.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub seal: String,
+    /// The seal this record chained to. Stored explicitly because the run id
+    /// is only second-granular: two records written in one second cannot rely
+    /// on sort order to name their predecessor.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub seal_prev: String,
+}
+
+/// The record as seal input: the shared canonicalizer strips the seal fields
+/// itself, so serializing the record is the whole preparation.
+fn seal_document(record: &Record) -> serde_json::Value {
+    serde_json::to_value(record).unwrap_or_default()
 }
 
 impl Record {
@@ -280,7 +297,7 @@ pub fn finish(
     report: &Report,
     routing_signature: &crate::configsig::SigState,
 ) {
-    let record = Record {
+    let mut record = Record {
         id: run.id,
         created_at: epoch_secs(),
         duration_ms: (now_ms().saturating_sub(run.started_ms)) as u64,
@@ -316,7 +333,11 @@ pub fn finish(
                 stderr: capture(&o.stderr),
             })
             .collect(),
+        seal: String::new(),
+        seal_prev: String::new(),
     };
+    record.seal_prev = crate::seal::latest(&run_dir(cfg), "engine.json", None);
+    record.seal = crate::seal::seal(&record.seal_prev, &seal_document(&record));
     let path = run.dir.join("engine.json");
     let written = serde_json::to_string_pretty(&record)
         .map_err(anyhow::Error::from)
@@ -374,6 +395,56 @@ pub fn list(cfg: &Config) -> Result<Vec<Record>> {
     let mut records = read(&dir);
     records.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
     Ok(records)
+}
+
+/// What the seal chain found on one record.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Link {
+    /// The seal recomputes and its predecessor is present (or it is genesis).
+    Sound,
+    /// The seal recomputes but `seal_prev` names a record that is gone:
+    /// either the retention window pruned it, or a run was deleted. The
+    /// operator distinguishes those; the chain cannot.
+    Gap,
+    /// The seal does not recompute over the stored content - the record was
+    /// rewritten after it was sealed.
+    Broken,
+    /// Written before the chain existed.
+    Unsealed,
+}
+
+impl Link {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Sound => "sound",
+            Self::Gap => "gap",
+            Self::Broken => "BROKEN",
+            Self::Unsealed => "unsealed",
+        }
+    }
+}
+
+/// Re-walk the seal chain: which records still prove what they claim.
+pub fn verify(cfg: &Config) -> Vec<(String, Link)> {
+    let dir = run_dir(cfg);
+    let mut records = read(&dir);
+    records.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+    let seals: std::collections::BTreeSet<&str> = records.iter().map(|r| r.seal.as_str()).collect();
+    records
+        .iter()
+        .map(|record| {
+            let link = if record.seal.is_empty() {
+                Link::Unsealed
+            } else if !crate::seal::valid(&seal_document(record)) {
+                Link::Broken
+            } else if !record.seal_prev.is_empty() && !seals.contains(record.seal_prev.as_str()) {
+                Link::Gap
+            } else {
+                Link::Sound
+            };
+            (record.id.clone(), link)
+        })
+        .collect()
 }
 
 pub fn show(cfg: &Config, id: &str) -> Result<Record> {
@@ -468,5 +539,105 @@ mod tests {
         let text = capture(&long);
         assert!(text.contains("[truncated at"));
         assert!(text.len() < long.len() + 64);
+    }
+
+    /// The seal chain over real written records: Sound when untouched, Broken
+    /// when a stored record is rewritten, Gap when its predecessor is removed,
+    /// and Unsealed for a record from before the chain existed.
+    #[test]
+    fn the_seal_chain_detects_rewrite_gap_and_legacy() {
+        use super::{Link, begin, finish, verify};
+        use crate::checkers::{Context, Report};
+        use crate::config::Config;
+        use crate::configsig::SigState;
+        use std::path::PathBuf;
+
+        let dir = std::env::temp_dir().join(format!(
+            "gv-seal-{}-{:04x}",
+            std::process::id(),
+            rand::random::<u16>()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = Config {
+            record_dir: Some(dir.clone()),
+            ..Default::default()
+        };
+        let ctx = Context {
+            event: "pre-push".into(),
+            repo_root: PathBuf::from("/synthetic/repo"),
+            repo_slug: Some("Owner/Repo".into()),
+            identity: "synthetic".into(),
+            account: None,
+            via_default: false,
+            expected_email: None,
+            actual_email: None,
+            stdin: None,
+            push_remote: None,
+            pr_base: None,
+            pr_head: None,
+            pr_number: None,
+            release_tag: None,
+            release_commit: None,
+        };
+        let write = |cfg: &Config, ctx: &Context| -> String {
+            let run = begin(cfg, 1).expect("a run begins");
+            let id = run.id.clone();
+            finish(
+                cfg,
+                run,
+                ctx,
+                &Report { outcomes: vec![] },
+                &SigState::Inactive,
+            );
+            id
+        };
+
+        // Two real records chain: the second seals against the first.
+        let first = write(&cfg, &ctx);
+        let second = write(&cfg, &ctx);
+        let links: std::collections::BTreeMap<_, _> = verify(&cfg).into_iter().collect();
+        assert_eq!(links[first.as_str()], Link::Sound, "genesis is sound");
+        assert_eq!(links[second.as_str()], Link::Sound, "the chain links");
+
+        // Rewriting a sealed record breaks its own seal without breaking the
+        // predecessor's - the tamper is visible exactly where it happened.
+        let path = dir.join(&second).join("engine.json");
+        let mut tampered: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        tampered["event"] = "pr".into();
+        std::fs::write(&path, serde_json::to_string_pretty(&tampered).unwrap()).unwrap();
+        let links: std::collections::BTreeMap<_, _> = verify(&cfg).into_iter().collect();
+        assert_eq!(links[second.as_str()], Link::Broken, "a rewrite breaks");
+        assert_eq!(links[first.as_str()], Link::Sound);
+
+        // A later record chains to the stored seal even of a broken record -
+        // the chain names what was written, not what should have been.
+        let third = write(&cfg, &ctx);
+        let links: std::collections::BTreeMap<_, _> = verify(&cfg).into_iter().collect();
+        assert_eq!(links[third.as_str()], Link::Sound);
+
+        // Removing a record leaves a Gap on its successor - a different fact
+        // from a rewrite, which is why the two report differently.
+        std::fs::remove_dir_all(dir.join(&second)).unwrap();
+        let links: std::collections::BTreeMap<_, _> = verify(&cfg).into_iter().collect();
+        assert_eq!(links[third.as_str()], Link::Gap, "a lost predecessor gaps");
+        assert_eq!(links[first.as_str()], Link::Sound);
+
+        // A record written before sealing exists reports Unsealed, never a
+        // false Broken: the field's absence is a version, not a tamper.
+        let legacy = write(&cfg, &ctx);
+        let raw = std::fs::read_to_string(dir.join(&legacy).join("engine.json")).unwrap();
+        let mut unsealed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        unsealed.as_object_mut().unwrap().remove("seal");
+        unsealed.as_object_mut().unwrap().remove("seal_prev");
+        std::fs::write(
+            dir.join(&legacy).join("engine.json"),
+            serde_json::to_string_pretty(&unsealed).unwrap(),
+        )
+        .unwrap();
+        let links: std::collections::BTreeMap<_, _> = verify(&cfg).into_iter().collect();
+        assert_eq!(links[legacy.as_str()], Link::Unsealed, "legacy is unsealed");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

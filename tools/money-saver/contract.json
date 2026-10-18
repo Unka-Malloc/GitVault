@@ -5,7 +5,7 @@
   "domains": ["sql", "storage", "network", "compute", "cloudflare", "vps"],
   "finding_keys": ["file", "line", "severity", "evidence", "impact", "before_after", "remedy", "validation", "sources"],
   "finding_optional_keys": ["title"],
-  "on": ["pre-push"],
+  "on": ["pre-push", "pr"],
   "severity": "blocking",
   "tools": {
     "name_prefix": "money",

@@ -58,11 +58,26 @@ kind = "python"          # injects -P / PYTHONSAFEPATH=1
 severity = "blocking"    # default; "advisory" reports without blocking
 timeout_secs = 120       # 0 waits for completion without a wall-clock deadline
 command = ["python3", "-m", "scanner", "scan", "--directory", "{repo}"]
+
+# kind = "verify" runs the signed command inside a detached worktree of the
+# candidate revision - the one kind allowed a repository cwd, because a test
+# can only exercise the code itself. A multi-ref push verifies one candidate
+# (the checked-out or first head); every head still passes the full review.
+# `repos` scopes the row to origin slugs or path prefixes so `cargo test`
+# fires only where Rust lives.
+[[checkers]]
+name = "verify-cargo"
+kind = "verify"
+on = ["pre-push"]
+repos = ["Owner/Repo"]
+command = ["cargo", "test"]
 ```
 
 The engine applies the hardening, so an entry cannot forget it:
 
-* checkers run with a **neutral working directory**, never the repository
+* checkers run with a **neutral working directory**, never the repository —
+  `verify` is the declared exception and stages the candidate, not the dirty
+  work tree
 * `{repo}` arrives as an **absolute argument**; the checker is never *inside* the tree
 * the environment is **curated** (PATH, HOME, LANG, TMPDIR plus `GITVAULT_*`), so
   ambient credentials or steering variables cannot reach a checker
@@ -71,8 +86,9 @@ The engine applies the hardening, so an entry cannot forget it:
 
 Placeholders: `{repo}`, `{repo_slug}`, `{event}`, `{identity}`, `{account}`,
 `{email}`, `{actual_email}`, `{pr_base}`, `{pr_head}`, `{pr_number}`,
-`{release_tag}`, `{release_commit}`. A placeholder an event does not carry
-substitutes to the empty string, never to a previous event's value.
+`{release_tag}`, `{release_commit}`, and for `verify` rows `{verify_head}`.
+A placeholder an event does not carry substitutes to the empty string, never
+to a previous event's value.
 
 ## Usage
 
@@ -84,6 +100,7 @@ gitvault check --event release --tag v1.2.0 --directory DIR
 gitvault check --event release --tag COMMIT_SHA --directory DIR # preflight before creating a tag
 gitvault records list [--json]               # what the gates did, newest first
 gitvault records show RUN_ID [--json]
+gitvault records verify                      # seal-chain integrity of the log
 gitvault hook pre-commit                     # wired as core.hooksPath
 ```
 
@@ -107,11 +124,15 @@ operations run the registry before they reach GitHub:
 | `pr` | `pr create` and `pr merge` | `{pr_base}`, `{pr_head}`, `{pr_number}` |
 | `release` | `release create` | `{release_tag}`, `{release_commit}` |
 
-**`git push --no-verify` bypasses `pre-push`** — git offers no counter to it, so
-a push-only gate is a convenience, not a wall. The boundaries that cannot be
-bypassed are the ones GitVault controls: `pr create`, `pr merge` and
-`release create` run the registry before any credential is unlocked and refuse
-without touching the API.
+**`git push --no-verify` bypasses `pre-push`** — git offers no local counter to
+it. The counter is server-side: a passed pre-push audit posts the
+`gitvault/audited` commit status on the reviewed head, and a ruleset requiring
+it rejects every unmarked push — web edits, other machines and `--no-verify`
+together. `gitvault api` refuses publication writes (contents, git refs,
+merges, `pulls` create/merge/update-branch, releases, statuses) so the channel
+cannot forge the mark either. The boundaries GitVault controls outright —
+`pr create`, `pr merge` and `release create` — run the registry before any
+credential is unlocked and refuse without touching the API.
 
 ## Status
 

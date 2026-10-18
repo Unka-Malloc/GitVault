@@ -12,14 +12,16 @@ mod checkers;
 mod config;
 mod configsig;
 mod git;
+mod history;
 mod identity;
 mod records;
+mod seal;
 mod sign;
 mod ssh;
 mod unlock;
 mod vault;
 
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -64,7 +66,10 @@ enum Command {
         args: Vec<String>,
     },
 
-    /// Run the registered checkers outside a hook, for testing and for CI.
+    /// Run the registered checkers outside a hook, for testing, for CI, and
+    /// to resume reviews a rate-limited provider left unfinished. For
+    /// `--event pre-push` the refs git would hand the hook are derived from
+    /// the checkout's outgoing branches when stdin supplies none.
     Check {
         #[arg(long, default_value = "pre-commit")]
         event: String,
@@ -443,6 +448,8 @@ enum RecordsCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Re-walk the seal chain over every record and report gaps or rewrites.
+    Verify,
 }
 
 #[derive(Subcommand)]
@@ -657,16 +664,28 @@ fn context_for(
     event: &str,
     directory: &Path,
     release_tag: Option<String>,
+    hook_remote: Option<String>,
 ) -> anyhow::Result<checkers::Context> {
     let repo = git::Repo::discover(directory)?;
     let outcome = identity::resolve(cfg, &repo, false)?;
 
     // git hands pre-push its refs on stdin:
     //   <local ref> <local sha> <remote ref> <remote sha>
+    // Outside a hook nobody supplies them: a terminal would only block on
+    // input nobody intends to type, and an empty list reads as "nothing to
+    // review" - a vacuous pass at a publication boundary. `check` then
+    // synthesizes the refs a push of this checkout would carry, which is also
+    // what a scheduled resume of unfinished reviews needs to drive the gate.
     let stdin = if event == "pre-push" {
         let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf)?;
-        Some(buf)
+        if !std::io::stdin().is_terminal() {
+            std::io::stdin().read_to_string(&mut buf)?;
+        }
+        if buf.trim().is_empty() {
+            Some(outgoing_push_stdin(&repo))
+        } else {
+            Some(buf)
+        }
     } else {
         None
     };
@@ -683,6 +702,27 @@ fn context_for(
         None => None,
     };
 
+    // The remote a push targets: the hook passes it on argv; `check` falls
+    // back to the checkout's first configured remote, the usual case.
+    let push_remote = if event == "pre-push" {
+        hook_remote.or_else(|| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo.root)
+                .args(["remote"])
+                .output()
+                .ok()
+                .and_then(|out| {
+                    String::from_utf8_lossy(&out.stdout)
+                        .lines()
+                        .next()
+                        .map(str::to_string)
+                })
+        })
+    } else {
+        None
+    };
+
     Ok(checkers::Context {
         event: event.to_string(),
         repo_root: repo.root.clone(),
@@ -693,12 +733,49 @@ fn context_for(
         expected_email: outcome.expected_email.clone(),
         actual_email: outcome.actual_email.clone(),
         stdin,
+        push_remote,
         pr_base: None,
         pr_head: None,
         pr_number: None,
         release_tag,
         release_commit,
     })
+}
+
+/// The stdin a `git push` of this checkout's outgoing branches would carry:
+/// `<local ref> <local sha> <remote ref> <remote sha>` per line. The upstream
+/// tracking ref stands in for the remote's value - stale by at most a fetch,
+/// and the gate refuses non-fast-forwards on its own evidence anyway. Heads
+/// already published are filtered downstream exactly as a real push's would
+/// be, so an up-to-date checkout still yields zero targets honestly.
+fn outgoing_push_stdin(repo: &git::Repo) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo.root)
+        .args([
+            "for-each-ref",
+            "--format=%(refname) %(objectname) %(upstream)",
+            "refs/heads",
+        ])
+        .output();
+    let mut buf = String::new();
+    if let Ok(out) = out {
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let mut fields = line.split_whitespace();
+            let (Some(local_ref), Some(local_sha)) = (fields.next(), fields.next()) else {
+                continue;
+            };
+            let remote_sha = fields
+                .next()
+                .filter(|s| !s.is_empty())
+                .and_then(|upstream| repo.resolve_commit(upstream).ok())
+                .unwrap_or_else(|| "0".repeat(40));
+            buf.push_str(&format!(
+                "{local_ref} {local_sha} {local_ref} {remote_sha}\n"
+            ));
+        }
+    }
+    buf
 }
 
 /// Run the certified audit policy and print the report BEFORE any signature
@@ -783,12 +860,19 @@ fn run_publication_gate(
     Ok(())
 }
 
-fn cmd_hook(config: Option<&PathBuf>, event: &str, _args: &[String]) -> anyhow::Result<ExitCode> {
+fn cmd_hook(config: Option<&PathBuf>, event: &str, args: &[String]) -> anyhow::Result<ExitCode> {
     let (cfg, cfg_path, cfg_sig) = config::Config::load_unverified(config)?;
     let (policy, _policy_path, policy_sig) = config::Policy::load_state(&cfg_path, &cfg)?;
     // git runs hooks with cwd set to the top level of the working tree, so "."
     // resolves correctly and no directory argument is needed from the hook shim.
-    let ctx = context_for(&cfg, event, &PathBuf::from("."), None)?;
+    // For pre-push, argv[0] is the remote the push targets.
+    let ctx = context_for(
+        &cfg,
+        event,
+        &PathBuf::from("."),
+        None,
+        args.first().cloned(),
+    )?;
     let report = audit_gate(
         &cfg,
         &cfg_sig,
@@ -798,7 +882,162 @@ fn cmd_hook(config: Option<&PathBuf>, event: &str, _args: &[String]) -> anyhow::
         "operation",
         None,
     )?;
+    if report.exit_code() == ExitCode::SUCCESS && event == "pre-push" {
+        publish_audited_status(&cfg, &ctx)?;
+    }
     Ok(report.exit_code())
+}
+
+/// Mark every head this push actually audited with the `gitvault/audited`
+/// commit status, so a server-side required check can enforce "the reviewed
+/// revision is the one that landed" - closing `--no-verify`, the web UI and
+/// other machines into the same gate.
+///
+/// The attestation stays honest by marking only heads the audit examined:
+/// the deterministic and semantic review covers every pushed ref, so each
+/// new head earns its mark. A `verify` row exercises one candidate revision
+/// (the checked-out or first head) - it strengthens the evidence without
+/// being the basis for the multi-head marking. A tip already reachable from
+/// the pushed remote's refs added no unreviewed content to this audit, so
+/// it earns no status here. The credential spend happens now, after the
+/// report exists - audits first, blessing after.
+fn publish_audited_status(cfg: &config::Config, ctx: &checkers::Context) -> anyhow::Result<()> {
+    // Attest where the push lands: the push remote's own repository. A named
+    // remote that cannot resolve gets no attestation at all - falling back to
+    // an unrelated slug would mark the wrong repository with evidence meant
+    // for this one. An unnamed remote (a `check` context) uses origin's slug.
+    let slug = match ctx.push_remote.as_deref() {
+        Some(name) => match remote_slug(&ctx.repo_root, name) {
+            Some(slug) => slug,
+            None => {
+                eprintln!(
+                    "gitvault: push remote '{name}' does not resolve to a repository; \
+                     audited status not posted"
+                );
+                return Ok(());
+            }
+        },
+        None => match ctx.repo_slug.clone() {
+            Some(slug) => slug,
+            // No remote to attest against; nothing was sent anywhere.
+            None => return Ok(()),
+        },
+    };
+    let mut heads: Vec<String> = Vec::new();
+    for line in ctx.stdin.as_deref().unwrap_or("").lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let Some(sha) = fields.get(1) else { continue };
+        if sha.trim_matches('0').is_empty() {
+            continue; // a deletion has no head to mark
+        }
+        let sha = (*sha).to_string();
+        if !heads.contains(&sha) {
+            heads.push(sha);
+        }
+    }
+    if heads.is_empty() {
+        return Ok(());
+    }
+    let vault = vault::Vault::open()?;
+    for sha in heads {
+        // A pushed object is not always a commit: an annotated tag carries its
+        // tag object, and /statuses on one 422s - which fail-closed would turn
+        // into a refusal after the audits already passed. Peel to the commit;
+        // an object with no commit has no status surface and is skipped.
+        let Some(commit) = peel_commit(&ctx.repo_root, &sha) else {
+            continue;
+        };
+        // Skip tips the pushed remote already holds: the audit skipped them
+        // too, so marking them would attest to a review that never happened.
+        // Scoped to the push remote's own mirrors - another remote holding
+        // the commit says nothing about this repository, and counting it
+        // would deadlock a ruleset that requires the status there.
+        let mirror = ctx
+            .push_remote
+            .as_deref()
+            .map(|name| format!("refs/remotes/{name}"))
+            .unwrap_or_else(|| "refs/remotes".to_string());
+        if git::refs_containing(&ctx.repo_root, &commit, &[&mirror]) {
+            continue;
+        }
+        let req = api::Request {
+            method: "POST".to_string(),
+            path: format!("/repos/{slug}/statuses/{commit}"),
+            target: api::Target::Repo(slug.to_string()),
+            fields: vec![
+                ("state".to_string(), "success".to_string()),
+                ("context".to_string(), "gitvault/audited".to_string()),
+                (
+                    "description".to_string(),
+                    "publication audit passed on this machine".to_string(),
+                ),
+            ],
+            raw_fields: Vec::new(),
+            headers: Vec::new(),
+            body: None,
+            jq: None,
+            silent: true,
+        };
+        let code = api::run(cfg, &vault, &req)?;
+        if code != 0 {
+            // A status only attaches to a commit GitHub already knows, and a
+            // first-time head arrives with this very push - refusing here
+            // would deadlock publication (no objects ever land, so no status
+            // can ever post). Probe instead: an unknown commit means this
+            // push lands the objects and the ruleset refuses the ref update
+            // on their evidence; the immediate re-push then posts 200. A
+            // commit GitHub does know and still cannot mark is a real
+            // failure, and the push fails closed rather than landing
+            // unattested.
+            let probe = api::Request {
+                method: "GET".to_string(),
+                path: format!("/repos/{slug}/commits/{commit}"),
+                target: api::Target::Repo(slug.to_string()),
+                fields: Vec::new(),
+                raw_fields: Vec::new(),
+                headers: Vec::new(),
+                body: None,
+                jq: None,
+                silent: true,
+            };
+            let known = api::run(cfg, &vault, &probe)? == 0;
+            anyhow::ensure!(
+                !known,
+                "the audit passed but the `gitvault/audited` status could not be posted \
+                 for {commit}; the push is refused rather than landing without its evidence"
+            );
+            eprintln!(
+                "gitvault: {commit:.12} is not on {slug} yet - this push lands the objects \
+                 and the remote refuses the ref update for the missing status; \
+                 run `git push` again to attest and land (the audits are already sealed)"
+            );
+            continue;
+        }
+        eprintln!("gitvault: marked {commit:.12} audited on {slug}");
+    }
+    Ok(())
+}
+
+/// The `Owner/Repo` a push actually lands on: the named remote's URL parsed
+/// for its slug, never a different remote's.
+fn remote_slug(repo_root: &std::path::Path, remote: &str) -> Option<String> {
+    let url = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["remote", "get-url", remote])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+    url.and_then(|url| git::slug_from_remote(&url))
+}
+
+/// The commit a pushed object attests to, when it has one: annotated tags and
+/// other non-commit objects peel through `^{commit}`, a plain commit resolves
+/// to itself.
+fn peel_commit(repo_root: &std::path::Path, sha: &str) -> Option<String> {
+    git::commit_at(repo_root, sha)
 }
 
 fn cmd_records(config: Option<&PathBuf>, command: RecordsCommand) -> anyhow::Result<ExitCode> {
@@ -877,6 +1116,48 @@ fn cmd_records(config: Option<&PathBuf>, command: RecordsCommand) -> anyhow::Res
             }
             Ok(ExitCode::SUCCESS)
         }
+        RecordsCommand::Verify => {
+            let links = records::verify(&cfg);
+            if links.is_empty() {
+                println!("no runs recorded in {}", records::run_dir(&cfg).display());
+                return Ok(ExitCode::SUCCESS);
+            }
+            let mut worst = records::Link::Sound;
+            for (id, link) in &links {
+                if *link != records::Link::Sound {
+                    println!("{id}  {}", link.label());
+                }
+                match link {
+                    records::Link::Broken => worst = records::Link::Broken,
+                    records::Link::Gap if worst != records::Link::Broken => {
+                        worst = records::Link::Gap;
+                    }
+                    _ => {}
+                }
+            }
+            let sound = links
+                .iter()
+                .filter(|(_, l)| *l == records::Link::Sound)
+                .count();
+            println!(
+                "{} of {} records verify sound{}",
+                sound,
+                links.len(),
+                match worst {
+                    records::Link::Broken => " — REWRITTEN RECORDS FOUND",
+                    records::Link::Gap => " — gaps found (pruned predecessors or deleted runs)",
+                    _ => "",
+                }
+            );
+            // Only a rewrite is a hard failure: an operator pruning or an
+            // interrupted upgrade produces gaps, which are reported, not
+            // prosecuted.
+            Ok(if worst == records::Link::Broken {
+                ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
+            })
+        }
     }
 }
 
@@ -889,7 +1170,7 @@ fn cmd_check(
 ) -> anyhow::Result<ExitCode> {
     let (cfg, cfg_path, cfg_sig) = config::Config::load_unverified(config)?;
     let (policy, _policy_path, policy_sig) = config::Policy::load_state(&cfg_path, &cfg)?;
-    let ctx = context_for(&cfg, event, directory, tag.map(str::to_string))?;
+    let ctx = context_for(&cfg, event, directory, tag.map(str::to_string), None)?;
     let report = audit_gate(&cfg, &cfg_sig, &policy, &policy_sig, &ctx, "check", only)?;
     Ok(report.exit_code())
 }
@@ -1234,7 +1515,10 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
             "#!/usr/bin/env bash\n\
              set -u\n\
              HOOK=\"${1:?hook name required}\"; shift || true\n\
-             GITVAULT_BIN=\"${GITVAULT_BIN:-$HOME/.local/bin/gitvault}\"\n\
+             # The gateway binary is fixed, never an environment override:\n\
+             # an env-set substitute would let `GITVAULT_BIN=/bin/true git push`\n\
+             # run no gate at all.\n\
+             GITVAULT_BIN=\"$HOME/.local/bin/gitvault\"\n\
              if [ ! -x \"$GITVAULT_BIN\" ]; then\n\
              \x20 printf 'gitvault: not installed; refusing the action\\n' >&2\n\
              \x20 exit 1\n\
@@ -1378,6 +1662,20 @@ fn cmd_api(
         other => other,
     };
 
+    // The publication boundary applies to the raw API surface too: `api` is a
+    // credential broker, but a write that puts repository content or refs on
+    // GitHub must go through the audited commands, not around them. The check
+    // lives here - not inside api::run - because the gated verbs (pr create,
+    // release create) call api::run themselves after their audits.
+    if let Some(reason) = publication_surface(&method, &path) {
+        eprintln!(
+            "gitvault: refusing unaudited publication via api: {reason}\n  \
+             use the gated command instead: `gitvault pr create`, `gitvault pr merge`,\n  \
+             `gitvault release create`, or `git push` through the pre-push hook"
+        );
+        return Ok(ExitCode::from(2));
+    }
+
     let req = api::Request {
         method,
         path,
@@ -1399,6 +1697,61 @@ fn cmd_api(
             Ok(ExitCode::from(2))
         }
     }
+}
+
+/// The write surfaces that publish repository content or move refs. Matching
+/// is on the API path after the `/repos/{owner}/{repo}` prefix: anything that
+/// lands content (file writes, git objects, merges, release artifacts) or moves
+/// refs belongs to the audited commands. Reads and non-publication writes
+/// (issues, comments, labels, PR metadata) stay open.
+fn publication_surface(method: &str, path: &str) -> Option<String> {
+    if matches!(
+        method.to_ascii_uppercase().as_str(),
+        "GET" | "HEAD" | "OPTIONS"
+    ) {
+        return None;
+    }
+    // Normalize an absolute API URL back to its path before matching. The
+    // origin lives in api::API_ROOT alone - a second literal here would drift
+    // from it, skip normalization, and silently unguard absolute-URL writes.
+    let path = path
+        .strip_prefix(crate::api::API_ROOT)
+        .unwrap_or(path)
+        .trim_start_matches('/')
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("");
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    // repos/{owner}/{repo}/<surface>/...
+    if segments.len() < 3 || segments[0] != "repos" {
+        return None;
+    }
+    let tail: Vec<&str> = segments[3..].to_vec();
+    let verb = method.to_ascii_uppercase();
+    let hit = match tail.first().copied() {
+        // File contents and every git object/ref write.
+        Some("contents" | "git") => true,
+        // Branch merges performed server-side, and a fork syncing its branch
+        // from upstream - both move a ref without the local gate seeing it.
+        Some("merges" | "merge-upstream") => true,
+        // Creating a pull request, or merging one or updating its branch from
+        // the base. Metadata writes (PATCH title/body, reviewers, comments)
+        // are not publication.
+        Some("pulls") => {
+            verb == "POST" && tail.len() == 1
+                || tail
+                    .get(2)
+                    .is_some_and(|seg| *seg == "merge" || *seg == "update-branch")
+        }
+        // Releases and their assets, created or edited.
+        Some("releases") => true,
+        // Commit statuses are the audit's attestation channel: a hand-posted
+        // `gitvault/audited` would forge the receipt the server-side check
+        // trusts. The audited path posts them through api::run internally.
+        Some("statuses") => true,
+        _ => false,
+    };
+    hit.then(|| format!("{verb} /{path}"))
 }
 
 fn cmd_pr(
@@ -1439,13 +1792,14 @@ fn cmd_pr(
             // paid for twice; content that reached the remote from elsewhere is
             // reviewed here before the request proposes it. The checker resolves
             // base/head in the local repository, the only place the content exists.
-            let mut ctx = context_for(&cfg, "pr", &PathBuf::from("."), None).map_err(|err| {
-                anyhow::anyhow!(
-                    "reviewing a pull request needs a checkout of the repository\n  \
+            let mut ctx =
+                context_for(&cfg, "pr", &PathBuf::from("."), None, None).map_err(|err| {
+                    anyhow::anyhow!(
+                        "reviewing a pull request needs a checkout of the repository\n  \
                      {err:#}\n  \
                      push the branch through GitVault, or run this from its working tree"
-                )
-            })?;
+                    )
+                })?;
             ctx.pr_base = Some(base.clone());
             ctx.pr_head = Some(head.clone());
             let (policy, _policy_path, policy_sig) = config::Policy::load_state(&cfg_path, &cfg)?;
@@ -1497,13 +1851,14 @@ fn cmd_pr(
             // permanent record as creating. The head may not be checked out
             // here, so the checker is told the request number and fetches the
             // head itself; nothing reaches GitHub until it passes.
-            let mut ctx = context_for(&cfg, "pr", &PathBuf::from("."), None).map_err(|err| {
-                anyhow::anyhow!(
-                    "reviewing a merge request needs a checkout of the repository\n  \
+            let mut ctx =
+                context_for(&cfg, "pr", &PathBuf::from("."), None, None).map_err(|err| {
+                    anyhow::anyhow!(
+                        "reviewing a merge request needs a checkout of the repository\n  \
                      {err:#}\n  \
                      run this from its working tree"
-                )
-            })?;
+                    )
+                })?;
             ctx.pr_number = Some(number.to_string());
             let (policy, _policy_path, policy_sig) = config::Policy::load_state(&cfg_path, &cfg)?;
             run_publication_gate(&cfg, &cfg_sig, &policy, &policy_sig, &ctx, "merge")?;
@@ -1734,15 +2089,20 @@ fn cmd_release(
     // the vault is locked. Nothing reaches GitHub until the registry passes.
     if let ReleaseCommand::Create { tag, .. } = &command {
         let (policy, _policy_path, policy_sig) = config::Policy::load_state(&cfg_path, &cfg)?;
-        let ctx = context_for(&cfg, "release", &PathBuf::from("."), Some(tag.clone())).map_err(
-            |err| {
-                anyhow::anyhow!(
-                    "reviewing a release needs a checkout with the tagged commit\n  \
+        let ctx = context_for(
+            &cfg,
+            "release",
+            &PathBuf::from("."),
+            Some(tag.clone()),
+            None,
+        )
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "reviewing a release needs a checkout with the tagged commit\n  \
                      {err:#}\n  \
                      run this from the tagged working tree"
-                )
-            },
-        )?;
+            )
+        })?;
         run_publication_gate(&cfg, &cfg_sig, &policy, &policy_sig, &ctx, "release")?;
     }
     let vault = vault::Vault::open()?;
@@ -1931,11 +2291,33 @@ fn cmd_signing_key(
 
 #[cfg(test)]
 mod tests {
-    use super::audit_gate;
+    use super::{audit_gate, outgoing_push_stdin, publication_surface};
     use crate::checkers::Context;
     use crate::config::{Config, Policy};
     use crate::configsig::SigState;
     use std::path::PathBuf;
+    use std::process::Command;
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Synthetic")
+            .env("GIT_AUTHOR_EMAIL", "synthetic@example.invalid")
+            .env("GIT_COMMITTER_NAME", "Synthetic")
+            .env("GIT_COMMITTER_EMAIL", "synthetic@example.invalid")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
 
     fn ctx(event: &str) -> Context {
         Context {
@@ -1948,6 +2330,7 @@ mod tests {
             expected_email: None,
             actual_email: None,
             stdin: None,
+            push_remote: None,
             pr_base: None,
             pr_head: None,
             pr_number: None,
@@ -2032,5 +2415,100 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// The publication surface refuses every write that lands content or moves
+    /// refs, including absolute-URL forms, while reads and metadata writes
+    /// stay open. An absolute URL that no longer normalizes silently unguards
+    /// the whole list, so that form is exercised explicitly.
+    #[test]
+    fn the_api_surface_refuses_only_publication_writes() {
+        for (method, path) in [
+            ("PUT", "/repos/o/r/contents/src/lib.rs"),
+            ("POST", "/repos/o/r/git/refs"),
+            ("POST", "/repos/o/r/git/tags"),
+            ("PATCH", "/repos/o/r/git/refs/heads/main"),
+            ("DELETE", "/repos/o/r/git/refs/heads/stale"),
+            ("POST", "/repos/o/r/merges"),
+            ("POST", "/repos/o/r/merge-upstream"),
+            ("POST", "/repos/o/r/pulls"),
+            ("PUT", "/repos/o/r/pulls/7/merge"),
+            ("PUT", "/repos/o/r/pulls/7/update-branch"),
+            ("POST", "/repos/o/r/releases"),
+            ("PATCH", "/repos/o/r/releases/9"),
+            ("POST", "/repos/o/r/statuses/deadbeef"),
+            // The audited channel is safe only if absolute URLs still
+            // normalize onto the path the match runs against.
+            ("POST", "https://api.github.com/repos/o/r/statuses/deadbeef"),
+        ] {
+            assert!(
+                publication_surface(method, path).is_some(),
+                "{method} {path} publishes and must be refused"
+            );
+        }
+        for (method, path) in [
+            ("GET", "/repos/o/r/contents/src/lib.rs"),
+            ("GET", "/repos/o/r/pulls/7"),
+            ("POST", "/repos/o/r/issues"),
+            ("POST", "/repos/o/r/issues/3/comments"),
+            ("PATCH", "/repos/o/r/pulls/7"), // metadata edit, not publication
+            ("POST", "/repos/o/r/labels"),
+            ("POST", "/repos/o/r/pulls/7/merge-ish"), // not the merge endpoint
+        ] {
+            assert!(
+                publication_surface(method, path).is_none(),
+                "{method} {path} does not publish and must stay open"
+            );
+        }
+    }
+
+    /// `check` outside a hook has no ref list on stdin; the synthesized lines
+    /// must name every outgoing branch with its upstream (or zeros for a
+    /// first push) so the gate reviews real targets instead of passing empty.
+    #[test]
+    fn a_hookless_check_synthesizes_the_refs_a_push_would_carry() {
+        let dir = std::env::temp_dir().join(format!(
+            "gv-check-refs-{}-{:04x}",
+            std::process::id(),
+            rand::random::<u16>()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-b", "main"]);
+        std::fs::write(dir.join("a"), "a").unwrap();
+        git(&dir, &["add", "a"]);
+        git(&dir, &["commit", "-m", "a"]);
+        let first = git(&dir, &["rev-parse", "HEAD"]);
+        // main tracks an upstream that is one commit behind: an outgoing push.
+        git(
+            &dir,
+            &["remote", "add", "origin", "git@github.com:Owner/Repo.git"],
+        );
+        git(&dir, &["update-ref", "refs/remotes/origin/main", &first]);
+        git(&dir, &["config", "branch.main.remote", "origin"]);
+        git(&dir, &["config", "branch.main.merge", "refs/heads/main"]);
+        std::fs::write(dir.join("b"), "b").unwrap();
+        git(&dir, &["add", "b"]);
+        git(&dir, &["commit", "-m", "b"]);
+        let head = git(&dir, &["rev-parse", "HEAD"]);
+        // feature has no upstream: a first push, remote sha is zeros.
+        git(&dir, &["checkout", "-b", "feature"]);
+
+        let stdin = outgoing_push_stdin(&crate::git::Repo::for_test(
+            &dir.to_string_lossy(),
+            Some("git@github.com:Owner/Repo.git"),
+        ));
+        assert!(
+            stdin.contains(&format!("refs/heads/main {head} refs/heads/main {first}")),
+            "{stdin}"
+        );
+        assert!(
+            stdin.contains(&format!(
+                "refs/heads/feature {head} refs/heads/feature {}",
+                "0".repeat(40)
+            )),
+            "{stdin}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

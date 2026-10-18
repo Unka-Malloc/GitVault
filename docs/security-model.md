@@ -92,7 +92,8 @@ tree, so a repository cannot edit the terms it is judged by. The engine:
 - runs each checker from a **neutral working directory** with a **curated
   environment** (`PATH`, `HOME`, `LANG`, `TMPDIR`, `GITVAULT_*` only) — ambient
   credentials and steering variables cannot reach the check;
-- passes the repository as an absolute argument, never as cwd;
+- passes the repository as an absolute argument, never as cwd — the single
+  exception is `kind = "verify"` below, which stages the candidate revision;
 - is **fail-closed**: a blocking checker that is missing, times out, or exits
   non-zero refuses the action;
 - runs every checker for the event and reports all results — no short-circuit
@@ -104,6 +105,14 @@ the engine's portable floor — `-P` and `PYTHONSAFEPATH=1`, which stop
 `sys.path` shadowing but leave user site-packages and `PYTHONPATH` alone;
 register the command with `-I` itself when the stronger isolation is wanted.
 
+The third kind, `verify`, is the declared exception to the neutral-directory
+rule: it stages a **detached worktree of the candidate revision** inside its
+neutral directory and runs the signed command there, because a build or test
+can only exercise the code itself. `repos` scopes the row to origin slugs or
+work-tree path prefixes, and `{verify_head}` substitutes the resolved
+revision. The command still comes only from the signed policy — the
+repository never names its own test.
+
 **Tracked repository hooks run.** The hook dispatcher also invokes a
 checked-out `.githooks/<event>` when it is executable, so a repository's own
 hooks keep working under GitVault. That is a declared exception to "nothing
@@ -113,23 +122,24 @@ runs first and a non-zero exit stops the chain), but the execution surface
 exists — review `.githooks/` after cloning as you would `Makefile` or CI
 scripts.
 
-`git push --no-verify` bypasses the git `pre-push` hook — git offers no counter
-to it, so the push hook alone is a convenience. Two environment variables on
-the hook chain are bypasses of the same class and are listed here so the list
-is complete: `GITVAULT_BIN` substitutes the dispatcher's gateway binary, and
-`GIT_IDENTITY_GUARD_CHAINED=1` skips the gateway call entirely (it exists as
-the chain's own recursion guard). Neither reaches `pr`/`release`, whose
-checker runs happen inside the `gitvault` process before any credential is
-unlocked. The boundaries that cannot be
-bypassed are the ones GitVault controls: `pr create`, `pr merge` and
-`release create` run the checker registry before any credential is unlocked
-and refuse without contacting GitHub.
+`git push --no-verify` bypasses the git `pre-push` hook — git offers no local
+counter to it, so the hook alone is a convenience. The counter lives on the
+server: a successful pre-push audit posts a `gitvault/audited` commit status
+on the reviewed head, and a GitHub ruleset that requires it rejects every
+unmarked push — `--no-verify`, a web edit and another machine all fail there
+together. `GIT_IDENTITY_GUARD_CHAINED=1` skips the gateway call entirely (it
+exists as the chain's own recursion guard); it is the same class: refused by
+the server rule, not by git. The boundaries GitVault controls outright — `pr
+create`, `pr merge` and `release create` — run the checker registry before
+any credential is unlocked and refuse without contacting GitHub.
 
-The remaining commands — `api`, `repo`, `issue` and `ssh` — are gated by
-identity routing and the unlock window only; they do **not** run registered
-checkers. A direct `gitvault api` write therefore reaches GitHub after the
-identity and unlock gates, not after an audit. Treat them as credential-broker
-operations, not audited publication paths.
+The remaining commands — `api`, `repo`, `issue` and `ssh` — do **not** run
+registered checkers, and `api` additionally *refuses* every request that
+would publish: content writes (`contents`, `git/*`), ref-moving endpoints
+(`merges`, `merge-upstream`, `pulls` create/merge/update-branch), releases,
+and commit statuses — the last so a hand-posted `gitvault/audited` cannot
+forge the attestation the ruleset trusts. Reads and metadata writes (issues,
+comments, labels) still pass as credential-broker operations.
 
 ## Run records
 

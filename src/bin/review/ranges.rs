@@ -43,20 +43,7 @@ fn short_ref(name: &str) -> &str {
 
 /// True when a remote-tracking ref already contains the commit.
 fn published_elsewhere(repo: &str, commit: &str) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args([
-            "for-each-ref",
-            "--count=1",
-            "--contains",
-            commit,
-            "--format=%(refname)",
-            "refs/remotes",
-        ])
-        .output()
-        .map(|out| !String::from_utf8_lossy(&out.stdout).trim().is_empty())
-        .unwrap_or(false)
+    crate::git::refs_containing(std::path::Path::new(repo), commit, &["refs/remotes"])
 }
 
 /// Fetch a merge request's head into FETCH_HEAD; creates no ref.
@@ -76,11 +63,26 @@ fn fetch_pull_head(repo: &str, number: &str) -> Result<(), String> {
 }
 
 /// One whole-snapshot target at the resolved head commit.
-fn snapshot(kind: &str, label: String, head: String, ref_: Option<String>) -> Target {
+///
+/// `base` is the published tip the operation builds on - the remote ref's own
+/// sha for a push, the base branch head for a pull request. When set, two
+/// consumers use it: stage-one scans the blobs the `base..head` range
+/// introduces (so a credential committed and removed inside the range still
+/// gets caught), and the evidence server's `diff` tool shows the real
+/// `base..head` diff instead of a whole-tree one - unchanged files page to
+/// empty, which keeps the coverage contract while dropping the paid review to
+/// the actual increment. Stage-one's own scans stay whole-tree either way.
+fn snapshot(
+    kind: &str,
+    label: String,
+    base: Option<String>,
+    head: String,
+    ref_: Option<String>,
+) -> Target {
     Target {
         kind: kind.to_string(),
         label,
-        base: None,
+        base,
         head,
         ref_,
         scope: "snapshot".to_string(),
@@ -109,7 +111,7 @@ fn release_target(repo: &str, tag: &str, commit: &str) -> Result<Target, String>
             tag
         }
     );
-    Ok(snapshot("release", label, head, None))
+    Ok(snapshot("release", label, None, head, None))
 }
 
 /// The push refs, pull request or release to audit. `vars` carries the
@@ -137,6 +139,16 @@ pub fn ranges_from(
         let head_ref = var("GITVAULT_PR_HEAD");
         let base_ref = var("GITVAULT_PR_BASE");
         let number = var("GITVAULT_PR_NUMBER");
+        // The range the request proposes: the base branch's remote-tracking
+        // head, or origin/HEAD when the base is left at the default.
+        let base = if base_ref.is_empty() {
+            rev(repo, "refs/remotes/origin/HEAD^{commit}")
+        } else {
+            rev(
+                repo,
+                &format!("refs/remotes/origin/{}^{{commit}}", short_ref(&base_ref)),
+            )
+        };
         let (head, label);
         if !number.is_empty() {
             fetch_pull_head(repo, &number)?;
@@ -170,7 +182,8 @@ pub fn ranges_from(
         if head.is_empty() {
             return Err("The pull request head is not available locally; push the branch through GitVault first".to_string());
         }
-        return Ok(vec![snapshot("pr", label, head, None)]);
+        let base = if base.is_empty() { None } else { Some(base) };
+        return Ok(vec![snapshot("pr", label, base, head, None)]);
     }
     let mut found = Vec::new();
     for line in var("GITVAULT_PUSH_REFS").lines() {
@@ -178,7 +191,7 @@ pub fn ranges_from(
         if fields.len() != 4 {
             continue;
         }
-        let (local_ref, local_sha) = (fields[0], fields[1]);
+        let (local_ref, local_sha, remote_sha) = (fields[0], fields[1], fields[3]);
         if local_sha.trim_matches('0').is_empty() {
             continue; // a deletion publishes nothing
         }
@@ -186,9 +199,15 @@ pub fn ranges_from(
         if head.is_empty() || published_elsewhere(repo, &head) {
             continue; // already-published tips add no unreviewed content
         }
+        let base = if remote_sha.trim_matches('0').is_empty() {
+            None
+        } else {
+            Some(remote_sha.to_string())
+        };
         found.push(snapshot(
             "push",
             format!("push {local_ref}"),
+            base,
             head,
             Some(local_ref.to_string()),
         ));

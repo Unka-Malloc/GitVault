@@ -6,6 +6,7 @@
   "finding_keys": ["file", "line", "severity", "evidence", "impact", "remedy", "validation"],
   "stage1": {
     "label": "deterministic",
+    "surfaces": true,
     "rules": [
       {"id": "maintainer-hygiene", "title": "Conflict markers, merge artifacts and OS junk", "kind": "builtin", "builtin": "maintainer-hygiene"}
     ]
@@ -30,6 +31,6 @@
     "manifests": ["package.json", "Cargo.toml", "go.mod", "pubspec.yaml", "pyproject.toml", "requirements.txt", "Dockerfile", "Caddyfile", "nginx.conf", "README.md", "PRODUCT.md", "CONTEXT.md", "AGENTS.md", "CHANGELOG.md"],
     "exclude_names": ["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "Cargo.lock", "composer.lock", "poetry.lock", "Pipfile.lock", "Podfile.lock", "pubspec.lock", "go.sum", "Gemfile.lock", "flake.lock"]
   },
-  "task": "Review the outgoing changes with the Sustainable Maintainer tools and submit one final verdict: start with inventory, read every changed diff to its end, then judge all six domains. No arbitrary turn or time limit applies.",
+  "task": "Review the outgoing changes with the Sustainable Maintainer tools and submit one final verdict: start with inventory, read every changed diff to its end, judge all six domains, and account for every surface the deterministic stage reported. No arbitrary turn or time limit applies.",
   "task_full_service": "Perform the assigned repository-wide maintainability review. Start with inventory and original_request (the review charter), inspect every selected project across all six domains, and submit a complete report with per-project and per-domain coverage. No arbitrary turn or time limit applies."
 }
