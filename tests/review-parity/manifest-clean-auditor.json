@@ -45,7 +45,7 @@
   },
   {
     "name": "clean_submit_review",
-    "description": "Submit the final privacy verdict once, with every domain and both standing items accounted for.",
+    "description": "Submit the final privacy verdict once, with every domain and every standing item accounted for.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -230,6 +230,27 @@
                 "reason"
               ],
               "additionalProperties": false
+            },
+            "repository_scope": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "reviewed",
+                    "not-applicable",
+                    "unknown"
+                  ]
+                },
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "reason"
+              ],
+              "additionalProperties": false
             }
           },
           "required": [
@@ -240,7 +261,8 @@
             "personal_info",
             "credentials",
             "tooling",
-            "hardcoding"
+            "hardcoding",
+            "repository_scope"
           ],
           "additionalProperties": false
         },

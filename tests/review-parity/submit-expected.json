@@ -36,6 +36,10 @@
           "hardcoding": {
             "status": "reviewed",
             "reason": "looked"
+          },
+          "repository_scope": {
+            "status": "reviewed",
+            "reason": "reviewed the outgoing change for repository-scope references"
           }
         },
         "findings": [],
@@ -91,6 +95,10 @@
           "hardcoding": {
             "status": "reviewed",
             "reason": "looked"
+          },
+          "repository_scope": {
+            "status": "reviewed",
+            "reason": "reviewed the outgoing change for repository-scope references"
           }
         },
         "findings": [
@@ -156,6 +164,10 @@
           "hardcoding": {
             "status": "reviewed",
             "reason": "looked"
+          },
+          "repository_scope": {
+            "status": "reviewed",
+            "reason": "reviewed the outgoing change for repository-scope references"
           }
         },
         "findings": [],
@@ -210,6 +222,10 @@
           "hardcoding": {
             "status": "reviewed",
             "reason": "looked"
+          },
+          "repository_scope": {
+            "status": "reviewed",
+            "reason": "reviewed the outgoing change for repository-scope references"
           }
         },
         "findings": [],
@@ -264,6 +280,10 @@
           "hardcoding": {
             "status": "reviewed",
             "reason": "looked"
+          },
+          "repository_scope": {
+            "status": "reviewed",
+            "reason": "reviewed the outgoing change for repository-scope references"
           }
         },
         "findings": "none",
@@ -314,6 +334,10 @@
           "hardcoding": {
             "status": "reviewed",
             "reason": "looked"
+          },
+          "repository_scope": {
+            "status": "reviewed",
+            "reason": "reviewed the outgoing change for repository-scope references"
           }
         },
         "findings": [],
@@ -329,7 +353,7 @@
         "https://example.invalid/pricing"
       ],
       "expected": {
-        "error": "Account for every domain: privacy, business_secret, operations_data, machine_path, personal_info, credentials, tooling, hardcoding"
+        "error": "Account for every domain: privacy, business_secret, operations_data, machine_path, personal_info, credentials, tooling, hardcoding, repository_scope"
       }
     },
     "unknowns-not-list": {
@@ -368,6 +392,10 @@
           "hardcoding": {
             "status": "reviewed",
             "reason": "looked"
+          },
+          "repository_scope": {
+            "status": "reviewed",
+            "reason": "reviewed the outgoing change for repository-scope references"
           }
         },
         "findings": [],
@@ -422,6 +450,10 @@
           "hardcoding": {
             "status": "reviewed",
             "reason": "looked"
+          },
+          "repository_scope": {
+            "status": "reviewed",
+            "reason": "reviewed the outgoing change for repository-scope references"
           }
         },
         "findings": [
@@ -485,6 +517,10 @@
           "hardcoding": {
             "status": "reviewed",
             "reason": "looked"
+          },
+          "repository_scope": {
+            "status": "reviewed",
+            "reason": "reviewed the outgoing change for repository-scope references"
           }
         },
         "findings": [
@@ -549,6 +585,10 @@
           "hardcoding": {
             "status": "reviewed",
             "reason": "looked"
+          },
+          "repository_scope": {
+            "status": "reviewed",
+            "reason": "reviewed the outgoing change for repository-scope references"
           }
         },
         "findings": [
@@ -613,6 +653,10 @@
           "hardcoding": {
             "status": "reviewed",
             "reason": "looked"
+          },
+          "repository_scope": {
+            "status": "reviewed",
+            "reason": "reviewed the outgoing change for repository-scope references"
           }
         },
         "findings": [
@@ -677,6 +721,10 @@
           "hardcoding": {
             "status": "reviewed",
             "reason": "looked"
+          },
+          "repository_scope": {
+            "status": "reviewed",
+            "reason": "reviewed the outgoing change for repository-scope references"
           }
         },
         "findings": [
@@ -741,6 +789,10 @@
           "hardcoding": {
             "status": "reviewed",
             "reason": "looked"
+          },
+          "repository_scope": {
+            "status": "reviewed",
+            "reason": "reviewed the outgoing change for repository-scope references"
           }
         },
         "findings": [],
@@ -793,6 +845,10 @@
           "hardcoding": {
             "status": "reviewed",
             "reason": "looked"
+          },
+          "repository_scope": {
+            "status": "reviewed",
+            "reason": "reviewed the outgoing change for repository-scope references"
           }
         },
         "findings": [
@@ -857,6 +913,10 @@
           "hardcoding": {
             "status": "unknown",
             "reason": "looked"
+          },
+          "repository_scope": {
+            "status": "unknown",
+            "reason": "reviewed the outgoing change for repository-scope references"
           }
         },
         "findings": [],
@@ -908,6 +968,10 @@
           },
           "hardcoding": {
             "status": "reviewed"
+          },
+          "repository_scope": {
+            "status": "reviewed",
+            "reason": "reviewed the outgoing change for repository-scope references"
           }
         },
         "findings": [],
@@ -960,6 +1024,10 @@
           "hardcoding": {
             "status": "reviewed",
             "reason": "looked"
+          },
+          "repository_scope": {
+            "status": "reviewed",
+            "reason": "reviewed the outgoing change for repository-scope references"
           }
         },
         "findings": [],

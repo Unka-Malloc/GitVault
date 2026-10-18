@@ -1,13 +1,12 @@
 ---
 name: clean-auditor
-description: The privacy and confidentiality gate before publication. Use when changing anything that will be pushed, proposed in a pull request, or released, and when a Clean Auditor refusal needs to be understood or repaired. Covers privacy, business secrets, operational data, machine paths, personal information and credentials.
+description: The privacy and confidentiality gate before publication. Use when changing anything that will be pushed, proposed in a pull request, or released, and when a Clean Auditor refusal needs to be understood or repaired. Covers privacy, business secrets, operational data, machine paths, personal information, credentials and content belonging to other repositories.
 ---
 
 # Clean Auditor
 
-Publication happens at three boundaries, and Clean Auditor stands at two of
-them: `pre-push` and `pr` (create and merge); `release create` is gated by the
-security reviewer. It reviews the
+Publication happens at three boundaries, and Clean Auditor stands at all of
+them: `pre-push`, `pr` (create and merge), and `release create`. It reviews the
 outgoing range only, refuses when the change cannot be published, and never
 modifies anything.
 
@@ -15,14 +14,12 @@ modifies anything.
 
 A refusal is a verdict, not an obstacle:
 
-- **deterministic refusal** (stage one): a credential shape or a withheld
-  name, either of which may hide behind a credential-container path. The
-  scan runs locally, prints category counts and never prints the matched
-  value.
-- **semantic refusal** (stage two): the six domains and the two standing
-  items — tooling hygiene and hardcoded parameters, including machine
-  paths and internal addresses — judged by an isolated OpenCode conversation
-  with a fresh context each run.
+- **deterministic refusal** (stage one): a shape it can prove — a credential,
+  a machine path, an internal address, a structural policy violation. The scan
+  runs locally, prints category counts and never prints the matched value.
+- **semantic refusal** (stage two): the six domains and the three standing
+  items — tooling hygiene, hardcoded parameters and repository scope — judged
+  by an isolated OpenCode conversation with a fresh context each run.
 
 Repair the change (remove or generalize the content), then publish again. Do
 not re-word the finding away and do not add a skip: the checker reads no
@@ -41,13 +38,14 @@ Walk the outgoing diff once before pushing, proposing or releasing: no
 credential shapes or credential containers, no withheld names, no personal
 information, no machine paths, host names or private endpoints, no real
 operational data; every tool's state directory ignored; every parameter in
-configuration or its one named place. Fix what the list catches, then let the
-checker run anyway — self-check precedes the audit, it does not replace it.
+configuration or its one named place; no material that belongs to a different
+repository. Fix what the list catches, then let the checker run anyway —
+self-check precedes the audit, it does not replace it.
 
 ## Boundaries worth knowing
 
 - `git push --no-verify` bypasses the `pre-push` hook; the unbypassable
-  boundary is GitVault's own `pr` path.
+  boundaries are GitVault's own `pr` and `release` paths.
 - A branch with nothing published to compare against is scanned whole and the
   receipt records why.
 - The semantic stage runs once per range; a range that already passed is reused
