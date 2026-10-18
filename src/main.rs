@@ -883,6 +883,10 @@ fn cmd_hook(config: Option<&PathBuf>, event: &str, args: &[String]) -> anyhow::R
         None,
     )?;
     if report.exit_code() == ExitCode::SUCCESS && event == "pre-push" {
+        // Pending attestations drain on every audited push - including an
+        // up-to-date one that moves no refs - so a first push's deferred
+        // status always finds a later trigger, ruleset or not.
+        drain_pending_attestations(&cfg)?;
         publish_audited_status(&cfg, &ctx)?;
     }
     Ok(report.exit_code())
@@ -960,25 +964,7 @@ fn publish_audited_status(cfg: &config::Config, ctx: &checkers::Context) -> anyh
         if git::refs_containing(&ctx.repo_root, &commit, &[&mirror]) {
             continue;
         }
-        let req = api::Request {
-            method: "POST".to_string(),
-            path: format!("/repos/{slug}/statuses/{commit}"),
-            target: api::Target::Repo(slug.to_string()),
-            fields: vec![
-                ("state".to_string(), "success".to_string()),
-                ("context".to_string(), "gitvault/audited".to_string()),
-                (
-                    "description".to_string(),
-                    "publication audit passed on this machine".to_string(),
-                ),
-            ],
-            raw_fields: Vec::new(),
-            headers: Vec::new(),
-            body: None,
-            jq: None,
-            silent: true,
-        };
-        let code = api::run(cfg, &vault, &req)?;
+        let code = api::run(cfg, &vault, &audited_status_request(&slug, &commit))?;
         if code != 0 {
             // A status only attaches to a commit GitHub already knows, and a
             // first-time head arrives with this very push - refusing here
@@ -989,18 +975,7 @@ fn publish_audited_status(cfg: &config::Config, ctx: &checkers::Context) -> anyh
             // commit GitHub does know and still cannot mark is a real
             // failure, and the push fails closed rather than landing
             // unattested.
-            let probe = api::Request {
-                method: "GET".to_string(),
-                path: format!("/repos/{slug}/commits/{commit}"),
-                target: api::Target::Repo(slug.to_string()),
-                fields: Vec::new(),
-                raw_fields: Vec::new(),
-                headers: Vec::new(),
-                body: None,
-                jq: None,
-                silent: true,
-            };
-            let known = api::run(cfg, &vault, &probe)? == 0;
+            let known = api::run(cfg, &vault, &commit_known_probe(&slug, &commit))? == 0;
             anyhow::ensure!(
                 !known,
                 "the audit passed but the `gitvault/audited` status could not be posted \
@@ -1011,9 +986,190 @@ fn publish_audited_status(cfg: &config::Config, ctx: &checkers::Context) -> anyh
                  and the remote refuses the ref update for the missing status; \
                  run `git push` again to attest and land (the audits are already sealed)"
             );
+            record_pending_attestation(cfg, &slug, &sha, &ctx.repo_root);
             continue;
         }
         eprintln!("gitvault: marked {commit:.12} audited on {slug}");
+    }
+    Ok(())
+}
+
+/// The `gitvault/audited` commit-status request - one authority for both the
+/// immediate and the deferred posting path, so the context a ruleset
+/// requires cannot drift between them.
+fn audited_status_request(slug: &str, sha: &str) -> api::Request {
+    api::Request {
+        method: "POST".to_string(),
+        path: format!("/repos/{slug}/statuses/{sha}"),
+        target: api::Target::Repo(slug.to_string()),
+        fields: vec![
+            ("state".to_string(), "success".to_string()),
+            ("context".to_string(), "gitvault/audited".to_string()),
+            (
+                "description".to_string(),
+                "publication audit passed on this machine".to_string(),
+            ),
+        ],
+        raw_fields: Vec::new(),
+        headers: Vec::new(),
+        body: None,
+        jq: None,
+        silent: true,
+    }
+}
+
+/// Whether GitHub can name the commit - the chicken-and-egg probe the
+/// immediate path uses to tell "lands with this push" from "real posting
+/// failure". The deferred path skips it: a failed POST keeps the pending
+/// file either way, so the retry itself is the probe.
+fn commit_known_probe(slug: &str, sha: &str) -> api::Request {
+    api::Request {
+        method: "GET".to_string(),
+        path: format!("/repos/{slug}/commits/{sha}"),
+        target: api::Target::Repo(slug.to_string()),
+        fields: Vec::new(),
+        raw_fields: Vec::new(),
+        headers: Vec::new(),
+        body: None,
+        jq: None,
+        silent: true,
+    }
+}
+
+/// One deferred `gitvault/audited` posting: the audit that produced it is
+/// sealed, only the remote's knowledge of the commit was missing.
+fn pending_dir(cfg: &config::Config) -> PathBuf {
+    records::run_dir(cfg)
+        .parent()
+        .map(|dir| dir.join("pending"))
+        .unwrap_or_else(|| PathBuf::from("pending"))
+}
+
+/// Stash the attestation this push could not post. The file is a reminder,
+/// not the authority: it names the pushed object, and the drain re-proves
+/// against the sealed record chain before credentials are spent. Only the
+/// pushed sha goes in the name so a repeated first push dedupes itself.
+fn record_pending_attestation(cfg: &config::Config, slug: &str, sha: &str, repo: &Path) {
+    let dir = pending_dir(cfg);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let name = format!("{}__{}.json", slug.replace('/', "_"), sha);
+    let body = serde_json::json!({
+        "slug": slug,
+        "sha": sha,
+        "repo": repo,
+        "recorded_at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    });
+    let _ = std::fs::write(
+        dir.join(name),
+        serde_json::to_string_pretty(&body).unwrap_or_default(),
+    );
+}
+
+/// Read one pending attestation file into `(slug, pushed sha, repo)`. Slug
+/// and sha are shape-checked before either can reach a request path or a
+/// `git` argument: a pending file is same-user writable input, so it is
+/// parsed like one.
+fn read_pending(path: &Path) -> Option<(String, String, PathBuf)> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let doc: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let slug = doc["slug"].as_str()?.to_string();
+    let sha = doc["sha"].as_str()?.to_string();
+    let repo = PathBuf::from(doc["repo"].as_str()?);
+    let slug_ok = slug.split('/').count() == 2
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'));
+    let sha_ok = sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit());
+    (slug_ok && sha_ok).then_some((slug, sha, repo))
+}
+
+/// Whether the sealed run log carries a passed pre-push that pushed `sha` to
+/// `slug` - the evidence a deferred attestation replays. A planted pending
+/// file earns nothing on its own: only a commit a real audited run already
+/// pushed may be marked. `Sound` and `Gap` links both carry a recomputing
+/// self-seal (a gap means the predecessor was pruned or lost, not that this
+/// record was rewritten); `Broken` and `Unsealed` evidence is refused.
+fn pending_attested(cfg: &config::Config, slug: &str, sha: &str) -> bool {
+    let links: std::collections::HashMap<String, records::Link> =
+        records::verify(cfg).into_iter().collect();
+    records::list(cfg).unwrap_or_default().into_iter().any(|r| {
+        r.passed
+            && r.event == "pre-push"
+            && r.repository == slug
+            && matches!(
+                links.get(&r.id),
+                Some(records::Link::Sound | records::Link::Gap)
+            )
+            && r.range
+                .refs
+                .lines()
+                .any(|line| line.split_whitespace().nth(1) == Some(sha))
+    })
+}
+
+/// Post every deferred attestation whose commit the remote now knows. Each
+/// entry must re-earn its mark before the vault is even opened: the pushed
+/// sha peels to the commit in the recording repo (content-addressed, so the
+/// relation cannot be forged), and the sealed record chain must show a
+/// passed audit pushing that sha. A commit still unknown keeps its file -
+/// the failed POST is the probe, so no extra request exists - and per-entry
+/// errors stay best-effort: a stale, forged or unroutable pending must not
+/// hold every later push hostage; the file remains for the next drain.
+fn drain_pending_attestations(cfg: &config::Config) -> anyhow::Result<()> {
+    let dir = pending_dir(cfg);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(());
+    };
+    let mut pending: Vec<(PathBuf, String, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some((slug, sha, repo)) = read_pending(&path) else {
+            eprintln!(
+                "gitvault: ignoring malformed pending attestation {}",
+                path.display()
+            );
+            continue;
+        };
+        let Some(commit) = peel_commit(&repo, &sha) else {
+            eprintln!(
+                "gitvault: pending attestation for {slug}@{sha:.12} cannot be peeled in {repo:?}; keeping"
+            );
+            continue;
+        };
+        if !pending_attested(cfg, &slug, &sha) {
+            eprintln!(
+                "gitvault: pending attestation for {slug}@{sha:.12} has no sealed audit to replay; not posting"
+            );
+            continue;
+        }
+        pending.push((path, slug, commit));
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let vault = match vault::Vault::open() {
+        Ok(vault) => vault,
+        Err(error) => {
+            eprintln!("gitvault: vault unavailable, deferred attestations wait: {error}");
+            return Ok(());
+        }
+    };
+    for (path, slug, commit) in pending {
+        match api::run(cfg, &vault, &audited_status_request(&slug, &commit)) {
+            Ok(0) => {
+                let _ = std::fs::remove_file(&path);
+                eprintln!("gitvault: marked {commit:.12} audited on {slug} (deferred)");
+            }
+            Ok(_) => {} // commit not known to the remote yet - retry next run
+            Err(error) => {
+                eprintln!("gitvault: deferred attestation for {slug}@{commit:.12} failed: {error}");
+            }
+        }
     }
     Ok(())
 }
@@ -2291,10 +2447,14 @@ fn cmd_signing_key(
 
 #[cfg(test)]
 mod tests {
-    use super::{audit_gate, outgoing_push_stdin, publication_surface};
+    use super::{
+        audit_gate, drain_pending_attestations, outgoing_push_stdin, pending_attested,
+        publication_surface, read_pending, record_pending_attestation,
+    };
     use crate::checkers::Context;
     use crate::config::{Config, Policy};
     use crate::configsig::SigState;
+    use crate::records;
     use std::path::PathBuf;
     use std::process::Command;
 
@@ -2509,6 +2669,130 @@ mod tests {
             )),
             "{stdin}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pending-file contract is the drain's only input: a deferred
+    /// attestation must land where the drain looks and read back the slug
+    /// and sha it was recorded with, or key drift silently disables the
+    /// whole mechanism.
+    #[test]
+    fn a_pending_attestation_round_trips_through_its_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "gv-pending-{}-{:04x}",
+            std::process::id(),
+            rand::random::<u16>()
+        ));
+        let cfg = Config {
+            record_dir: Some(dir.join("runs")),
+            ..Default::default()
+        };
+        let sha = "a".repeat(40);
+        record_pending_attestation(&cfg, "Owner/Repo", &sha, &dir);
+        let file = dir.join("pending").join(format!("Owner_Repo__{sha}.json"));
+        assert!(file.is_file(), "pending file missing at {}", file.display());
+        assert_eq!(
+            read_pending(&file),
+            Some(("Owner/Repo".to_string(), sha.clone(), dir.clone()))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pending file is same-user writable, so a planted one must not earn
+    /// a posting: without a sealed passed run pushing that sha, the drain
+    /// refuses and keeps the file - before the vault is ever opened.
+    #[test]
+    fn a_planted_pending_attestation_is_not_posted() {
+        let dir = std::env::temp_dir().join(format!(
+            "gv-pending-{}-{:04x}",
+            std::process::id(),
+            rand::random::<u16>()
+        ));
+        let cfg = Config {
+            record_dir: Some(dir.join("runs")),
+            ..Default::default()
+        };
+        // Write a real commit in a real repo so the peel check cannot be the
+        // reason the entry is skipped: only the missing evidence may refuse.
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init"]);
+        std::fs::write(repo.join("a"), "a").unwrap();
+        git(&repo, &["add", "a"]);
+        git(&repo, &["commit", "-m", "a"]);
+        let sha = git(&repo, &["rev-parse", "HEAD"]);
+        record_pending_attestation(&cfg, "Owner/Repo", &sha, &repo);
+        let file = dir.join("pending").join(format!("Owner_Repo__{sha}.json"));
+
+        // No run records exist: the claim is forged, the drain must hold.
+        drain_pending_attestations(&cfg).unwrap();
+        assert!(file.is_file(), "forged pending was posted or dropped");
+        // And a pushed sha that does appear in a sealed passing record is
+        // the only shape that may post - assert the predicate sees the gap.
+        assert!(!pending_attested(&cfg, "Owner/Repo", &sha));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The positive half of the binding: a sealed, passed pre-push record
+    /// whose refs pushed the sha is accepted as evidence; rewriting it
+    /// breaks the seal and the evidence with it.
+    #[test]
+    fn only_a_sealed_passed_push_record_attests_a_pending_sha() {
+        let dir = std::env::temp_dir().join(format!(
+            "gv-attest-{}-{:04x}",
+            std::process::id(),
+            rand::random::<u16>()
+        ));
+        let run_dir = dir.join("runs");
+        let cfg = Config {
+            record_dir: Some(run_dir.clone()),
+            ..Default::default()
+        };
+        let sha = "b".repeat(40);
+        let record_dir = run_dir.join("0000000001-a1a1");
+        std::fs::create_dir_all(&record_dir).unwrap();
+        let mut record = records::Record {
+            id: "0000000001-a1a1".to_string(),
+            created_at: 1,
+            duration_ms: 0,
+            event: "pre-push".to_string(),
+            repository: "Owner/Repo".to_string(),
+            identity: "synthetic".to_string(),
+            account: "Fixture-Acct".to_string(),
+            range: records::Range {
+                refs: format!("refs/heads/main {sha} refs/heads/main {}", "0".repeat(40)),
+                pr_base: None,
+                pr_head: None,
+                pr_number: None,
+                release_tag: None,
+                release_commit: None,
+            },
+            routing_signature: "valid".to_string(),
+            passed: true,
+            blocking_failures: 0,
+            outcomes: Vec::new(),
+            seal: String::new(),
+            seal_prev: String::new(),
+        };
+        record.seal = crate::seal::seal("", &serde_json::to_value(&record).unwrap());
+        let file = record_dir.join("engine.json");
+        let write = |r: &records::Record| {
+            std::fs::write(&file, serde_json::to_string_pretty(r).unwrap()).unwrap();
+        };
+        write(&record);
+        assert!(pending_attested(&cfg, "Owner/Repo", &sha));
+
+        // A different sha - one the recorded push never carried - has no
+        // evidence, and tampering with the refs breaks the seal either way.
+        assert!(!pending_attested(&cfg, "Owner/Repo", &"c".repeat(40)));
+        record.range.refs = format!(
+            "refs/heads/main {} refs/heads/main {}",
+            "c".repeat(40),
+            "0".repeat(40)
+        );
+        write(&record); // stale seal: rewritten after sealing
+        assert!(!pending_attested(&cfg, "Owner/Repo", &sha));
+        assert!(!pending_attested(&cfg, "Owner/Repo", &"c".repeat(40)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

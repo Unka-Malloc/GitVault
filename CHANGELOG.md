@@ -43,7 +43,9 @@
   `gitvault/audited` commit status for the exact reviewed commit, so a
   GitHub ruleset can require it and cover `--no-verify`, web edits and other
   machines. Tag objects peel to their commit; tips the remote already holds
-  are never marked.
+  are never marked. A status the remote cannot accept yet — the commit
+  arrives with that very push — is recorded under the pending directory and
+  reposted by the first later audited push, ruleset or not.
 - Chain run records and review receipts with sha256 seals and add
   `gitvault records verify` to detect rewrites and gaps. Old records read as
   unsealed, never as tampered.

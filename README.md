@@ -160,8 +160,7 @@ is documented in [`docs/security-model.md`](docs/security-model.md).
 - `gitvault-review` and `gitvault-audit-agent` on PATH for the bundled
   checkers under `tools/`; the semantic review stage runs whichever agent
   lane the checker's registry document declares, through A4AA, with the
-  runtime declared in the synced profile — this machine's deployment
-  declares OpenCode (`opencode serve`) with a Devin ACP fallback.
+  runtime declared in the synced profile.
   Python 3 only when a registered checker uses `kind = "python"`.
 
 ## License
@@ -192,8 +191,7 @@ completed turn alone cannot pass a gate. Receipts record the AwP principal and r
 receipt reuse and unfinished-run selection also match the role and version.
 
 The runtime comes from the synced profile's `runtime` declaration — harness,
-provider and model chain — and this machine's deployment declares an OpenCode
-lane on the free `opencode/`-namespaced model chain. Each checker has an
+provider and model chain. Each checker has an
 isolated XDG home with no host configuration, plugins, skills or shell tools;
 the deployment's declared agent spec carries the tool policy — denied edits,
 shell, web and sub-agent calls — as data. Credentials resolve through the
