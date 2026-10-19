@@ -76,10 +76,15 @@ const STORES: &[Store] = &[
     },
 ];
 
-/// Archive every session recorded under `runs_dir` in each admitted agent's
-/// store: one UPDATE per store over the collected id list.
-pub fn run_sessions(runs_dir: &Path) {
-    let ids = recorded_ids(runs_dir);
+/// Archive every finished run's recorded sessions in each admitted agent's
+/// store: one UPDATE per store over the collected id list. `profiles_root`
+/// is `~/.local/share/gitvault/profiles`; every `*-runs` directory beneath
+/// it contributes, so a checker skipped by an earlier phase's refusal still
+/// gets its backlog swept by whichever checker does run. Run directories
+/// holding a `live` marker whose recorded pid is still running are in
+/// flight — their sessions stay untouched until the run really ends.
+pub fn run_sessions(profiles_root: &Path) {
+    let ids = recorded_ids(profiles_root);
     if ids.is_empty() {
         return;
     }
@@ -113,29 +118,69 @@ pub fn run_sessions(runs_dir: &Path) {
     }
 }
 
-/// Every session id recorded under `runs_dir`: each run's
-/// `audit-session.json` contributes `session_ids` (all conversations the run
+/// Every session id recorded under `profiles_root`: walk each checker's
+/// `*-runs` directory, skip runs still in flight, and read each finished
+/// run's `audit-session.json` — `session_ids` (all conversations the run
 /// opened) plus the scalar `session_id` for files written before the list
 /// field existed.
-fn recorded_ids(runs_dir: &Path) -> BTreeSet<String> {
-    let Ok(entries) = std::fs::read_dir(runs_dir) else {
-        return BTreeSet::new();
-    };
+fn recorded_ids(profiles_root: &Path) -> BTreeSet<String> {
     let mut ids = BTreeSet::new();
-    for entry in entries.flatten() {
-        let file = entry.path().join("audit-session.json");
-        let Ok(raw) = std::fs::read_to_string(&file) else {
+    let Ok(profiles) = std::fs::read_dir(profiles_root) else {
+        return ids;
+    };
+    for profile in profiles.flatten() {
+        let Ok(members) = std::fs::read_dir(profile.path()) else {
             continue;
         };
-        let Ok(saved) = serde_json::from_str::<serde_json::Value>(&raw) else {
-            continue;
-        };
-        if let Some(id) = saved["session_id"].as_str() {
-            ids.insert(id.to_string());
-        }
-        if let Some(list) = saved["session_ids"].as_array() {
-            ids.extend(list.iter().filter_map(|id| id.as_str().map(str::to_string)));
+        for member in members.flatten() {
+            let runs_dir = member.path();
+            if !runs_dir.is_dir()
+                || member
+                    .file_name()
+                    .to_str()
+                    .is_none_or(|n| !n.ends_with("-runs"))
+            {
+                continue;
+            }
+            let Ok(runs) = std::fs::read_dir(&runs_dir) else {
+                continue;
+            };
+            for run in runs.flatten() {
+                let dir = run.path();
+                if in_flight(&dir) {
+                    continue;
+                }
+                let Ok(raw) = std::fs::read_to_string(dir.join("audit-session.json")) else {
+                    continue;
+                };
+                let Ok(saved) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                    continue;
+                };
+                if let Some(id) = saved["session_id"].as_str() {
+                    ids.insert(id.to_string());
+                }
+                if let Some(list) = saved["session_ids"].as_array() {
+                    ids.extend(list.iter().filter_map(|id| id.as_str().map(str::to_string)));
+                }
+            }
         }
     }
     ids
+}
+
+/// A run is in flight while its `live` marker names a pid still running.
+/// A stale marker (dead pid, unreadable pid) means the run died — its
+/// sessions are finished and safe to archive.
+fn in_flight(run_dir: &Path) -> bool {
+    let Ok(pid) = std::fs::read_to_string(run_dir.join("live")) else {
+        return false;
+    };
+    let Ok(pid) = pid.trim().parse::<u32>() else {
+        return false;
+    };
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }

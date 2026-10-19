@@ -15,10 +15,10 @@ The `gitvault-review` binary (`src/bin/review.rs` + `src/bin/review/`):
 - `evidence.rs` — the sensitive-path contract and the gate-mode evidence verbs
   (inventory/list/diff/read/find) with the pagination state a verdict depends
   on.
-- `stage1.rs` — the deterministic stage: the three per-checker builtins
+- `stage1.rs` — the deterministic stage: the per-checker builtins
   (withheld-names-and-credentials, maintainer-hygiene,
-  security-static-checklist) plus regex rules executed as data over a declared
-  target. The builtins own one coupled scan pass each.
+  security-static-checklist, dependency-direction) plus regex rules executed
+  as data over a declared target. The builtins own one coupled scan pass each.
 - `documents.rs` — the catalogued official-document fetcher: closed whitelist,
   redirects pinned to the same authority, HTML text extraction, paged replies,
   a persisted per-run cache.

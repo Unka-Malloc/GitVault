@@ -35,10 +35,13 @@
   session_v2, and `cognition.ai/isArchived` on the Devin desktop's
   globalStorage session index that its sidebar actually renders — so
   resumable transcripts stop filling the operator's visible session lists.
-  The sweep runs only after the audit finishes: flagging a conversation
-  while its agent is still prompting breaks the turn, and the store writes
-  wait out transient database locks rather than refusing. Concealment is
-  best-effort and never gates a run.
+  The sweep covers every checker's runs root on each gate — a checker
+  skipped by an earlier phase's refusal still gets its backlog concealed —
+  and runs only after the audit finishes: flagging a conversation while
+  its agent is still prompting breaks the turn. Each run directory carries
+  a `live` pid marker so a sibling sweep can never archive a conversation
+  mid-turn, and the store writes wait out transient database locks rather
+  than refusing. Concealment is best-effort and never gates a run.
 - Judge a push whose remote tip is not in the local object store as a whole
   snapshot: the remote's live tip sha cannot anchor a diff it never
   fetched, so the review object falls back to the same root-to-head

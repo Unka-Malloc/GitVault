@@ -5,10 +5,10 @@ description: The privacy and confidentiality gate before publication. Use when c
 
 # Clean Auditor
 
-Publication happens at three boundaries, and Clean Auditor stands at all of
-them: `pre-push`, `pr` (create and merge), and `release create`. It reviews the
-outgoing range only, refuses when the change cannot be published, and never
-modifies anything.
+Publication happens at three boundaries, and Clean Auditor stands at two of
+them: `pre-push` and `pr` (create and merge). `release create` is gated by
+the Security Enhancer. It reviews the outgoing range only, refuses when the
+change cannot be published, and never modifies anything.
 
 ## What a refusal means
 

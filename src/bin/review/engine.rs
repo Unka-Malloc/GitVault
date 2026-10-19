@@ -575,6 +575,9 @@ fn review_target(
             created
         }
     };
+    // The conceal sweep skips directories whose `live` pid is still running;
+    // a resumed directory gets its marker refreshed either way.
+    let _ = std::fs::write(run_dir.join("live"), std::process::id().to_string());
     // The scope the evidence server reads; kind and surfaces ride along for
     // the checkers whose contracts carry them.
     let mut scope = json!({
@@ -715,12 +718,26 @@ pub fn run(repo: &str, contract_path: &Path) -> Result<i32, String> {
     let runtime = declared_runtime(&settings)?;
     let runs = settings.profile.join(format!("{}-runs", contract.name));
     let result = review_gate(repo, &contract, &settings, &runtime);
+    for entry in std::fs::read_dir(&runs).into_iter().flatten().flatten() {
+        let marker = entry.path().join("live");
+        if std::fs::read_to_string(&marker)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<u32>().ok())
+            == Some(std::process::id())
+        {
+            let _ = std::fs::remove_file(&marker);
+        }
+    }
     // Housekeeping follows the audit, never precedes it: a recorded session
     // is concealed only once its run has finished — flagging a conversation
-    // while its agent is still prompting breaks the turn. The sweep must
-    // also precede pruning, since a removed run directory takes its session
-    // id evidence with it.
-    crate::conceal::run_sessions(&runs);
+    // while its agent is still prompting breaks the turn. The sweep covers
+    // every checker's runs root, since a checker skipped by an earlier
+    // phase's refusal never reaches its own sweep. It must also precede
+    // pruning, since a removed run directory takes its session id evidence
+    // with it.
+    if let Some(profiles) = settings.profile.parent() {
+        crate::conceal::run_sessions(profiles);
+    }
     prune_runs(&runs);
     result
 }

@@ -581,8 +581,8 @@ fn is_document(path: &str) -> bool {
     )
 }
 
-/// The comparison form: case and separators erased, so `Meshrix.js`,
-/// `meshrix js` and `MESHRIXJS` are one repository.
+/// The comparison form: case and separators erased, so `Repo-Name.42`,
+/// `repo name 42` and `REPONAME42` are one repository.
 fn dep_key(name: &str) -> String {
     name.chars()
         .filter(|c| c.is_alphanumeric())
@@ -639,7 +639,7 @@ fn deps_audit(repo: &str, target: &Target, _opts: &Opts) -> Result<Vec<Hit>, Str
         return Ok(Vec::new());
     }
     let mut hits = Vec::new();
-    for record in git(repo, &["ls-tree", "-rz", &target.head])?
+    for record in git(repo, &["ls-tree", "-r", "-z", &target.head])?
         .stdout
         .split(|byte| *byte == 0)
     {
@@ -1921,6 +1921,76 @@ mod tests {
             .filter(|name| dep_key(name) != mine && dep_closure(&entries, name).contains(&mine))
             .collect();
         assert_eq!(downstreams, ["Mid", "Down"]);
+    }
+
+    #[test]
+    fn a_nested_document_naming_a_downstream_is_refused() {
+        use super::{Target, deps_audit};
+        use std::process::Command;
+        let tag = format!(
+            "gv-deps-e2e-{}-{:04x}",
+            std::process::id(),
+            rand::random::<u16>()
+        );
+        let dir = std::env::temp_dir().join(&tag);
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {:?}: {:?}", args, out);
+        };
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::write(dir.join("docs/guide.md"), "See the Down project.\n").unwrap();
+        std::fs::write(dir.join("README"), "Upstream notes.\n").unwrap();
+        run(&["init", "-q", "-b", "main"]);
+        run(&[
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:acme/Upstream.git",
+        ]);
+        run(&["add", "-A"]);
+        run(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "x",
+        ]);
+        let deps = std::env::temp_dir().join(format!("{tag}.deps"));
+        std::fs::write(&deps, "Upstream <-\nDown <- Upstream\n").unwrap();
+        unsafe { std::env::set_var("GITVAULT_REPO_DEPS", &deps) };
+        let target = Target {
+            kind: "push".into(),
+            label: "push".into(),
+            base: None,
+            head: "HEAD".into(),
+            ref_: None,
+            scope: String::new(),
+            fallback: String::new(),
+        };
+        let hits = deps_audit(
+            dir.to_str().unwrap(),
+            &target,
+            &super::Opts {
+                withheld_path: None,
+            },
+        )
+        .unwrap();
+        unsafe { std::env::remove_var("GITVAULT_REPO_DEPS") };
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&deps);
+        assert_eq!(hits.len(), 1, "expected one hit, got {}", hits.len());
+        assert!(
+            hits[0].path.starts_with("docs/guide.md"),
+            "{}",
+            hits[0].path
+        );
     }
 
     #[test]
