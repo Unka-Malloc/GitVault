@@ -8,9 +8,10 @@
 //! opencode's serve update ignores `time.archived`), so the sweep flips each
 //! store's native list flag directly: `hidden` on devin's sessions.db,
 //! `time_archived` on opencode's session_v2, and
-//! `info._meta."cognition.ai/isArchived"` on the Devin desktop's
-//! globalStorage session index — the sidebar renders that index, not the CLI
-//! database. Concealment is best-effort housekeeping: a missing store or a
+//! `info._meta."cognition.ai/isArchived"` plus membership in the
+//! `archivedSessions` list on the Devin desktop's globalStorage index — the
+//! sidebar renders that index, not the CLI database, and its Archived filter
+//! consults the list. Concealment is best-effort housekeeping: a missing store or a
 //! refused write warns on stderr and never fails the gate.
 
 use std::collections::BTreeSet;
@@ -19,6 +20,12 @@ use std::process::Command;
 
 /// The desktop session-index record name for a devin-cli conversation.
 const VSCDB_KEY: &str = "windsurf.acp.sessioninfo.session.acp/devin-cli/";
+
+/// The desktop database and the archive-list key the sidebar filter actually
+/// consults: session rows render unless their `acp/devin-cli/<id>` appears in
+/// this JSON array. The per-row `isArchived` flag alone does not hide them.
+const VSCDB_DB: &str = "Library/Application Support/Devin/User/globalStorage/state.vscdb";
+const ARCHIVED_KEY: &str = "windsurf.acp.session/archivedSessions";
 
 /// One harness session store: the database path under `$HOME`, the table
 /// holding sessions, and the SQL boolean selecting recorded sessions.
@@ -65,7 +72,7 @@ const STORES: &[Store] = &[
         pending: "hidden IS NOT 1",
     },
     Store {
-        db: "Library/Application Support/Devin/User/globalStorage/state.vscdb",
+        db: VSCDB_DB,
         table: "ItemTable",
         match_: keys_in,
         set: |_| {
@@ -115,6 +122,43 @@ pub fn run_sessions(profiles_root: &Path) {
             ),
             Err(error) => eprintln!("conceal: {} refused: {error}", db.display()),
         }
+    }
+    archive_list(&Path::new(&home).join(VSCDB_DB), &ids);
+}
+
+/// Merge the recorded ids into the desktop's `archivedSessions` list — the
+/// single source the session list's Archived filter subtracts. One row, one
+/// array: insert it when absent, union it otherwise.
+fn archive_list(db: &Path, ids: &BTreeSet<String>) {
+    if !db.is_file() {
+        return;
+    }
+    let new_ids = serde_json::to_string(
+        &ids.iter()
+            .map(|id| format!("acp/devin-cli/{id}"))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_default()
+    .replace('\'', "''");
+    let sql = format!(
+        "PRAGMA busy_timeout = 15000;
+         INSERT INTO ItemTable (key, value)
+             SELECT '{ARCHIVED_KEY}', '{new_ids}'
+             WHERE NOT EXISTS (SELECT 1 FROM ItemTable WHERE key = '{ARCHIVED_KEY}');
+         UPDATE ItemTable SET value = (
+             SELECT json_group_array(value) FROM (
+                 SELECT value FROM json_each(ItemTable.value)
+                 UNION SELECT value FROM json_each('{new_ids}')))
+         WHERE key = '{ARCHIVED_KEY}';"
+    );
+    match Command::new("sqlite3").arg(db).arg(&sql).output() {
+        Ok(out) if out.status.success() => {}
+        Ok(out) => eprintln!(
+            "conceal: {} refused: {}",
+            db.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(error) => eprintln!("conceal: {} refused: {error}", db.display()),
     }
 }
 

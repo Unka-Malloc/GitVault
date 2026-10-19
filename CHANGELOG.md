@@ -32,8 +32,9 @@
   (`session_ids` alongside the resume pointer), and when the run ends the
   engine marks those recorded sessions archived with the store's native
   flag — `hidden` on devin's sessions.db, `time_archived` on opencode's
-  session_v2, and `cognition.ai/isArchived` on the Devin desktop's
-  globalStorage session index that its sidebar actually renders — so
+  session_v2, and on the Devin desktop's globalStorage index both the
+  `cognition.ai/isArchived` row flag and membership in the
+  `archivedSessions` list its sidebar's Archived filter consults — so
   resumable transcripts stop filling the operator's visible session lists.
   The sweep covers every checker's runs root on each gate — a checker
   skipped by an earlier phase's refusal still gets its backlog concealed —
