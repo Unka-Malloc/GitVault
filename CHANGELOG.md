@@ -27,6 +27,12 @@
 - Resume interrupted conversations even after report submission, and reuse
   validated completion evidence when only local receipt finalization failed.
   Retain unfinished review progress independently of completed-receipt cleanup.
+- Attest a first-time head inside the same push: when the `gitvault/audited`
+  status post finds the commit unknown to the remote, the gate stages it
+  under `refs/gitvault/incoming/<sha>` — a ref no branch ruleset watches —
+  posts the mark, and deletes the staging ref, so the very first push of a
+  commit lands attested instead of needing the manual second-push ritual.
+  A staging failure still falls back to the deferred-attestation path.
 - Bind each run's verdict to a one-shot credential: the run mints a random
   `verdict.key` before the reviewer starts, the review server signs its
   submitted receipt with `HMAC-SHA256(key, canonical receipt)` into

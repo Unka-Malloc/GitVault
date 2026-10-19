@@ -967,12 +967,11 @@ fn publish_audited_status(cfg: &config::Config, ctx: &checkers::Context) -> anyh
         let code = api::run(cfg, &vault, &audited_status_request(&slug, &commit))?;
         if code != 0 {
             // A status only attaches to a commit GitHub already knows, and a
-            // first-time head arrives with this very push - refusing here
-            // would deadlock publication (no objects ever land, so no status
-            // can ever post). Probe instead: an unknown commit means this
-            // push lands the objects and the ruleset refuses the ref update
-            // on their evidence; the immediate re-push then posts 200. A
-            // commit GitHub does know and still cannot mark is a real
+            // first-time head arrives with this very push. Probe: an unknown
+            // commit is the chicken-and-egg case - stage the objects under a
+            // ref no branch ruleset watches, post the status against the now
+            // known commit, and this same push then lands with its mark.
+            // A commit GitHub does know and still cannot mark is a real
             // failure, and the push fails closed rather than landing
             // unattested.
             let known = api::run(cfg, &vault, &commit_known_probe(&slug, &commit))? == 0;
@@ -981,10 +980,15 @@ fn publish_audited_status(cfg: &config::Config, ctx: &checkers::Context) -> anyh
                 "the audit passed but the `gitvault/audited` status could not be posted \
                  for {commit}; the push is refused rather than landing without its evidence"
             );
+            if staged_attestation(cfg, ctx, &vault, &slug, &commit) {
+                eprintln!("gitvault: marked {commit:.12} audited on {slug} (objects staged)");
+                continue;
+            }
             eprintln!(
-                "gitvault: {commit:.12} is not on {slug} yet - this push lands the objects \
-                 and the remote refuses the ref update for the missing status; \
-                 run `git push` again to attest and land (the audits are already sealed)"
+                "gitvault: {commit:.12} is not on {slug} yet and staging it failed - this \
+                 push lands the objects and the remote refuses the ref update for the \
+                 missing status; run `git push` again to attest and land (the audits are \
+                 already sealed)"
             );
             record_pending_attestation(cfg, &slug, &sha, &ctx.repo_root);
             continue;
@@ -1016,6 +1020,43 @@ fn audited_status_request(slug: &str, sha: &str) -> api::Request {
         jq: None,
         silent: true,
     }
+}
+
+/// Stage a first-time head so the status can post in the same push: push
+/// the commit to `refs/gitvault/incoming/<sha>` - a ref branch rulesets do
+/// not watch - post the attestation, then delete the staging ref. The
+/// status rides the commit, not the ref, so the mark survives the cleanup
+/// and the real push lands already attested. `--no-verify` keeps the
+/// staging pushes from re-entering this hook. Any failure leaves the
+/// caller on the deferred path.
+fn staged_attestation(
+    cfg: &config::Config,
+    ctx: &checkers::Context,
+    vault: &vault::Vault,
+    slug: &str,
+    commit: &str,
+) -> bool {
+    let Some(remote) = ctx.push_remote.as_deref() else {
+        return false;
+    };
+    let staging = format!("refs/gitvault/incoming/{commit}");
+    let stage = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&ctx.repo_root)
+        .args(["push", "--no-verify", "-q", remote, &format!("{commit}:{staging}")])
+        .output();
+    if !stage.map(|out| out.status.success()).unwrap_or(false) {
+        return false;
+    }
+    let marked = api::run(cfg, vault, &audited_status_request(slug, commit))
+        .map(|code| code == 0)
+        .unwrap_or(false);
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&ctx.repo_root)
+        .args(["push", "--no-verify", "-q", remote, &format!(":{staging}")])
+        .output();
+    marked
 }
 
 /// Whether GitHub can name the commit - the chicken-and-egg probe the
