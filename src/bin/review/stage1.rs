@@ -547,6 +547,40 @@ fn deps_map(path: &std::path::Path) -> Vec<DepRepo> {
     entries
 }
 
+/// The public-document surface this rule guards: prose a reader meets on
+/// the repository page. Source files are out of scope — code and comments
+/// legitimately spell sibling names in tests, examples and identifiers.
+fn is_document(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem, Some(ext)),
+        _ => (name, None),
+    };
+    if let Some(ext) = ext {
+        if matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "md" | "markdown" | "mdown" | "rst" | "adoc" | "asciidoc" | "txt" | "org"
+        ) {
+            return true;
+        }
+        return false;
+    }
+    matches!(
+        stem.to_ascii_lowercase().as_str(),
+        "readme"
+            | "changelog"
+            | "changes"
+            | "history"
+            | "news"
+            | "contributing"
+            | "authors"
+            | "notice"
+            | "roadmap"
+            | "security"
+            | "support"
+    )
+}
+
 /// The comparison form: case and separators erased, so `Meshrix.js`,
 /// `meshrix js` and `MESHRIXJS` are one repository.
 fn dep_key(name: &str) -> String {
@@ -617,6 +651,9 @@ fn deps_audit(repo: &str, target: &Target, _opts: &Opts) -> Result<Vec<Hit>, Str
             continue;
         };
         if !metadata.starts_with("100644 ") && !metadata.starts_with("100755 ") {
+            continue;
+        }
+        if !is_document(path) {
             continue;
         }
         let blob = git(
