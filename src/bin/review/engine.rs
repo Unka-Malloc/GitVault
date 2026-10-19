@@ -714,8 +714,23 @@ pub fn run(repo: &str, contract_path: &Path) -> Result<i32, String> {
     assert_synced(&settings, contract.dir.as_path())?;
     let runtime = declared_runtime(&settings)?;
     let runs = settings.profile.join(format!("{}-runs", contract.name));
-    prune_runs(&runs);
+    let result = review_gate(repo, &contract, &settings, &runtime);
+    // Housekeeping follows the audit, never precedes it: a recorded session
+    // is concealed only once its run has finished — flagging a conversation
+    // while its agent is still prompting breaks the turn. The sweep must
+    // also precede pruning, since a removed run directory takes its session
+    // id evidence with it.
     crate::conceal::run_sessions(&runs);
+    prune_runs(&runs);
+    result
+}
+
+fn review_gate(
+    repo: &str,
+    contract: &Contract,
+    settings: &Settings,
+    runtime: &Map<String, Value>,
+) -> Result<i32, String> {
     let targets = ranges::ranges(repo)?;
     if targets.is_empty() {
         println!(
@@ -758,7 +773,7 @@ pub fn run(repo: &str, contract_path: &Path) -> Result<i32, String> {
                 summary.hits.len(),
                 surfaces,
             );
-            for line in stage1_lines(&contract, summary) {
+            for line in stage1_lines(contract, summary) {
                 println!("  {line}");
             }
         }
@@ -771,11 +786,11 @@ pub fn run(repo: &str, contract_path: &Path) -> Result<i32, String> {
     }
     for (index, target) in targets.iter().enumerate() {
         if audited(
-            &settings,
-            &contract,
+            settings,
+            contract,
             target.base.as_deref(),
             &target.head,
-            &runtime,
+            runtime,
         ) {
             println!(
                 "{}: {} already passed its semantic review ({}); reusing that verdict",
@@ -787,7 +802,7 @@ pub fn run(repo: &str, contract_path: &Path) -> Result<i32, String> {
         }
         let summary = summaries.get(index);
         if review_target(
-            repo, &settings, target, summary, &summaries, &runtime, &contract,
+            repo, settings, target, summary, &summaries, runtime, contract,
         )? != 0
         {
             return Ok(1);

@@ -37,6 +37,20 @@ fn rev(repo: &str, spec: &str) -> String {
     }
 }
 
+/// Whether a commit object is in this object store. The remote sha a push
+/// reports is the remote's live tip: a checkout that has not fetched since
+/// the remote moved cannot diff against it, and then the whole snapshot is
+/// the review object - the same shape a first push takes.
+fn commit_known(repo: &str, sha: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["cat-file", "-e", &format!("{sha}^{{commit}}")])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
 fn short_ref(name: &str) -> &str {
     name.strip_prefix("refs/heads/").unwrap_or(name)
 }
@@ -199,7 +213,7 @@ pub fn ranges_from(
         if head.is_empty() || published_elsewhere(repo, &head) {
             continue; // already-published tips add no unreviewed content
         }
-        let base = if remote_sha.trim_matches('0').is_empty() {
+        let base = if remote_sha.trim_matches('0').is_empty() || !commit_known(repo, remote_sha) {
             None
         } else {
             Some(remote_sha.to_string())
@@ -240,4 +254,81 @@ pub fn ranges(repo: &str) -> Result<Vec<Target>, String> {
         .unwrap_or("")
         .to_string();
     ranges_from(repo, &event, &vars)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A scratch repository with one commit; the tree is deleted on drop.
+    struct Repo(std::path::PathBuf);
+
+    impl Repo {
+        fn new() -> (Self, String) {
+            let dir = std::env::temp_dir().join(format!(
+                "gv-ranges-{}-{:04x}",
+                std::process::id(),
+                rand::random::<u16>()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let git = |args: &[&str]| {
+                let out = Command::new("git")
+                    .arg("-C")
+                    .arg(&dir)
+                    .args(args)
+                    .env("GIT_AUTHOR_NAME", "Synthetic")
+                    .env("GIT_AUTHOR_EMAIL", "synthetic@example.invalid")
+                    .env("GIT_COMMITTER_NAME", "Synthetic")
+                    .env("GIT_COMMITTER_EMAIL", "synthetic@example.invalid")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "git {args:?}");
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            };
+            git(&["init", "-b", "main"]);
+            std::fs::write(dir.join("one.txt"), "one\n").unwrap();
+            git(&["add", "one.txt"]);
+            git(&["commit", "-m", "one"]);
+            let head = git(&["rev-parse", "HEAD"]);
+            (Self(dir), head)
+        }
+    }
+
+    impl Drop for Repo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn push_vars(refs: &str) -> serde_json::Map<String, serde_json::Value> {
+        json!({"GITVAULT_EVENT": "pre-push", "GITVAULT_PUSH_REFS": refs})
+            .as_object()
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn a_first_push_and_an_unfetched_tip_both_review_the_whole_snapshot() {
+        let (repo, head) = Repo::new();
+        let zero = "0".repeat(40);
+        let refs = format!("refs/heads/main {head} refs/heads/main {zero}\n");
+        let targets = ranges_from(repo.0.to_str().unwrap(), "pre-push", &push_vars(&refs))
+            .expect("a first push resolves");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].base, None, "no base: the whole tree is reviewed");
+
+        // The remote advertises a tip this object store has never fetched:
+        // the range cannot diff against it, so the review object is again
+        // the whole snapshot rather than an unreadable range.
+        let missing = "1".repeat(40);
+        let refs = format!("refs/heads/main {head} refs/heads/main {missing}\n");
+        let targets = ranges_from(repo.0.to_str().unwrap(), "pre-push", &push_vars(&refs))
+            .expect("an unfetched tip still resolves");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].base, None, "unfetched tip: whole snapshot");
+    }
 }

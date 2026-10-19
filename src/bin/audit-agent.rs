@@ -216,14 +216,28 @@ impl a4aa::SecretResolver for AuditSecrets {
     }
 }
 
+/// `session_id` stays the resume pointer; `session_ids` accumulates every
+/// conversation the run has opened so the gate can conceal them all once the
+/// audit completes.
 fn save_session(path: &Path, id: &str) -> io::Result<()> {
+    let mut ids: Vec<String> = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|saved| saved["session_ids"].as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|saved| saved.as_str().map(str::to_string))
+        .collect();
+    if !ids.iter().any(|saved| saved == id) {
+        ids.push(id.to_string());
+    }
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
         .open(path)?;
-    writeln!(file, "{}", json!({"session_id":id}))
+    writeln!(file, "{}", json!({"session_id":id,"session_ids":ids}))
 }
 
 /// `^[A-Za-z0-9._-]+$` — a provider or agent label; the provider-relative

@@ -7,7 +7,8 @@
   "stage1": {
     "label": "deterministic",
     "rules": [
-      {"id": "withheld-names-and-credentials", "title": "Withheld names and credential shapes, scanned over the whole revision", "kind": "builtin", "builtin": "withheld-names-and-credentials"}
+      {"id": "withheld-names-and-credentials", "title": "Withheld names and credential shapes, scanned over the whole revision", "kind": "builtin", "builtin": "withheld-names-and-credentials"},
+      {"id": "dependency-direction", "title": "Named sibling-repository references must follow the dependency direction", "kind": "builtin", "builtin": "dependency-direction"}
     ]
   },
   "on": ["pre-push", "pr"],

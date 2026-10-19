@@ -32,8 +32,9 @@ pub const EVENTS: [&str; 7] = [
 /// The deterministic checks the runtime ships as code. A contract names them;
 /// it never carries executable text. Each builtin owns one coupled scan pass
 /// whose internal hit ordering and refusal priority are its semantics.
-pub const BUILTINS: [&str; 3] = [
+pub const BUILTINS: [&str; 4] = [
     "withheld-names-and-credentials",
+    "dependency-direction",
     "maintainer-hygiene",
     "security-static-checklist",
 ];

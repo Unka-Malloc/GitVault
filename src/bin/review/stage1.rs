@@ -471,6 +471,187 @@ fn clean_audit(repo: &str, target: &Target, opts: &Opts) -> Result<(String, Vec<
 }
 
 // ---------------------------------------------------------------------------
+// dependency-direction (Clean Auditor)
+// ---------------------------------------------------------------------------
+
+/// The sibling-repository dependency map, machine-local like the withheld
+/// names: one line per repository, `Name <- upstream, upstream, ...`,
+/// `#` comments. A document may name this repository's upstreams; a document
+/// in an upstream repository must never name one of its downstreams — an
+/// upstream naming a downstream publishes that repository's product plan
+/// before the downstream has shipped anything on its own.
+fn default_deps_path() -> PathBuf {
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".config")
+        });
+    base.join("gitvault").join("repo-deps.txt")
+}
+
+/// One mapped repository: canonical name, the aliases documents actually
+/// use (`Adapter-For-All-Agents|a4aa`), and the upstreams it depends on
+/// (canonical names only - the graph never resolves an alias).
+struct DepRepo {
+    name: String,
+    aliases: Vec<String>,
+    upstreams: Vec<String>,
+}
+
+impl DepRepo {
+    /// Every spelling this repository answers to, keyed for comparison.
+    fn names(&self) -> impl Iterator<Item = String> + '_ {
+        std::iter::once(self.name.as_str())
+            .chain(self.aliases.iter().map(String::as_str))
+            .map(dep_key)
+    }
+
+    /// Every spelling, as document-match patterns.
+    fn patterns(&self) -> impl Iterator<Item = Result<Regex, String>> + '_ {
+        std::iter::once(self.name.as_str())
+            .chain(self.aliases.iter().map(String::as_str))
+            .map(|spelling| {
+                Regex::new(&format!("(?i){}", name_pattern(spelling)))
+                    .map_err(|e| format!("invalid dependency name pattern: {e}"))
+            })
+    }
+}
+
+fn deps_map(path: &std::path::Path) -> Vec<DepRepo> {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    for line in raw.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let Some((name, upstreams)) = line.split_once("<-") else {
+            continue;
+        };
+        let mut spellings = name.split('|').map(str::trim).filter(|s| !s.is_empty());
+        let Some(canonical) = spellings.next() else {
+            continue;
+        };
+        entries.push(DepRepo {
+            name: canonical.to_string(),
+            aliases: spellings.map(str::to_string).collect(),
+            upstreams: upstreams
+                .split(',')
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+                .map(str::to_string)
+                .collect(),
+        });
+    }
+    entries
+}
+
+/// The comparison form: case and separators erased, so `Meshrix.js`,
+/// `meshrix js` and `MESHRIXJS` are one repository.
+fn dep_key(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Every repository `name` transitively depends on, keyed for comparison.
+fn dep_closure(entries: &[DepRepo], name: &str) -> std::collections::HashSet<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut pending = vec![dep_key(name)];
+    while let Some(current) = pending.pop() {
+        for entry in entries {
+            if !entry.names().any(|spelling| spelling == current) {
+                continue;
+            }
+            for upstream in &entry.upstreams {
+                let key = dep_key(upstream);
+                if seen.insert(key.clone()) {
+                    pending.push(key);
+                }
+            }
+        }
+    }
+    seen
+}
+
+/// Public documents of this repository may name its upstreams, never its
+/// downstreams. Only downstream names are compiled: a reference to an
+/// upstream or an unrelated sibling needs no finding.
+fn deps_audit(repo: &str, target: &Target, _opts: &Opts) -> Result<Vec<Hit>, String> {
+    let path = std::env::var("GITVAULT_REPO_DEPS")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(default_deps_path);
+    let entries = deps_map(&path);
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let me = dep_key(origin_slug(repo).rsplit('/').next().unwrap_or_default());
+    let mut forbidden: Vec<(String, Regex)> = Vec::new();
+    for entry in &entries {
+        if entry.names().any(|spelling| spelling == me)
+            || !dep_closure(&entries, &entry.name).contains(&me)
+        {
+            continue;
+        }
+        for pattern in entry.patterns() {
+            forbidden.push((entry.name.clone(), pattern?));
+        }
+    }
+    if forbidden.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut hits = Vec::new();
+    for record in git(repo, &["ls-tree", "-rz", &target.head])?
+        .stdout
+        .split(|byte| *byte == 0)
+    {
+        if record.is_empty() {
+            continue;
+        }
+        let record = String::from_utf8_lossy(record);
+        let Some((metadata, path)) = record.split_once('\t') else {
+            continue;
+        };
+        if !metadata.starts_with("100644 ") && !metadata.starts_with("100755 ") {
+            continue;
+        }
+        let blob = git(
+            repo,
+            &["cat-file", "blob", &format!("{}:{path}", target.head)],
+        )?;
+        if is_binary(&blob.stdout, 8000) {
+            continue;
+        }
+        for (number, line) in String::from_utf8_lossy(&blob.stdout).lines().enumerate() {
+            let Some((name, _)) = forbidden.iter().find(|(_, pattern)| pattern.is_match(line))
+            else {
+                continue;
+            };
+            hits.push(Hit {
+                path: format!("{path} ({name})"),
+                line: number as u64 + 1,
+                rule: "dependency-direction".to_string(),
+                remedy: Some(
+                    "upstream documents must not name a downstream repository; \
+                     drop the reference or move it into the downstream's own docs",
+                ),
+            });
+            if hits.len() >= MAX_HITS {
+                break;
+            }
+        }
+        if hits.len() >= MAX_HITS {
+            break;
+        }
+    }
+    Ok(hits)
+}
+
+// ---------------------------------------------------------------------------
 // maintainer-hygiene (Sustainable Maintainer)
 // ---------------------------------------------------------------------------
 
@@ -1583,6 +1764,16 @@ pub fn audit(
                         hits.extend(found);
                     }
                 }
+                "dependency-direction" => {
+                    let found = deps_audit(repo, target, opts)?;
+                    if !found.is_empty() {
+                        status = "refused".into();
+                        if refused.is_empty() {
+                            refused = "dependency-direction".to_string();
+                        }
+                        hits.extend(found);
+                    }
+                }
                 "maintainer-hygiene" => {
                     let (found, found_surfaces) = maintainer_audit(repo, target, with_surfaces)?;
                     surfaces.get_or_insert_with(Vec::new).extend(found_surfaces);
@@ -1651,8 +1842,8 @@ pub fn audit_all(
 #[cfg(test)]
 mod tests {
     use super::{
-        Hit, clean_audit, in_scope, is_instruction_channel, is_interface_surface, marker_lines,
-        name_pattern, security_audit,
+        Hit, clean_audit, dep_closure, dep_key, deps_map, in_scope, is_instruction_channel,
+        is_interface_surface, marker_lines, name_pattern, security_audit,
     };
     use base64::Engine as _;
 
@@ -1664,6 +1855,35 @@ mod tests {
         assert!(pattern.is_match("WIDGET GO"));
         assert!(pattern.is_match("the Widget Go project"));
         assert!(!pattern.is_match("Widget"));
+    }
+
+    #[test]
+    fn the_dependency_map_closes_transitively_in_both_directions() {
+        let file = std::env::temp_dir().join(format!(
+            "gv-deps-{}-{:04x}",
+            std::process::id(),
+            rand::random::<u16>()
+        ));
+        std::fs::write(
+            &file,
+            "# comment\nUp <-\nMid <- Up\nDown <- Mid\nOther <- Unrelated\n",
+        )
+        .unwrap();
+        let entries = deps_map(&file);
+        let _ = std::fs::remove_file(&file);
+        // Up's closure is empty; Mid sees Up; Down reaches Up through Mid.
+        assert!(dep_closure(&entries, "Up").is_empty());
+        assert!(dep_closure(&entries, "Mid").contains(&dep_key("Up")));
+        assert!(dep_closure(&entries, "Down").contains(&dep_key("Up")));
+        // The forbidden direction: whose closure contains "Up" - Mid and
+        // Down, not Up itself, not the unrelated sibling.
+        let mine = dep_key("Up");
+        let downstreams: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .filter(|name| dep_key(name) != mine && dep_closure(&entries, name).contains(&mine))
+            .collect();
+        assert_eq!(downstreams, ["Mid", "Down"]);
     }
 
     #[test]

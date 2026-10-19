@@ -28,11 +28,29 @@
   validated completion evidence when only local receipt finalization failed.
   Retain unfinished review progress independently of completed-receipt cleanup.
 - Conceal finished audit conversations from the harness's own session list:
-  each gate run flags every session under the checker's run root with the
-  store's native archive bit — `hidden` on devin's sessions.db,
-  `time_archived` on opencode's session_v2 — so resumable transcripts stop
-  filling the operator's visible session lists. Concealment is best-effort
-  and never gates a run.
+  each run records every conversation it opens in `audit-session.json`
+  (`session_ids` alongside the resume pointer), and when the run ends the
+  engine marks those recorded sessions archived with the store's native
+  flag — `hidden` on devin's sessions.db, `time_archived` on opencode's
+  session_v2, and `cognition.ai/isArchived` on the Devin desktop's
+  globalStorage session index that its sidebar actually renders — so
+  resumable transcripts stop filling the operator's visible session lists.
+  The sweep runs only after the audit finishes: flagging a conversation
+  while its agent is still prompting breaks the turn, and the store writes
+  wait out transient database locks rather than refusing. Concealment is
+  best-effort and never gates a run.
+- Judge a push whose remote tip is not in the local object store as a whole
+  snapshot: the remote's live tip sha cannot anchor a diff it never
+  fetched, so the review object falls back to the same root-to-head
+  snapshot a first push carries, the attribution scan widens the same way,
+  and the history gate's refusal names the remedy — fetch the remote and
+  rebase, or `git pull --rebase` — instead of a bare non-fast-forward
+  refusal.
+- Refuse sibling-repository references that run against the dependency
+  direction: the Clean Auditor's deterministic stage reads a machine-local
+  `repo-deps.txt` map and blocks a document in an upstream repository that
+  names one of its downstreams — an upstream naming a downstream publishes
+  that repository's plans before it has shipped anything on its own.
 - Remove the superseded Codex/Pi bridges and launcher configuration.
 - Validate annotated release tags against their reviewed commit when checking
   that the published reference has not changed during an audit.

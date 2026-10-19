@@ -176,12 +176,31 @@ pub fn gates(ctx: &Context) -> Vec<CheckerOutcome> {
         }
         match is_ancestor(&ctx.repo_root, remote_sha, local_sha) {
             Some(true) => {}
-            _ => outcomes.push(hit(
+            // The remote tip is not in this object store at all: ancestry
+            // cannot be judged until the remote is fetched. The remedy is
+            // fetch + rebase - the same command reports a real rewrite or
+            // makes the push a fast-forward.
+            None => outcomes.push(hit(
                 "history-nonff",
                 format!(
-                    "{local_ref} is not a fast-forward of {remote_ref} (remote {remote_sha} → {local_sha}); \
-                     rewriting published history is refused - rebase onto the remote tip\n\
-                     or push a new ref"
+                    "{remote_ref}'s tip {remote_sha} is not in this checkout; \
+                     fetch it and rebase `{local_ref}` onto it \
+                     (git fetch {} && git rebase {remote_ref}), then push again",
+                    ctx.push_remote.as_deref().unwrap_or("<remote>"),
+                ),
+            )),
+            // The tip is present but not an ancestor: integrating it turns
+            // the push back into a fast-forward.
+            Some(false) => outcomes.push(hit(
+                "history-nonff",
+                format!(
+                    "{local_ref} does not contain {remote_ref}'s tip (remote {remote_sha} → {local_sha}); \
+                     integrate it with git pull --rebase{} and push again - \
+                     deliberately different history needs a new ref name",
+                    ctx.push_remote
+                        .as_deref()
+                        .map(|remote| format!(" {remote}"))
+                        .unwrap_or_default(),
                 ),
             )),
         }
@@ -297,6 +316,25 @@ mod tests {
             format!("refs/heads/main {b} refs/heads/main {c}"),
         ));
         assert_eq!(names(&out), ["history-nonff"]);
+    }
+
+    #[test]
+    fn a_remote_tip_missing_from_the_checkout_still_refuses_with_guidance() {
+        let repo = Repo::new();
+        let b = repo.commit("b");
+        // The remote advertises a tip this object store has never fetched:
+        // ancestry cannot be proven, so the push is held for fetch+rebase.
+        let missing = "1".repeat(40);
+        let out = gates(&ctx(
+            &repo,
+            format!("refs/heads/main {b} refs/heads/main {missing}"),
+        ));
+        assert_eq!(names(&out), ["history-nonff"]);
+        assert!(
+            out[0].stdout.contains("fetch"),
+            "the remedy names the fetch first: {}",
+            out[0].stdout
+        );
     }
 
     #[test]

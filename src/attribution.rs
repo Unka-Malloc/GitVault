@@ -251,11 +251,16 @@ fn push_ranges(ctx: &Context) -> Result<Vec<RangeSpec>, String> {
             ]);
         } else {
             // The remote sha normally resolves locally. When it does not (a
-            // remote this checkout never fetched), fall back to the wider set.
+            // remote this checkout never fetched, or a tip the remote moved
+            // since), fall back to the wider set.
             let mut spec = vec![format!("{remote_sha}..{local_sha}")];
             if run_git(
                 &ctx.repo_root,
-                &["rev-parse".into(), "--verify".into(), remote_sha.into()],
+                &[
+                    "rev-parse".into(),
+                    "--verify".into(),
+                    format!("{remote_sha}^{{commit}}"),
+                ],
             )
             .is_err()
             {
