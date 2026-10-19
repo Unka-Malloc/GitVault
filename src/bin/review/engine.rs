@@ -9,6 +9,7 @@
 //! the tool surface now live here.
 
 use crate::contract::{self, Contract};
+use crate::credential;
 use crate::evidence;
 use crate::fullservice;
 use crate::sanitize::sanitize;
@@ -609,6 +610,10 @@ fn review_target(
         }
     }
     evidence::write_json(&run_dir.join("scope.json"), &scope)?;
+    // The run's verdict credential: minted (or reused after an unfinished
+    // attempt) before the reviewer starts, held here for the receipt check
+    // and consumed once a verdict seals it.
+    let key = credential::issue(&run_dir)?;
     let result = (|| -> Result<i32, String> {
         println!(
             "{}: reviewing {} with {}/{} ({})…",
@@ -627,6 +632,16 @@ fn review_target(
             &std::fs::read_to_string(&report_path).map_err(|e| e.to_string())?,
         )
         .map_err(|e| e.to_string())?;
+        // The verdict must carry this run's signature: a receipt that never
+        // went through the review server's submit channel - hand-written,
+        // replayed from another run, or left by a crashed attempt - is not a
+        // review at all.
+        if !credential::verify(&key, &report) {
+            return Err(
+                "the audit report carries no valid verdict credential; publication refused"
+                    .to_string(),
+            );
+        }
         if let Some(reference) = &target.ref_ {
             let moved = Command::new("git")
                 .arg("-C")
@@ -667,6 +682,10 @@ fn review_target(
         report["seal_prev"] = json!(seal_prev);
         report["seal"] = json!(crate::seal::seal(&seal_prev, &report));
         evidence::write_json(&report_path, &report)?;
+        // The verdict is finalized on disk; its credential is spent. Doing
+        // this only now keeps an unfinalized attempt resumable under the
+        // same key.
+        credential::consume(&run_dir);
         println!(
             "{}: {} — {}",
             contract.title,
@@ -690,11 +709,18 @@ fn review_target(
     })();
     let _ = std::fs::remove_file(run_dir.join("scope.json"));
     // A run that never finalized its receipt is refused, never pending.
+    // The reworded receipt is re-signed only when it was authentic to begin
+    // with — re-signing an unverifiable receipt would launder a forged
+    // report into a signature a resume would accept.
     if let Ok(raw) = std::fs::read_to_string(run_dir.join("report.json"))
         && let Ok(mut receipt) = serde_json::from_str::<Value>(&raw)
         && receipt["gate_status"] == "pending"
     {
+        let authentic = credential::verify(&key, &receipt);
         receipt["gate_status"] = json!("refused");
+        if authentic {
+            receipt["receipt_mac"] = json!(credential::mac(&key, &receipt));
+        }
         let _ = evidence::write_json(&run_dir.join("report.json"), &receipt);
     }
     result
@@ -955,6 +981,10 @@ pub fn resume_full_audit(contract_path: &Path, output: &Path) -> Result<i32, Str
             "files": snapshot["files"].as_object().map(|f| f.len()).unwrap_or_default(),
         }),
     )?;
+    // Same one-shot credential the gate path issues: the full audit's
+    // verdict is signed by the session that produced it and the key dies
+    // with it.
+    let key = credential::issue(&output)?;
     match agent_review(&output, &settings, &runtime, &contract) {
         Err(error) => {
             evidence::write_json(
@@ -970,10 +1000,18 @@ pub fn resume_full_audit(contract_path: &Path, output: &Path) -> Result<i32, Str
                 &std::fs::read_to_string(&report_path).map_err(|e| e.to_string())?,
             )
             .map_err(|e| e.to_string())?;
+            if !credential::verify(&key, &report) {
+                evidence::write_json(
+                    &status_path,
+                    &json!({"state": "failed", "report_exists": true}),
+                )?;
+                return Err("the audit report carries no valid verdict credential".to_string());
+            }
             report["gate_status"] = json!("full-audit-complete");
             report["review_usage"] = json!({"tokens": usage, "duration_ms": duration_ms as u64});
             report["agent_profile"] = identity;
             evidence::write_json(&report_path, &report)?;
+            credential::consume(&output);
             evidence::write_json(
                 &status_path,
                 &json!({"state": "completed", "report_exists": true}),

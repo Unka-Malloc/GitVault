@@ -113,17 +113,21 @@ pub fn run_sessions(profiles_root: &Path) {
             (store.match_)(&ids),
             store.pending
         );
-        match Command::new("sqlite3").arg(&db).arg(&sql).output() {
-            Ok(out) if out.status.success() => {}
-            Ok(out) => eprintln!(
-                "conceal: {} refused: {}",
-                db.display(),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ),
-            Err(error) => eprintln!("conceal: {} refused: {error}", db.display()),
+        if let Err(error) = run_sql(&db, &sql) {
+            eprintln!("conceal: {} refused: {error}", db.display());
         }
     }
     archive_list(&Path::new(&home).join(VSCDB_DB), &ids);
+}
+
+/// One sqlite3 invocation, best-effort: the harnesses hold their stores
+/// open so a refused write only earns a stderr note, never a gate failure.
+fn run_sql(db: &Path, sql: &str) -> Result<String, String> {
+    match Command::new("sqlite3").arg(db).arg(sql).output() {
+        Ok(out) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).into_owned()),
+        Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 /// Merge the recorded ids into the desktop's `archivedSessions` list — the
@@ -133,13 +137,31 @@ fn archive_list(db: &Path, ids: &BTreeSet<String>) {
     if !db.is_file() {
         return;
     }
-    let new_ids = serde_json::to_string(
-        &ids.iter()
-            .map(|id| format!("acp/devin-cli/{id}"))
-            .collect::<Vec<_>>(),
+    // Only devin-cli lane ids belong under the `acp/devin-cli/` key shape —
+    // intersect the recorded ids with the session-index keys actually
+    // present so another lane's ids never become dead list entries.
+    let known_out = run_sql(
+        db,
+        &format!(
+            "PRAGMA busy_timeout = 15000; SELECT key FROM ItemTable WHERE {};",
+            keys_in(ids)
+        ),
     )
-    .unwrap_or_default()
-    .replace('\'', "''");
+    .unwrap_or_default();
+    let known: BTreeSet<&str> = known_out.lines().map(str::trim).collect();
+    // The lane prefix is the tail of the sessioninfo key: one source.
+    let lane = VSCDB_KEY.trim_start_matches("windsurf.acp.sessioninfo.session.");
+    let members: Vec<String> = ids
+        .iter()
+        .filter(|id| known.contains(format!("{VSCDB_KEY}{id}").as_str()))
+        .map(|id| format!("{lane}{id}"))
+        .collect();
+    if members.is_empty() {
+        return;
+    }
+    let new_ids = serde_json::to_string(&members)
+        .unwrap_or_default()
+        .replace('\'', "''");
     let sql = format!(
         "PRAGMA busy_timeout = 15000;
          INSERT INTO ItemTable (key, value)
@@ -151,14 +173,8 @@ fn archive_list(db: &Path, ids: &BTreeSet<String>) {
                  UNION SELECT value FROM json_each('{new_ids}')))
          WHERE key = '{ARCHIVED_KEY}';"
     );
-    match Command::new("sqlite3").arg(db).arg(&sql).output() {
-        Ok(out) if out.status.success() => {}
-        Ok(out) => eprintln!(
-            "conceal: {} refused: {}",
-            db.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ),
-        Err(error) => eprintln!("conceal: {} refused: {error}", db.display()),
+    if let Err(error) = run_sql(db, &sql) {
+        eprintln!("conceal: {} refused: {error}", db.display());
     }
 }
 

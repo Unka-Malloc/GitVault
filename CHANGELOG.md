@@ -27,6 +27,13 @@
 - Resume interrupted conversations even after report submission, and reuse
   validated completion evidence when only local receipt finalization failed.
   Retain unfinished review progress independently of completed-receipt cleanup.
+- Bind each run's verdict to a one-shot credential: the run mints a random
+  `verdict.key` before the reviewer starts, the review server signs its
+  submitted receipt with `HMAC-SHA256(key, canonical receipt)` into
+  `receipt_mac`, and the gate recomputes the signature before trusting the
+  report — a hand-written, replayed or stale `report.json` no longer
+  counts as a review. The key file dies with the verdict that sealed it;
+  a spent or missing credential refuses submission outright.
 - Conceal finished audit conversations from the harness's own session list:
   each run records every conversation it opens in `audit-session.json`
   (`session_ids` alongside the resume pointer), and when the run ends the

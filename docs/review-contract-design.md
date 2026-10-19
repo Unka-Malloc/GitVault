@@ -30,6 +30,13 @@ The `gitvault-review` binary (`src/bin/review.rs` + `src/bin/review/`):
 - `serve.rs` — the bridge-facing JSONL tool server, wire-compatible with the
   retired `--serve-tools`, now also writing the receipt (`report.json`) with
   its engine marker.
+- `credential.rs` — the one-shot verdict credential: the run issues
+  `verdict.key`, `serve` signs the receipt's `receipt_mac` under it, the
+  gate recomputes the signature before trusting the report and the key
+  dies with the finalized verdict.
+- `conceal.rs` — end-of-run session concealment by recorded id across the
+  admitted agents' stores, plus the desktop `archivedSessions` list the
+  sidebar filter consults; skips runs still marked live.
 - `engine.rs` + `ranges.rs` — the gate: snapshot resolution for push/pr/release,
   the deterministic stage first, receipt reuse and resume keys, the retention
   window, the A4AA runner process, the full-audit lifecycle. Receipts carry

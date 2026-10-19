@@ -50,6 +50,9 @@ pub struct Server {
     scope: Value,
     /// The official-document URLs fetched this review.
     fetched: HashSet<String>,
+    /// The run's verdict credential. Absent once a verdict consumed it —
+    /// without it no receipt can be signed and none may be submitted.
+    key: Option<[u8; 32]>,
     submitted: bool,
 }
 
@@ -101,6 +104,7 @@ impl Server {
             run_dir: run_dir.to_path_buf(),
             scope,
             fetched: HashSet::new(),
+            key: crate::credential::load(run_dir),
             submitted: false,
         })
     }
@@ -252,7 +256,14 @@ impl Server {
             let sanitized = crate::sanitize::sanitize(
                 &serde_json::to_string(&receipt).map_err(|e| e.to_string())?,
             );
-            let receipt: Value = serde_json::from_str(&sanitized).map_err(|e| e.to_string())?;
+            let mut receipt: Value = serde_json::from_str(&sanitized).map_err(|e| e.to_string())?;
+            // Sign the verdict with the run's one-shot credential: only the
+            // session holding this run's key can produce a receipt the gate
+            // accepts, and submitting consumes it.
+            let Some(key) = self.key else {
+                return Err("the run's verdict credential is already spent".to_string());
+            };
+            receipt["receipt_mac"] = json!(crate::credential::mac(&key, &receipt));
             crate::evidence::write_json(&self.run_dir.join("report.json"), &receipt)?;
             if let Some(full) = &self.full {
                 full.event("submitted", args["verdict"].as_str());

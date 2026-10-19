@@ -15,6 +15,8 @@
 mod conceal;
 #[path = "review/contract.rs"]
 mod contract;
+#[path = "review/credential.rs"]
+mod credential;
 #[path = "review/date.rs"]
 mod date;
 #[path = "review/documents.rs"]
