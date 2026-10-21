@@ -69,6 +69,11 @@ pub struct Context {
     /// For `release`: the tag being published and the commit it points at.
     pub release_tag: Option<String>,
     pub release_commit: Option<String>,
+    /// For `commit-msg`/`prepare-commit-msg`: the message file git hands the
+    /// hook (argv[0]) and its composition source (argv[1]: `message`,
+    /// `template`, `merge`, `squash` or `commit` for `-c/-C` reuse).
+    pub commit_message_file: Option<PathBuf>,
+    pub commit_message_source: Option<String>,
 }
 
 impl Context {
@@ -760,6 +765,8 @@ mod tests {
             pr_number: Some("7".into()),
             release_tag: Some("v1.0.0".into()),
             release_commit: Some("c0ffee".into()),
+            commit_message_file: None,
+            commit_message_source: None,
         }
     }
 
@@ -844,6 +851,8 @@ mod tests {
             pr_number: None,
             release_tag: None,
             release_commit: None,
+            commit_message_file: None,
+            commit_message_source: None,
         }
     }
 

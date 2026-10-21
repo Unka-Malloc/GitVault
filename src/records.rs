@@ -590,6 +590,8 @@ mod tests {
             pr_number: None,
             release_tag: None,
             release_commit: None,
+            commit_message_file: None,
+            commit_message_source: None,
         };
         let write = |cfg: &Config, ctx: &Context| -> String {
             let run = begin(cfg, 1).expect("a run begins");

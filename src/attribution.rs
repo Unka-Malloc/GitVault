@@ -376,6 +376,9 @@ fn log_messages(repo: &std::path::Path, spec: &[String]) -> Result<Vec<(String, 
 /// state the gate cannot read refuses closed: a push it cannot inspect must
 /// not sail through.
 pub fn gate(ctx: &Context) -> Option<CheckerOutcome> {
+    if matches!(ctx.event.as_str(), "commit-msg" | "prepare-commit-msg") {
+        return scrub_gate(ctx);
+    }
     if !matches!(ctx.event.as_str(), "pre-push" | "pr" | "release") {
         return None;
     }
@@ -466,9 +469,178 @@ pub fn gate(ctx: &Context) -> Option<CheckerOutcome> {
     )
 }
 
+// --------------------------------------------------------- message scrubbing
+
+/// Git states in which the message file is being replayed from an existing
+/// commit rather than composed now. git reports `source=message` for
+/// cherry-pick and rebase too, so the marker files are the only reliable
+/// signal.
+const REPLAY_MARKERS: [&str; 6] = [
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "MERGE_HEAD",
+    "rebase-merge",
+    "rebase-apply",
+    "SQUASH_MSG",
+];
+
+fn replay_in_progress(repo_root: &std::path::Path) -> bool {
+    REPLAY_MARKERS.iter().any(|marker| {
+        Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["rev-parse", "--git-path", marker])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                // --git-path may answer relative to the repo, not to us:
+                // resolve relative answers against repo_root explicitly.
+                let path = std::path::PathBuf::from(String::from_utf8_lossy(&o.stdout).trim());
+                if path.is_absolute() {
+                    path.exists()
+                } else {
+                    repo_root.join(path).exists()
+                }
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Split `text` into blank-line-separated paragraphs, drop lines that match
+/// the attribution catalogue, drop paragraphs left empty, and rejoin. `None`
+/// when nothing matched: the file is then left untouched.
+fn strip_attribution(text: &str) -> Option<(String, Vec<String>)> {
+    let mut blocks: Vec<String> = vec![];
+    let mut removed: Vec<String> = vec![];
+    for block in text.split("\n\n") {
+        if block.trim().is_empty() {
+            continue;
+        }
+        let kept: Vec<&str> = block
+            .split('\n')
+            .filter(|line| match attribution_match(line) {
+                Some(_) => {
+                    removed.push(line.trim().to_string());
+                    false
+                }
+                None => true,
+            })
+            .collect();
+        if kept.iter().any(|line| !line.trim().is_empty()) {
+            blocks.push(kept.join("\n"));
+        }
+    }
+    if removed.is_empty() {
+        return None;
+    }
+    let joined = blocks.join("\n\n");
+    Some((format!("{}\n", joined.trim_end_matches('\n')), removed))
+}
+
+/// Replace `file` with `contents` atomically: a temp file in the same
+/// directory, the original's mode copied over, then a rename. Errors leave
+/// the message untouched — a scrub the hook cannot complete never refuses.
+fn rewrite_message_file(file: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    let dir = file.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let stem = file
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "COMMIT_EDITMSG".to_string());
+    let tmp = dir.join(format!(".ai-attribution-{stem}-{}", std::process::id()));
+    std::fs::write(&tmp, contents)?;
+    let result = std::fs::metadata(file)
+        .and_then(|meta| std::fs::set_permissions(&tmp, meta.permissions()))
+        .and_then(|()| std::fs::rename(&tmp, file));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// The compose-time half of the gate, run for `commit-msg` and
+/// `prepare-commit-msg`: the message file git hands the hook is cleaned in
+/// place. A freshly composed message that carried attribution lines is then
+/// refused — the cleaned file is already in place, so re-running the same
+/// commit succeeds. A replayed message (`-c/-C` reuse, or a merge,
+/// cherry-pick, revert, rebase or squash in progress) is cleaned without
+/// refusal: its trailers came from the original commit, not from whoever is
+/// driving this one. Internal errors never refuse a commit.
+fn scrub_gate(ctx: &Context) -> Option<CheckerOutcome> {
+    let file = ctx.commit_message_file.as_ref()?;
+    let started = std::time::Instant::now();
+    let outcome = |outcome: OutcomeKind, stdout: String| {
+        Some(CheckerOutcome {
+            name: "attribution-message".to_string(),
+            severity: Severity::Blocking,
+            outcome,
+            duration_ms: started.elapsed().as_millis() as u64,
+            stdout,
+            stderr: String::new(),
+        })
+    };
+
+    let text = match std::fs::read(file)
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+    {
+        Some(t) => t,
+        None => return None,
+    };
+    let Some((cleaned, removed)) = strip_attribution(&text) else {
+        return None;
+    };
+    if let Err(why) = rewrite_message_file(file, &cleaned) {
+        eprintln!("gitvault: attribution scrub skipped (message unchanged): {why}");
+        return None;
+    }
+
+    let shown = removed.len().min(3);
+    let mut detail = removed[..shown]
+        .iter()
+        .map(|line| {
+            let squashed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+            if squashed.chars().count() <= 72 {
+                squashed
+            } else {
+                let truncated: String = squashed.chars().take(69).collect();
+                format!("{truncated}...")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    if removed.len() > shown {
+        detail.push_str(&format!("; … and {} more", removed.len() - shown));
+    }
+
+    let replay = ctx.commit_message_source.as_deref() == Some("commit")
+        || replay_in_progress(&ctx.repo_root);
+    if replay {
+        outcome(
+            OutcomeKind::Passed,
+            format!(
+                "stripped {} AI attribution line(s) from a replayed message: {detail}",
+                removed.len()
+            ),
+        )
+    } else {
+        outcome(
+            OutcomeKind::Failed(-1),
+            format!(
+                "the message carries {} AI attribution line(s) (now removed from the \
+                 message file): {detail}\n  resubmit without the banner; the cleaned \
+                 message is already in place, so re-running the same commit with it succeeds",
+                removed.len()
+            ),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::attribution_match;
+    use super::{attribution_match, gate, strip_attribution};
+    use crate::checkers::{Context, OutcomeKind};
+    use std::path::PathBuf;
 
     fn tag_of(line: &str) -> Option<&'static str> {
         attribution_match(line).map(|(tag, _)| tag)
@@ -550,5 +722,174 @@ mod tests {
             None
         );
         assert_eq!(tag_of("\tGenerated with Claude Code"), None);
+    }
+
+    // ------------------------------------------------- compose-time scrub
+
+    struct Dir(PathBuf);
+    impl Dir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "gv-scrub-{tag}-{}-{:04x}",
+                std::process::id(),
+                rand::random::<u16>()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn repo(&self) -> &Self {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.0)
+                .args(["init", "-b", "main"])
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            self
+        }
+    }
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn ctx(dir: &Dir, event: &str, source: Option<&str>) -> Context {
+        Context {
+            event: event.into(),
+            repo_root: dir.0.clone(),
+            repo_slug: None,
+            identity: "synthetic".into(),
+            account: None,
+            via_default: false,
+            expected_email: None,
+            actual_email: None,
+            stdin: None,
+            push_remote: None,
+            pr_base: None,
+            pr_head: None,
+            pr_number: None,
+            release_tag: None,
+            release_commit: None,
+            commit_message_file: Some(dir.0.join("MSG")),
+            commit_message_source: source.map(str::to_string),
+        }
+    }
+
+    const TAINTED: &str = "Fix the thing\n\nA proper body line.\n\nCo-authored-by: Devin AI <devin-ai-integration[bot]@users.noreply.github.com>\nGenerated with [Devin](https://devin.ai)\n";
+
+    #[test]
+    fn strip_removes_whole_lines_and_drops_emptied_paragraphs() {
+        let (cleaned, removed) = strip_attribution(TAINTED).unwrap();
+        assert_eq!(removed.len(), 2);
+        assert_eq!(cleaned, "Fix the thing\n\nA proper body line.\n");
+        // The trailer paragraph vanished entirely - no trailing blank lines.
+        assert!(!cleaned.contains("Devin"));
+    }
+
+    #[test]
+    fn strip_preserves_layout_of_kept_lines() {
+        let text = "Subject\n\nQuoted example:\n  Co-authored-by: Devin AI <devin-ai-integration[bot]@users.noreply.github.com>\n\n\n\nAssisted-by: Claude Code\nLast line";
+        let (cleaned, removed) = strip_attribution(text).unwrap();
+        assert_eq!(removed.len(), 1);
+        // The indented quote survives; the doubled blank collapses to one.
+        assert_eq!(
+            cleaned,
+            "Subject\n\nQuoted example:\n  Co-authored-by: Devin AI <devin-ai-integration[bot]@users.noreply.github.com>\n\nLast line\n"
+        );
+    }
+
+    #[test]
+    fn strip_returns_none_for_clean_text() {
+        assert!(
+            strip_attribution("Subject\n\nCo-authored-by: Jane Doe <jane@example.com>\n").is_none()
+        );
+    }
+
+    #[test]
+    fn fresh_message_is_cleaned_and_refused() {
+        let dir = Dir::new("fresh");
+        dir.repo();
+        let file = dir.0.join("MSG");
+        std::fs::write(&file, TAINTED).unwrap();
+        let outcome = gate(&ctx(&dir, "commit-msg", None)).unwrap();
+        match outcome.outcome {
+            OutcomeKind::Failed(_) => {}
+            other => panic!("fresh tainted message must refuse, got {other:?}"),
+        }
+        assert_eq!(outcome.name, "attribution-message");
+        assert!(outcome.stdout.contains("resubmit"));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "Fix the thing\n\nA proper body line.\n"
+        );
+    }
+
+    #[test]
+    fn reused_message_is_cleaned_and_allowed() {
+        let dir = Dir::new("reuse");
+        dir.repo();
+        let file = dir.0.join("MSG");
+        std::fs::write(&file, TAINTED).unwrap();
+        // prepare-commit-msg with source=commit: -c/-C reuses an existing
+        // commit's message - strip the banner, do not refuse.
+        let outcome = gate(&ctx(&dir, "prepare-commit-msg", Some("commit"))).unwrap();
+        assert!(matches!(outcome.outcome, OutcomeKind::Passed));
+        assert!(outcome.stdout.contains("replayed"));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "Fix the thing\n\nA proper body line.\n"
+        );
+    }
+
+    #[test]
+    fn merge_marker_makes_the_message_replayed() {
+        let dir = Dir::new("merge");
+        dir.repo();
+        std::fs::write(dir.0.join(".git/MERGE_HEAD"), "0".repeat(40)).unwrap();
+        let file = dir.0.join("MSG");
+        std::fs::write(&file, TAINTED).unwrap();
+        let outcome = gate(&ctx(&dir, "commit-msg", None)).unwrap();
+        assert!(matches!(outcome.outcome, OutcomeKind::Passed));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "Fix the thing\n\nA proper body line.\n"
+        );
+    }
+
+    #[test]
+    fn clean_or_missing_messages_do_not_touch_the_gate() {
+        let dir = Dir::new("clean");
+        dir.repo();
+        let file = dir.0.join("MSG");
+        std::fs::write(&file, "Fix the thing\n\nA proper body line.\n").unwrap();
+        assert!(gate(&ctx(&dir, "commit-msg", None)).is_none());
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "Fix the thing\n\nA proper body line.\n"
+        );
+
+        // No message file handed over: nothing to scrub, nothing to refuse.
+        let mut bare = ctx(&dir, "commit-msg", None);
+        bare.commit_message_file = None;
+        assert!(gate(&bare).is_none());
+    }
+
+    #[test]
+    fn rewrite_preserves_the_message_file_mode() {
+        let dir = Dir::new("mode");
+        dir.repo();
+        let file = dir.0.join("MSG");
+        std::fs::write(&file, TAINTED).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+            gate(&ctx(&dir, "commit-msg", None)).unwrap();
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 }

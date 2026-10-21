@@ -283,6 +283,8 @@ mod tests {
             pr_number: None,
             release_tag: None,
             release_commit: None,
+            commit_message_file: None,
+            commit_message_source: None,
         }
     }
 

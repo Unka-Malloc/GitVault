@@ -664,7 +664,7 @@ fn context_for(
     event: &str,
     directory: &Path,
     release_tag: Option<String>,
-    hook_remote: Option<String>,
+    hook_args: &[String],
 ) -> anyhow::Result<checkers::Context> {
     let repo = git::Repo::discover(directory)?;
     let outcome = identity::resolve(cfg, &repo, false)?;
@@ -705,7 +705,7 @@ fn context_for(
     // The remote a push targets: the hook passes it on argv; `check` falls
     // back to the checkout's first configured remote, the usual case.
     let push_remote = if event == "pre-push" {
-        hook_remote.or_else(|| {
+        hook_args.first().cloned().or_else(|| {
             std::process::Command::new("git")
                 .arg("-C")
                 .arg(&repo.root)
@@ -739,6 +739,12 @@ fn context_for(
         pr_number: None,
         release_tag,
         release_commit,
+        commit_message_file: matches!(event, "commit-msg" | "prepare-commit-msg")
+            .then(|| hook_args.first().map(PathBuf::from))
+            .flatten(),
+        commit_message_source: matches!(event, "commit-msg" | "prepare-commit-msg")
+            .then(|| hook_args.get(1).cloned())
+            .flatten(),
     })
 }
 
@@ -880,13 +886,7 @@ fn cmd_hook(config: Option<&PathBuf>, event: &str, args: &[String]) -> anyhow::R
     // git runs hooks with cwd set to the top level of the working tree, so "."
     // resolves correctly and no directory argument is needed from the hook shim.
     // For pre-push, argv[0] is the remote the push targets.
-    let ctx = context_for(
-        &cfg,
-        event,
-        &PathBuf::from("."),
-        None,
-        args.first().cloned(),
-    )?;
+    let ctx = context_for(&cfg, event, &PathBuf::from("."), None, args)?;
     let report = audit_gate(
         &cfg,
         &cfg_sig,
@@ -1388,7 +1388,7 @@ fn cmd_check(
 ) -> anyhow::Result<ExitCode> {
     let (cfg, cfg_path, cfg_sig) = config::Config::load_unverified(config)?;
     let (policy, _policy_path, policy_sig) = config::Policy::load_state(&cfg_path, &cfg)?;
-    let ctx = context_for(&cfg, event, directory, tag.map(str::to_string), None)?;
+    let ctx = context_for(&cfg, event, directory, tag.map(str::to_string), &[])?;
     let report = audit_gate(
         &cfg,
         &cfg_sig,
@@ -2020,7 +2020,7 @@ fn cmd_pr(
             // reviewed here before the request proposes it. The checker resolves
             // base/head in the local repository, the only place the content exists.
             let mut ctx =
-                context_for(&cfg, "pr", &PathBuf::from("."), None, None).map_err(|err| {
+                context_for(&cfg, "pr", &PathBuf::from("."), None, &[]).map_err(|err| {
                     anyhow::anyhow!(
                         "reviewing a pull request needs a checkout of the repository\n  \
                      {err:#}\n  \
@@ -2079,7 +2079,7 @@ fn cmd_pr(
             // here, so the checker is told the request number and fetches the
             // head itself; nothing reaches GitHub until it passes.
             let mut ctx =
-                context_for(&cfg, "pr", &PathBuf::from("."), None, None).map_err(|err| {
+                context_for(&cfg, "pr", &PathBuf::from("."), None, &[]).map_err(|err| {
                     anyhow::anyhow!(
                         "reviewing a merge request needs a checkout of the repository\n  \
                      {err:#}\n  \
@@ -2316,20 +2316,14 @@ fn cmd_release(
     // the vault is locked. Nothing reaches GitHub until the registry passes.
     if let ReleaseCommand::Create { tag, .. } = &command {
         let (policy, _policy_path, policy_sig) = config::Policy::load_state(&cfg_path, &cfg)?;
-        let ctx = context_for(
-            &cfg,
-            "release",
-            &PathBuf::from("."),
-            Some(tag.clone()),
-            None,
-        )
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "reviewing a release needs a checkout with the tagged commit\n  \
+        let ctx = context_for(&cfg, "release", &PathBuf::from("."), Some(tag.clone()), &[])
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "reviewing a release needs a checkout with the tagged commit\n  \
                      {err:#}\n  \
                      run this from the tagged working tree"
-            )
-        })?;
+                )
+            })?;
         run_publication_gate(&cfg, &cfg_sig, &policy, &policy_sig, &ctx, "release")?;
     }
     let vault = vault::Vault::open()?;
@@ -2567,6 +2561,8 @@ mod tests {
             pr_number: None,
             release_tag: None,
             release_commit: None,
+            commit_message_file: None,
+            commit_message_source: None,
         }
     }
 
