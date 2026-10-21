@@ -113,7 +113,7 @@
       "lane": "rpc",
       "command": {
         "program": {"resolve": ["pi", "{home}/.local/bin/pi", "{home}/.pi/agent/bin/pi"]},
-        "args": ["--mode", "rpc", "--approve", "--tools", "mcp__gitvault_audit__*"]
+        "args": ["--mode", "rpc", "--approve", "--tools", "codemode,mcp__gitvault_audit__*"]
       },
       "sessionOpen": {"method": "get_state", "params": {}},
       "sessionResume": {"method": "switch_session", "params": {"sessionPath": "{sessionId}"}},

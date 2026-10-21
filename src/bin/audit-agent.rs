@@ -309,6 +309,27 @@ fn write_pi_mcp(run_dir: &Path, servers: &[Value]) -> std::io::Result<()> {
             mcp_servers_map.insert(name.to_string(), Value::Object(spec));
         }
     }
+    // A project entry without command/url/type overrides the same-named
+    // global server: silence every server in the user's agent mcp.json so
+    // nothing outside the declared audit surface is discoverable in the
+    // session. A declared audit server keeps its real definition.
+    let agent_dir = std::env::var_os("PI_CODING_AGENT_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".pi").join("agent"))
+        });
+    if let Some(dir) = agent_dir {
+        if let Ok(raw) = std::fs::read_to_string(dir.join("mcp.json"))
+            && let Ok(doc) = serde_json::from_str::<Value>(&raw)
+            && let Some(global) = doc["mcpServers"].as_object()
+        {
+            for name in global.keys() {
+                mcp_servers_map
+                    .entry(name.clone())
+                    .or_insert_with(|| json!({ "enabled": false }));
+            }
+        }
+    }
     std::fs::write(
         pi_dir.join("mcp.json"),
         serde_json::to_string_pretty(&json!({ "mcpServers": mcp_servers_map })).unwrap_or_default(),
