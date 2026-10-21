@@ -5,8 +5,10 @@
 Audits always precede authorization. Run the certified audit policy and show
 its report before the operator is asked for any signature, unlock or
 credential — a blessing requested before the evidence exists lets the audit
-be bypassed. Never reorder this, and never execute checker rows from an
-uncertified policy file: the rows declare arbitrary commands.
+be bypassed. Never reorder this, and never *enforce* checker rows from an
+uncertified policy file: the rows declare arbitrary commands. `gitvault
+check` is the exception by design — it audits a proposed policy so evidence
+exists before its signature, marking the run uncertified.
 
 ## Trust boundary
 

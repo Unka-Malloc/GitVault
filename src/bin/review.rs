@@ -144,6 +144,16 @@ enum Command {
         #[arg(long)]
         repo: PathBuf,
     },
+    /// The deterministic publication sweep - withheld names and credential
+    /// shapes over the repository's unpublished snapshots. Registered as an
+    /// ordinary checker row in an earlier phase, it is the script-check half
+    /// of a gate: a pattern-decidable refusal skips every later phase and
+    /// never costs a semantic review a token.
+    Baseline {
+        /// The repository under review.
+        #[arg(long)]
+        repo: PathBuf,
+    },
     /// Run or resume a full-service audit over selected projects.
     FullAudit {
         /// The installed contract.json.
@@ -338,6 +348,71 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::Baseline { repo } => {
+            let repo = repo.to_string_lossy();
+            // The baseline is not a checker: its rule set is fixed and
+            // universal, so it needs no contract - only the machine-local
+            // withheld-names list the builtin already knows how to find.
+            let rules = [contract::Rule {
+                id: "publication-baseline".to_string(),
+                title: "Withheld names and credential shapes, scanned over the whole revision"
+                    .to_string(),
+                kind: "builtin".to_string(),
+                pattern: None,
+                target: None,
+                prompt: None,
+                builtin: Some("withheld-names-and-credentials".to_string()),
+            }];
+            let targets = match ranges::ranges(&repo) {
+                Ok(targets) => targets,
+                // An underivable scope is not a script-decidable refusal:
+                // nothing mechanically checkable exists yet, and the
+                // checkers that follow resolve the scope for themselves -
+                // the semantic layer reports the problem, in its own words.
+                Err(message) => {
+                    eprintln!("baseline: {message}");
+                    return ExitCode::SUCCESS;
+                }
+            };
+            if targets.is_empty() {
+                println!("baseline: nothing unpublished in this operation");
+                return ExitCode::SUCCESS;
+            }
+            match stage1::audit_all(
+                &repo,
+                &targets,
+                &rules,
+                &stage1::Opts {
+                    withheld_path: None,
+                },
+                false,
+            ) {
+                Err(message) => {
+                    eprintln!("{}", sanitize::sanitize(&message));
+                    ExitCode::FAILURE
+                }
+                Ok((ok, summaries)) => {
+                    for summary in &summaries {
+                        println!(
+                            "baseline: {} — {} ({}, findings={})",
+                            summary.status,
+                            summary.label,
+                            summary.scope,
+                            summary.hits.len(),
+                        );
+                    }
+                    if ok {
+                        ExitCode::SUCCESS
+                    } else {
+                        eprintln!(
+                            "baseline: the deterministic publication check refused this \
+                             operation; nothing reaches a reviewer"
+                        );
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+        }
         Command::FullAudit {
             contract,
             manifest,

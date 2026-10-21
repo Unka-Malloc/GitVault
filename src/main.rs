@@ -789,6 +789,9 @@ fn outgoing_push_stdin(repo: &git::Repo) -> String {
 /// event is held to the signatures only when the policy's commands would
 /// actually execute: an event the policy says nothing about runs nothing, and
 /// local work (commits, messages) is never held hostage to a blessing.
+/// `allow_proposed` splits the audit tool from the enforcement path: `check`
+/// audits a policy as a *proposal* - the evidence must exist before the
+/// blessing can be asked for - while hooks and publication fail closed.
 fn audit_gate(
     cfg: &config::Config,
     cfg_sig: &configsig::SigState,
@@ -797,6 +800,7 @@ fn audit_gate(
     ctx: &checkers::Context,
     operation: &str,
     only: Option<&str>,
+    allow_proposed: bool,
 ) -> anyhow::Result<checkers::Report> {
     let event = config::Event::parse(&ctx.event)?;
     let selected = policy.checkers_for(event);
@@ -822,13 +826,21 @@ fn audit_gate(
                     .join("\n    ")
             )
         };
-        anyhow::bail!(
-            "refusing to run an uncertified audit policy: {reason}\n  \
+        if !allow_proposed {
+            anyhow::bail!(
+                "refusing to run an uncertified audit policy: {reason}\n  \
+                 {declared}\n  \
+                 if this is the policy audits should enforce, certify it: gitvault config sign"
+            );
+        }
+        eprintln!(
+            "gitvault: auditing the proposed audit policy (uncertified: {reason})\n  \
              {declared}\n  \
-             if this is the policy audits should enforce, certify it: gitvault config sign"
+             the signature stays last - certify only after these audits pass: \
+             gitvault config sign"
         );
     }
-    let report = checkers::run_all(cfg, policy, ctx, cfg_sig, only)?;
+    let report = checkers::run_all(cfg, policy, ctx, cfg_sig, policy_sig, only)?;
     report.print(&ctx.event);
     if let configsig::SigState::Invalid(reason) = cfg_sig
         && (boundary || !selected.is_empty())
@@ -852,7 +864,9 @@ fn run_publication_gate(
     ctx: &checkers::Context,
     operation: &str,
 ) -> anyhow::Result<()> {
-    let report = audit_gate(cfg, cfg_sig, policy, policy_sig, ctx, operation, None)?;
+    let report = audit_gate(
+        cfg, cfg_sig, policy, policy_sig, ctx, operation, None, false,
+    )?;
     anyhow::ensure!(
         report.exit_code() == ExitCode::SUCCESS,
         "a blocking checker refused this {operation}; nothing was sent to GitHub"
@@ -881,6 +895,7 @@ fn cmd_hook(config: Option<&PathBuf>, event: &str, args: &[String]) -> anyhow::R
         &ctx,
         "operation",
         None,
+        false,
     )?;
     if report.exit_code() == ExitCode::SUCCESS && event == "pre-push" {
         // Pending attestations drain on every audited push - including an
@@ -1043,7 +1058,13 @@ fn staged_attestation(
     let stage = std::process::Command::new("git")
         .arg("-C")
         .arg(&ctx.repo_root)
-        .args(["push", "--no-verify", "-q", remote, &format!("{commit}:{staging}")])
+        .args([
+            "push",
+            "--no-verify",
+            "-q",
+            remote,
+            &format!("{commit}:{staging}"),
+        ])
         .output();
     if !stage.map(|out| out.status.success()).unwrap_or(false) {
         return false;
@@ -1368,7 +1389,16 @@ fn cmd_check(
     let (cfg, cfg_path, cfg_sig) = config::Config::load_unverified(config)?;
     let (policy, _policy_path, policy_sig) = config::Policy::load_state(&cfg_path, &cfg)?;
     let ctx = context_for(&cfg, event, directory, tag.map(str::to_string), None)?;
-    let report = audit_gate(&cfg, &cfg_sig, &policy, &policy_sig, &ctx, "check", only)?;
+    let report = audit_gate(
+        &cfg,
+        &cfg_sig,
+        &policy,
+        &policy_sig,
+        &ctx,
+        "check",
+        only,
+        true,
+    )?;
     Ok(report.exit_code())
 }
 
@@ -2557,6 +2587,7 @@ mod tests {
                 &ctx(event),
                 "test",
                 None,
+                false,
             ) {
                 Err(err) => err,
                 Ok(_) => panic!("{event} must refuse an uncertified audit policy"),
@@ -2577,8 +2608,32 @@ mod tests {
                 &ctx("pre-commit"),
                 "test",
                 None,
+                false,
             )
             .is_ok()
+        );
+    }
+
+    /// `check` is the audit-before-blessing tool: a proposed policy change
+    /// must be exercisable *before* it is signed, or signing would always
+    /// come first. Enforcement paths keep refusing the same file.
+    #[test]
+    fn check_audits_a_proposed_policy_the_enforcer_would_refuse() {
+        let cfg = Config::default();
+        let policy = Policy::default();
+        assert!(
+            audit_gate(
+                &cfg,
+                &SigState::Inactive,
+                &policy,
+                &SigState::Invalid("checkers.toml is unsigned".into()),
+                &ctx("pre-push"),
+                "check",
+                None,
+                true,
+            )
+            .is_ok(),
+            "check must audit the proposed policy, not demand its signature first"
         );
     }
 
@@ -2597,6 +2652,7 @@ mod tests {
                 &ctx(event),
                 "check",
                 None,
+                false,
             ) {
                 Err(err) => err,
                 Ok(_) => panic!("{event} must refuse an uncertified routing table"),
@@ -2613,6 +2669,7 @@ mod tests {
                 &ctx("pre-commit"),
                 "check",
                 None,
+                false,
             )
             .is_ok()
         );
@@ -2809,6 +2866,7 @@ mod tests {
                 release_commit: None,
             },
             routing_signature: "valid".to_string(),
+            policy_signature: "valid".to_string(),
             passed: true,
             blocking_failures: 0,
             outcomes: Vec::new(),

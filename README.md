@@ -41,6 +41,14 @@ removes:
 
 ## Checkers are a list
 
+Script checks sit in the same registry, in an earlier `phase` than the
+reviewers: a deterministic row — `gitvault-review baseline`, sweeping the
+outgoing revision for withheld names and credential shapes — refuses before
+any later phase starts, so a pattern-decidable refusal never spends a
+checker's tokens. What a script can decide is decided by the script; the
+semantic review that follows may assume nothing mechanically detectable
+survives.
+
 Adding capability means adding a registration, never editing the engine. An
 audit is one entry; a formatter, a commit-message policy or a build check are
 others. The registry is its own signed file — `checkers.toml` beside
@@ -212,13 +220,9 @@ when only local receipt finalization failed. Unfinished reviews retain their
 progress independently of completed-receipt cleanup.
 
 Build both binaries with `cargo build --release`. Install the runner beside
-`gitvault` on PATH, then run `gitvault-review update --source tools/<checker>`
-for each checker and sync each published profile with
-`gitvault-review pull --source tools/<checker>`. The workspace
-uses `a4aa` from `../../Adapter-For-All-Agents` for the generic spec types, and
-`agents-with-profiles` from `../../Agents-With-Profiles` with default
-features disabled; the agent-specific specs the deployment runs live in the
-registry template and the A4AA agent crates, not in GitVault.
+`gitvault` on PATH, then run `gitvault-review update --source <checker-dir>`
+for each checker's source directory and sync each published profile with
+`gitvault-review pull --source <checker-dir>`.
 The runner does not access GitHub credentials or the vault.
 
 The prompt and skill each audit agent runs on are hosted in a profile

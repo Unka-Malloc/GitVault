@@ -923,7 +923,7 @@ mod tests {
         );
         assert_eq!(
             document["bindings"]["audit"]["fallbacks"],
-            json!(["sample-checker-devin"])
+            json!(["sample-checker-devin", "sample-checker-pi"])
         );
         assert_eq!(
             document["profiles"]["sample-checker-devin"]["model"].as_str(),
@@ -960,7 +960,13 @@ mod tests {
         let registry = awp::Registry::from_document(parsed).unwrap();
         let binding = registry.binding("audit").unwrap();
         assert_eq!(binding.profile(), "sample-checker");
-        assert_eq!(binding.fallbacks(), &["sample-checker-devin".to_string()]);
+        assert_eq!(
+            binding.fallbacks(),
+            &[
+                "sample-checker-devin".to_string(),
+                "sample-checker-pi".to_string()
+            ]
+        );
         // The written file round-trips through the same path the runner uses.
         let target = dir.join("target");
         std::fs::create_dir_all(&target).unwrap();

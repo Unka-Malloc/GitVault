@@ -16,9 +16,6 @@
   profile without a `runtime` block refuses the audit; a model outside the
   declared provider's namespace refuses the declaration. No vendor or
   catalog is pinned by the framework.
-- This machine's deployment binds an OpenCode serve lane on the free
-  `opencode/`-namespaced chain with a `devin acp` fallback — a deployment
-  choice recorded in the registry template, not a framework fact.
 - Preserve each auditor's identity and profile revision in review receipts.
 - Isolate model access to the declared audit tools; host credentials are
   resolved through the registry document's declared secret recipes, never

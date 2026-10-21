@@ -9,7 +9,7 @@
 //! hit is blocking: the answer is to rewrite the range and strip the lines,
 //! never to publish them.
 //!
-//! The pattern catalogue is a port of `~/.git-hooks/ai_attribution.py` and
+//! The pattern catalogue is a port of an earlier standalone hook script and
 //! keeps its matching rules exactly:
 //!
 //! * every pattern is anchored to the whole line - a line must *be* an

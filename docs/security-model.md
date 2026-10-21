@@ -171,10 +171,15 @@ two files answer different questions and are blessed at different moments.
   is asked: a gated event whose routing signature does not hold refuses only
   after the audit report has been shown, so the operator always certifies
   evidence already produced, never a blind precondition. An uncertified
-  policy is never executed — its declared commands are shown, then refused —
-  and an uncertified routing table never reaches a credential. A routing
-  table that declares `audit_policy` also binds the policy file's existence:
-  deleting `checkers.toml` cannot silence the audit, it refuses.
+  policy is never *enforced* — hooks and publication commands show its
+  declared commands, then refuse — but `gitvault check` audits it as a
+  proposal: a policy change must produce evidence before its signature, or
+  the blessing would always come first. Such runs are marked uncertified in
+  the report and the run record's `policy_signature` field, so a proposal
+  audit never reads as a certified one. An uncertified routing table never
+  reaches a credential. A routing table that declares `audit_policy` also
+  binds the policy file's existence: deleting `checkers.toml` cannot silence
+  the audit, it refuses.
 - **Signing key in the vault.** `gitvault config keygen` creates an ed25519
   pair; the private half is stored in `vault.enc` beside the credentials, so
   producing a signature costs the same biometric-gated window as releasing a

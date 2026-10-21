@@ -508,6 +508,54 @@ fn pre_push_passes_a_clean_range() {
 }
 
 #[test]
+fn a_script_checker_in_an_earlier_phase_preempts_the_review() {
+    // Script check before the reviewer is a registry ordering, not an engine
+    // feature: the deterministic baseline runs as an ordinary checker row in
+    // an earlier phase, and its refusal skips every later phase - the marker
+    // staying absent proves no token was spent on a pattern-decidable
+    // refusal.
+    let fixture = publication_fixture("'pre-push'", false);
+    let root = fixture.0.clone();
+    // The shape must exist only at run time: a source tree carrying a literal
+    // credential-shaped string is exactly what the baseline refuses, so the
+    // fixture assembles it from parts that match nothing on their own.
+    std::fs::write(
+        root.join("leak"),
+        format!("key = {}{}\n", "AKIA", "IOSFODNN7EXAMPLE"),
+    )
+    .unwrap();
+    checked(&root, &["add", "."]);
+    checked(&root, &["commit", "-qm", "add a key"]);
+    // Move the scripted marker checker to a later phase and put the
+    // publication baseline in front of it.
+    let policy = format!(
+        "[[checkers]]\nname = 'publication-baseline'\non = ['pre-push']\nphase = 0\ncommand = ['{}', 'baseline', '--repo', '{{repo}}']\n\n[[checkers]]\nname = 'publication'\non = ['pre-push']\nphase = 1\ncommand = ['/bin/sh', '{}', '{{repo}}']\n",
+        env!("CARGO_BIN_EXE_gitvault-review"),
+        root.join("checker.sh").display()
+    );
+    std::fs::write(root.join("checkers.toml"), policy).unwrap();
+    let local = String::from_utf8(git(&root, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let remote = String::from_utf8(git(&root, &["rev-parse", "HEAD^"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let result = check_pre_push(
+        &root,
+        &format!("refs/heads/main {local} refs/heads/main {remote}\n"),
+    );
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "a leaked key must fail: {stderr}");
+    assert!(stderr.contains("publication-baseline"), "stderr: {stderr}");
+    assert!(
+        !root.join("ran").exists(),
+        "the later-phase checker ran and spent its tokens on a script-decidable refusal"
+    );
+}
+
+#[test]
 fn pre_push_passes_when_nothing_is_outgoing() {
     // A deletion ref line (local sha all zeros) and an up-to-date line both
     // contribute no outgoing commits - the gate must not invent a refusal.
@@ -716,8 +764,11 @@ fn an_emptied_policy_cannot_disarm_the_publication_boundary() {
             !result.status.success(),
             "the boundary must refuse: {stderr}"
         );
+        // `check` audits the proposal and refuses at the routing signature;
+        // `hook` refuses the uncertified policy before any checker runs.
         assert!(
-            stderr.contains("uncertified audit policy"),
+            stderr.contains("uncertified audit policy")
+                || stderr.contains("proposed audit policy (uncertified"),
             "stderr: {stderr}"
         );
     }

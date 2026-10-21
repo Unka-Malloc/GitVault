@@ -111,7 +111,8 @@ pub fn iso8601(secs: u64) -> String {
     )
 }
 
-/// Replace this machine's home and temporary prefixes with a marker.
+/// Replace any host's home and temporary prefixes with a marker. The marker
+/// list is the portable cross-platform convention, identical everywhere.
 ///
 /// Checkers already keep matched values out of their output, but they do print
 /// where their own receipts live. That path describes the machine, not the
@@ -207,6 +208,11 @@ pub struct Record {
     /// the blessing, so the record keeps the state the verdict was made under.
     #[serde(default)]
     pub routing_signature: String,
+    /// Whether the audit policy's signature held when the run happened. A
+    /// `check` may audit a proposed (uncertified) policy - the record must
+    /// not read as if a certified one ran.
+    #[serde(default)]
+    pub policy_signature: String,
     pub passed: bool,
     pub blocking_failures: usize,
     pub outcomes: Vec<Outcome>,
@@ -296,6 +302,7 @@ pub fn finish(
     ctx: &Context,
     report: &Report,
     routing_signature: &crate::configsig::SigState,
+    policy_signature: &crate::configsig::SigState,
 ) {
     let mut record = Record {
         id: run.id,
@@ -314,6 +321,11 @@ pub fn finish(
             release_commit: ctx.release_commit.clone(),
         },
         routing_signature: match routing_signature {
+            crate::configsig::SigState::Valid => "valid".to_string(),
+            crate::configsig::SigState::Invalid(_) => "invalid".to_string(),
+            crate::configsig::SigState::Inactive => "inactive".to_string(),
+        },
+        policy_signature: match policy_signature {
             crate::configsig::SigState::Valid => "valid".to_string(),
             crate::configsig::SigState::Invalid(_) => "invalid".to_string(),
             crate::configsig::SigState::Inactive => "inactive".to_string(),
@@ -587,6 +599,7 @@ mod tests {
                 run,
                 ctx,
                 &Report { outcomes: vec![] },
+                &SigState::Inactive,
                 &SigState::Inactive,
             );
             id

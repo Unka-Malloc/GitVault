@@ -56,7 +56,9 @@ static ENV_LINE: LazyLock<Regex> = LazyLock::new(|| {
         .unwrap()
 });
 
-/// Home and temp prefixes a receipt or a review payload must never spell out.
+/// The cross-platform home and temp prefixes a receipt or a review payload
+/// must never spell out — the same on every macOS, Linux and Windows host,
+/// so the list itself discloses nothing about the machine running it.
 /// One convention the receipt store shares: this list and
 /// `records.rs::redact`; the parity goldens pinned the pair against the
 /// retired Python engine.

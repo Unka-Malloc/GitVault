@@ -273,6 +273,7 @@ pub fn run_all(
     policy: &Policy,
     ctx: &Context,
     routing_sig: &crate::configsig::SigState,
+    policy_sig: &crate::configsig::SigState,
     only: Option<&str>,
 ) -> Result<Report> {
     let routing_certified = !matches!(routing_sig, crate::configsig::SigState::Invalid(_));
@@ -358,7 +359,7 @@ pub fn run_all(
     }
     report.outcomes.append(&mut outcomes);
     if let Some(run) = run {
-        records::finish(cfg, run, ctx, &report, routing_sig);
+        records::finish(cfg, run, ctx, &report, routing_sig, policy_sig);
     }
     Ok(report)
 }
@@ -952,6 +953,7 @@ mod tests {
             &policy,
             &ctx,
             &crate::configsig::SigState::Inactive,
+            &crate::configsig::SigState::Inactive,
             None,
         )
         .unwrap();
@@ -976,6 +978,7 @@ mod tests {
             &Config::default(),
             &policy,
             &ctx,
+            &crate::configsig::SigState::Inactive,
             &crate::configsig::SigState::Inactive,
             None,
         )
