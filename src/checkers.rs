@@ -382,6 +382,7 @@ pub fn run_all(
         records::finish(cfg, run, ctx, &report, routing_sig, policy_sig);
     }
     let _ = std::fs::remove_file(&evidence);
+    let _ = std::fs::remove_dir_all(evidence.with_extension("d"));
     Ok(report)
 }
 

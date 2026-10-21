@@ -49,7 +49,7 @@ by the audit session. Source retrieval excludes credential containers/runtime da
 redacts recognizable credentials and local identifiers; it is not a replacement for
 a dedicated privacy audit. Do not stage private operational records as source code.
 
-`policy.md` defines the six cost domains and blocking threshold. Findings require
+`policy.md` defines the seven cost domains and blocking threshold. Findings require
 file/line, trigger/evidence, impact, resource units before/after, a minimal remedy,
 focused validation and successfully fetched official URLs. Cost estimates distinguish
 inference from measurement, resource savings from invoice savings and allowances
@@ -68,7 +68,7 @@ usage so the review's own cost can be assessed. No report is committed to the pr
 
 Verification: run `cargo test`. Unit and integration tests use synthetic Git
 repositories, MCP protocol round-trips against the stateful serve process and
-a deterministic ACP agent double driven through the declared registry
+a deterministic `va serve` agent double driven through the declared registry
 document. GitVault tests exercise actual hooks, refusal, `--no-verify`,
 partial index scope and completion waits. A real model review is a separate
 live acceptance operation, not an implementation test.
@@ -113,7 +113,7 @@ repeated guessing.
 | Source access | Only immutable Git objects; reject credential/runtime containers and traversal; never follow worktree symlinks. |
 | Official catalog | Only operator-supplied public URLs; refuse cross-authority redirects; reuse one fetch per page. |
 | Findings contract | Require concrete location, impact, before/after units, remedy, validation and retrieved sources. |
-| Coverage | A pass requires every snapshot path's diff and all six cost domains accounted for, with no blocker or unknown applicable coverage. |
+| Coverage | A pass requires every snapshot path's diff and all seven cost domains accounted for, with no blocker or unknown applicable coverage. |
 | Single submission | Accept one verdict per run; no cached prior approvals. |
 | Agent completion | Require successful engine exit and a structured verdict; provider errors/interruption refuse the publication. |
 | Ref stability | A pushed ref that moved during review refuses the publication. |

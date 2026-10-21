@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://gitvault.local/schemas/review-contract.schema.json",
   "title": "GitVault review contract",
-  "description": "The declarative half of an audit checker: everything that varies per reviewer, as data. The runtime (Rust) executes these verbs; the registry pins and versions the document. Judgment stays in policy.md - natural language is not part of this schema.",
+  "description": "The declarative half of an audit checker: everything that varies per reviewer, as data. The runtime (Rust) executes these verbs; the registry pins and versions the document. Judgment stays in policy.md - natural language is not part of this schema. Stability: provisional until the first public release; the builtin vocabulary below is the set that release publishes.",
   "type": "object",
   "required": ["name", "title", "domains", "finding_keys", "on", "severity", "tools", "task"],
   "additionalProperties": false,

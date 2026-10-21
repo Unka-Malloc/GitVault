@@ -977,6 +977,16 @@ fn audit_gate(
         event,
         config::Event::PrePush | config::Event::Pr | config::Event::Release
     );
+    // Rows may carry a `repos` scope that `run_all` honors by dropping
+    // non-matching rows. Every completeness judgment below must reason
+    // about the rows that would actually execute for this repository -
+    // a policy scoped entirely elsewhere must not count as audit evidence.
+    let effective: Vec<&config::Checker> = selected
+        .iter()
+        .copied()
+        .filter(|c| only.is_some() || c.applies_to(ctx.repo_slug.as_deref(), &ctx.repo_root))
+        .filter(|c| only.is_none_or(|name| c.name == name))
+        .collect();
     // Checker rows are arbitrary code, so running them unsigned is the
     // privilege hole this guard closes. `selected` only shapes the refusal
     // message; it is never a precondition for checking the signature.
@@ -1041,7 +1051,9 @@ fn audit_gate(
         // evidence under-certifies the policy an operator would then sign.
         if boundary && !selected.is_empty() {
             let baseline_kept = covered.iter().any(|(checker, found)| {
-                found.is_none() && checker.severity == config::Severity::Blocking
+                found.is_none()
+                    && checker.severity == config::Severity::Blocking
+                    && checker.applies_to(ctx.repo_slug.as_deref(), &ctx.repo_root)
             });
             if !baseline_kept {
                 anyhow::bail!(
@@ -1062,6 +1074,7 @@ fn audit_gate(
                 let hit = covered.iter().any(|(checker, found)| {
                     checker.severity == config::Severity::Blocking
                         && found.as_ref() == Some(&contract)
+                        && checker.applies_to(ctx.repo_slug.as_deref(), &ctx.repo_root)
                 });
                 if !hit {
                     anyhow::bail!(
@@ -1090,11 +1103,18 @@ fn audit_gate(
     // passes, which is precisely the "no audit happened" state a boundary
     // exists to prevent. Signature problems still refuse first; an empty
     // policy adds its own refusal here, not a blessing.
-    if boundary && selected.is_empty() {
+    if boundary && effective.is_empty() {
+        let why = if selected.is_empty() {
+            format!("no checkers are registered for {}", event.name())
+        } else {
+            format!(
+                "no checkers registered for {} apply to this repository",
+                event.name()
+            )
+        };
         anyhow::bail!(
-            "no checkers are registered for {} - a publication boundary needs \
-             audit evidence, not a vacuous pass",
-            event.name()
+            "{why} - a publication boundary needs audit evidence, not a \
+             vacuous pass"
         );
     }
     Ok(report)
@@ -3386,5 +3406,41 @@ mod tests {
         let err = proposed_contract_path_at("/etc/passwd").unwrap_err();
         assert!(err.contains("profiles root"), "{err}");
         assert!(proposed_contract_path_at("/nonexistent/contract.json").is_err());
+    }
+
+    /// Rows scoped to another repository satisfy `checkers_for` but never
+    /// execute under `run_all`'s `applies_to` filter. A boundary whose whole
+    /// event set is scoped elsewhere must refuse - the review surface is
+    /// the rows that would actually run, not the rows that exist.
+    #[test]
+    fn a_boundary_refuses_a_policy_scoped_away_from_this_repository() {
+        let cfg = Config::default();
+        let mut policy = Policy::default();
+        policy.checkers.push(crate::config::Checker {
+            name: "elsewhere".into(),
+            on: vec!["pre-push".into()],
+            kind: crate::config::Kind::Exec,
+            severity: crate::config::Severity::Blocking,
+            timeout_secs: 0,
+            phase: 0,
+            command: vec!["/bin/true".into()],
+            env: Default::default(),
+            repos: vec!["someone/other-repo".into()],
+        });
+        let err = audit_gate(
+            &cfg,
+            &SigState::Inactive,
+            &policy,
+            &SigState::Valid,
+            &ctx("pre-push"),
+            "check",
+            None,
+            true,
+        )
+        .expect_err("a boundary with zero applicable checkers must refuse");
+        assert!(
+            err.to_string().contains("apply to this repository"),
+            "{err}"
+        );
     }
 }

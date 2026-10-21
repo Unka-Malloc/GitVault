@@ -2,6 +2,12 @@
 
 ## 0.2.0
 
+- The review-contract schema publishes its builtin vocabulary in neutral
+  names - `withheld-names-and-credentials`, `workspace-hygiene`,
+  `static-checklist`, `dependency-direction` - and the runtime accepts
+  exactly that set. The schema is provisional until this release and
+  carries no compatibility surface for earlier development names.
+
 - `phase` on a checker row orchestrates the run into ordered pools: rows in
   one phase run concurrently, later phases start only while no blocking
   failure exists, and skipped rows are recorded without spending tokens.

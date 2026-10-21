@@ -197,7 +197,9 @@ shared declarative template `tools/registry.json` — agent lane specs, the
 runner loads through AwP's standard registry rather than wiring a specific
 agent itself.
 The engine's role projection supplies the checker's review tools as the
-role's one MCP server, materialized onto the ACP lane by AwP. The review
+role's one MCP server, materialized onto the agent lane the synced profile
+declares - Pi's rpc lane today, launched by `va serve` with a project-local
+`.pi/mcp.json` that disables every global server. The review
 engine owns scope, evidence and verdicts; a
 completed turn alone cannot pass a gate. Receipts record the AwP principal and revision;
 receipt reuse and unfinished-run selection also match the role and version.
