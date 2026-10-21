@@ -821,11 +821,22 @@ fn profiles_root() -> PathBuf {
 /// binary: `baseline`, or `run --contract` on a contract installed under the
 /// profiles root. Anything else must refuse the run, not be skipped - an
 /// unsigned file sneaking in a foreign command cannot launder a partial audit.
-fn admissible_proposed_row(checker: &config::Checker) -> Result<(), String> {
+fn admissible_proposed_row(
+    checker: &config::Checker,
+    repo_root: &Path,
+) -> Result<Option<PathBuf>, String> {
     if checker.kind != config::Kind::Exec {
         return Err(format!(
             "kind '{:?}' is not the plain exec a proposal may run",
             checker.kind
+        ));
+    }
+    // A proposal gets no environment of its own at all: `GITVAULT_*` context
+    // would retarget the audit and loader variables like DYLD_* or PATH turn
+    // the trusted runner into a different process. Installed rows carry none.
+    if let Some(key) = checker.env.keys().next() {
+        return Err(format!(
+            "env '{key}' — a proposal may not override the runner environment"
         ));
     }
     let declared = checker.command.first().map(String::as_str).unwrap_or("");
@@ -841,25 +852,60 @@ fn admissible_proposed_row(checker: &config::Checker) -> Result<(), String> {
             "command '{declared}' is not the audit runner next to this binary"
         ));
     }
-    match checker.command.get(1).map(String::as_str) {
-        Some("baseline") => Ok(()),
-        Some("run") => proposed_contract_path(&checker.command).map(|_| ()),
-        other => Err(format!(
-            "subcommand '{}' is not one a proposal may invoke",
-            other.unwrap_or("")
-        )),
+    // Exact argument shape: the runner may only ever audit this repository.
+    // `{repo}` resolves to the run context's root; a literal path must be the
+    // same directory so a proposal cannot grade an unrelated tree.
+    let tail = &checker.command[1..];
+    let mut contract: Option<PathBuf> = None;
+    let mut seen_repo = false;
+    let sub = tail.first().map(String::as_str).unwrap_or("");
+    if sub != "baseline" && sub != "run" {
+        return Err(format!(
+            "subcommand '{sub}' is not one a proposal may invoke"
+        ));
     }
+    let mut args = tail[1..].iter();
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--repo" => {
+                if seen_repo {
+                    return Err("duplicate --repo".to_string());
+                }
+                seen_repo = true;
+                let value = args.next().ok_or("--repo without a value")?;
+                if value != "{repo}" {
+                    let canon = std::fs::canonicalize(value)
+                        .map_err(|_| format!("--repo '{value}' does not resolve"))?;
+                    let root = std::fs::canonicalize(repo_root)
+                        .unwrap_or_else(|_| repo_root.to_path_buf());
+                    if canon != root {
+                        return Err(format!(
+                            "--repo '{value}' is not the repository under review"
+                        ));
+                    }
+                }
+            }
+            "--contract" if sub == "run" => {
+                if contract.is_some() {
+                    return Err("duplicate --contract".to_string());
+                }
+                let value = args.next().ok_or("--contract without a value")?;
+                contract = Some(proposed_contract_path_at(value)?);
+            }
+            other => return Err(format!("argument '{other}' is outside the audit shape")),
+        }
+    }
+    if !seen_repo {
+        return Err("missing --repo binding to the repository under review".to_string());
+    }
+    if sub == "run" && contract.is_none() {
+        return Err("run without --contract".to_string());
+    }
+    Ok(contract)
 }
 
-/// The `--contract` a proposed `run` row may name: it must resolve to a file
-/// inside the installed profiles root, the operator-controlled surface the
-/// signer already owns.
-fn proposed_contract_path(command: &[String]) -> Result<PathBuf, String> {
-    let contract = command
-        .iter()
-        .position(|arg| arg == "--contract")
-        .and_then(|i| command.get(i + 1))
-        .ok_or_else(|| "run without --contract".to_string())?;
+/// The `--contract` a proposed `run` row may name, as a path value.
+fn proposed_contract_path_at(contract: &str) -> Result<PathBuf, String> {
     let contract_path = std::fs::canonicalize(contract)
         .map_err(|_| format!("contract '{contract}' does not resolve"))?;
     let root = std::fs::canonicalize(profiles_root()).unwrap_or_else(|_| profiles_root());
@@ -870,6 +916,35 @@ fn proposed_contract_path(command: &[String]) -> Result<PathBuf, String> {
             "contract '{contract}' is outside the installed profiles root"
         ))
     }
+}
+
+/// Installed reviewer contracts that cover `event` at blocking severity — the
+/// operator-controlled set a proposed boundary policy must still audit with.
+fn installed_boundary_contracts(event: config::Event) -> Vec<(PathBuf, String)> {
+    let root = std::fs::canonicalize(profiles_root()).unwrap_or_else(|_| profiles_root());
+    let mut contracts = Vec::new();
+    for pattern_dir in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+        let plugins = pattern_dir.path().join("plugins");
+        for entry in std::fs::read_dir(&plugins).into_iter().flatten().flatten() {
+            let path = entry.path().join("contract.json");
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(doc) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                continue;
+            };
+            let covers = doc["on"]
+                .as_array()
+                .map(|on| on.iter().any(|e| e.as_str() == Some(event.name())))
+                .unwrap_or(false);
+            let blocking = doc["severity"].as_str() == Some("blocking");
+            if covers && blocking {
+                let name = doc["name"].as_str().unwrap_or("?").to_string();
+                contracts.push((path, name));
+            }
+        }
+    }
+    contracts
 }
 
 fn audit_gate(
@@ -920,16 +995,40 @@ fn audit_gate(
              gitvault config sign"
         );
         // Even as a proposal the file stays inert where it counts: only rows
-        // that invoke the trusted audit runner beside this binary may run.
-        // The commands are still audited - as content - by the runners that
+        // that invoke the trusted audit runner beside this binary may run,
+        // bound to this repository and this installed contract set. The
+        // commands are still audited - as content - by the runners that
         // do execute.
+        let mut covered: Vec<(&config::Checker, Option<PathBuf>)> = Vec::new();
         for checker in &selected {
-            if let Err(why) = admissible_proposed_row(checker) {
-                anyhow::bail!(
+            match admissible_proposed_row(checker, &ctx.repo_root) {
+                Ok(contract) => covered.push((checker, contract)),
+                Err(why) => anyhow::bail!(
                     "refusing to run the proposed audit policy: checker '{}' \
                      escapes the audit-runner boundary: {why}",
                     checker.name
-                );
+                ),
+            }
+        }
+        // A boundary proposal cannot downgrade the audit it must produce:
+        // every installed blocking contract for this event still runs, at
+        // blocking severity, or the evidence under-certifies the policy an
+        // operator would then sign.
+        if boundary && !selected.is_empty() {
+            for (contract, name) in installed_boundary_contracts(event) {
+                let hit = covered.iter().any(|(checker, found)| {
+                    checker.severity == config::Severity::Blocking
+                        && found.as_ref() == Some(&contract)
+                });
+                if !hit {
+                    anyhow::bail!(
+                        "refusing to run the proposed audit policy: installed \
+                         reviewer '{name}' is missing or downgraded for {} - a \
+                         boundary proposal must keep every installed blocking \
+                         reviewer",
+                        event.name()
+                    );
+                }
             }
         }
     }
@@ -2613,8 +2712,8 @@ fn cmd_signing_key(
 mod tests {
     use super::{
         admissible_proposed_row, audit_gate, drain_pending_attestations, outgoing_push_stdin,
-        pending_attested, proposed_contract_path, publication_surface, read_pending,
-        record_pending_attestation,
+        pending_attested, profiles_root, proposed_contract_path_at, publication_surface,
+        read_pending, record_pending_attestation,
     };
     use crate::checkers::Context;
     use crate::config::{Config, Policy};
@@ -3022,32 +3121,113 @@ mod tests {
             env: Default::default(),
             repos: vec![],
         };
-        assert!(admissible_proposed_row(&shell_row).is_err());
+        let repo = std::env::temp_dir().join(format!("gv-prop-{:04x}", rand::random::<u16>()));
+        std::fs::create_dir_all(&repo).unwrap();
+        assert!(admissible_proposed_row(&shell_row, &repo).is_err());
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn a_proposal_row_is_bound_to_the_reviewed_repository() {
+        let runner = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("gitvault-review");
+        // Any installed contract supplies the in-root path the shape needs;
+        // both fixtures only exist where the toolchain is deployed.
+        let contract = std::fs::read_dir(profiles_root())
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .flat_map(|dir| {
+                std::fs::read_dir(dir.path().join("plugins"))
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            })
+            .map(|entry| entry.path().join("contract.json"))
+            .find(|path| path.is_file());
+        let (Some(contract), true) = (contract, runner.exists()) else {
+            return;
+        };
+        let repo = std::env::temp_dir().join(format!("gv-prop-{:04x}", rand::random::<u16>()));
+        std::fs::create_dir_all(&repo).unwrap();
+        let row = |tail: &[String]| crate::config::Checker {
+            name: "probe".into(),
+            on: vec!["pre-push".into()],
+            kind: crate::config::Kind::Exec,
+            severity: crate::config::Severity::Blocking,
+            timeout_secs: 0,
+            phase: 0,
+            command: std::iter::once(runner.display().to_string())
+                .chain(tail.iter().cloned())
+                .collect(),
+            env: Default::default(),
+            repos: vec![],
+        };
+        let contract = contract.display().to_string();
+        // The canonical installed shape passes; a literal path bound to the
+        // same repository does too.
+        for tail in [
+            vec!["run", "--contract", &contract, "--repo", "{repo}"],
+            vec![
+                "run",
+                "--contract",
+                &contract,
+                "--repo",
+                &repo.display().to_string(),
+            ],
+            vec!["baseline", "--repo", "{repo}"],
+        ] {
+            let good = row(&tail.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+            assert!(
+                admissible_proposed_row(&good, &repo).is_ok(),
+                "canonical row {tail:?} refused"
+            );
+        }
+        // A different repository, extra arguments, help flags and a
+        // contract-less run all refuse.
+        for tail in [
+            vec!["run", "--contract", &contract, "--repo", "/"],
+            vec![
+                "run",
+                "--contract",
+                &contract,
+                "--repo",
+                "{repo}",
+                "--verbose",
+            ],
+            vec!["run", "--help"],
+            vec!["run", "--contract", &contract],
+            vec!["baseline", "--repo", "/"],
+        ] {
+            let bad = row(&tail.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+            assert!(
+                admissible_proposed_row(&bad, &repo).is_err(),
+                "tail {tail:?} passed"
+            );
+        }
+        // Reserved context variables cannot be overridden by a proposal.
+        let mut poisoned = row(&[
+            "run".into(),
+            "--contract".into(),
+            contract.clone(),
+            "--repo".into(),
+            "{repo}".into(),
+        ]);
+        poisoned.env.insert("GITVAULT_PUSH_REFS".into(), "x".into());
+        assert!(admissible_proposed_row(&poisoned, &repo).is_err());
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]
     fn a_proposed_contract_must_live_under_the_profiles_root() {
-        let outside = vec![
-            "/usr/bin/true".into(),
-            "run".into(),
-            "--contract".into(),
-            "/etc/passwd".into(),
-        ];
-        let err = proposed_contract_path(&outside).unwrap_err();
+        let err = proposed_contract_path_at("/etc/passwd").unwrap_err();
         assert!(err.contains("profiles root"), "{err}");
-
-        // A contract that does not resolve at all refuses too: a dangling
-        // path is never inside the root.
-        let dangling = vec![
-            "/usr/bin/true".into(),
-            "run".into(),
-            "--contract".into(),
-            "/nonexistent/contract.json".into(),
-        ];
-        assert!(proposed_contract_path(&dangling).is_err());
-
-        // run without --contract has no contract to check - still a refusal.
-        let bare = vec!["/usr/bin/true".into(), "run".into()];
-        assert!(proposed_contract_path(&bare).is_err());
+        assert!(proposed_contract_path_at("/nonexistent/contract.json").is_err());
     }
 }

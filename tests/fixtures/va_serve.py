@@ -91,6 +91,24 @@ for line in sys.stdin:
         if MODE == "stale-resume" and params.get("resume"):
             reject(req_id, "resume_unsupported", "session/open", "stale resume")
             continue
+        if MODE == "uncertain-resume" and params.get("resume"):
+            emit(
+                {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32603,
+                        "message": "resume transport dropped",
+                        "data": {
+                            "code": "resume_uncertain",
+                            "stage": "session/open",
+                            "retryable": True,
+                            "uncertainEffect": True,
+                        },
+                    },
+                }
+            )
+            continue
         reply(
             req_id,
             {

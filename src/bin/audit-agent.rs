@@ -726,7 +726,18 @@ async fn run(request: Request) -> a4aa::Result<Value> {
                     break;
                 }
             },
-            Err(error) => last_error = Some(error),
+            Err(error) => {
+                // Only a certain, permanent refusal of the stored session may
+                // fall through to a fresh open. A transport or uncertain
+                // outcome may already have reached the agent, so the preserved
+                // conversation stays for the next run instead of being
+                // orphaned by a fresh session.
+                let definite_stale = !error.retryable && !error.uncertain_effect;
+                last_error = Some(error);
+                if !definite_stale {
+                    break;
+                }
+            }
         }
     }
     let Some(opened) = opened else {

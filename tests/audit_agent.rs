@@ -514,6 +514,25 @@ fn a_stale_resume_retries_the_same_binding_open_once() {
     assert_eq!(opens[0]["patch"], opens[1]["patch"]);
 }
 
+/// An uncertain resume open may already have reached the agent: no fresh
+/// open follows it, so the preserved conversation stays resumable and paid
+/// review progress is never discarded by a blind restart.
+#[test]
+fn an_uncertain_resume_open_never_falls_through_to_fresh() {
+    let fixture = Fixture::new("uncertain-resume");
+    std::fs::write(
+        fixture.run_dir.join("audit-session.json"),
+        json!({"session_id":"stale","session_ids":["stale"]}).to_string(),
+    )
+    .unwrap();
+    let (ok, result) = fixture.invoke();
+    assert!(!ok, "uncertain resume must refuse, not restart: {result}");
+    let opens = fixture.records("session-open.jsonl");
+    assert_eq!(opens.len(), 1, "uncertain resume must not open fresh");
+    assert_eq!(opens[0]["resume"], "stale");
+    assert!(fixture.records("session-prompt.jsonl").is_empty());
+}
+
 #[test]
 fn an_unadmitted_serving_profile_fails_closed() {
     let mut fixture = Fixture::new("complete");

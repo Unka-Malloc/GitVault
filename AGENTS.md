@@ -10,9 +10,12 @@ uncertified policy file: the rows declare arbitrary commands. `gitvault
 check` is the exception by design — it audits a proposed policy so evidence
 exists before its signature, marking the run uncertified — but the proposal
 still cannot run arbitrary code: only rows invoking the trusted
-`gitvault-review` runner (`baseline`, or `run --contract` on a contract
-installed under the profiles root) execute, and any other row refuses the
-run. An empty policy cannot bless a publication boundary at all.
+`gitvault-review` runner execute — `baseline` or `run --contract` naming a
+contract installed under the profiles root, with `--repo` bound to the
+repository under review, no extra arguments, and no `GITVAULT_*` environment
+overrides. At a publication boundary the proposal must also keep every
+installed blocking reviewer contract covering the event. An empty policy
+cannot bless a publication boundary at all.
 
 ## Trust boundary
 
