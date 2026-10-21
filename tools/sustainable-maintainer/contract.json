@@ -8,7 +8,7 @@
     "label": "deterministic",
     "surfaces": true,
     "rules": [
-      {"id": "maintainer-hygiene", "title": "Conflict markers, merge artifacts and OS junk", "kind": "builtin", "builtin": "maintainer-hygiene"}
+      {"id": "maintainer-hygiene", "title": "Conflict markers, merge artifacts and OS junk", "kind": "builtin", "builtin": "workspace-hygiene"}
     ]
   },
   "on": ["pre-push", "pr"],

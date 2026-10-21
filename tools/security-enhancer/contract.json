@@ -9,7 +9,7 @@
     "surfaces": true,
     "refusal": "The static security checklist refused this operation; nothing was published",
     "rules": [
-      {"id": "security-static-checklist", "title": "The static security checklist over the outgoing revision", "kind": "builtin", "builtin": "security-static-checklist"}
+      {"id": "security-static-checklist", "title": "The static security checklist over the outgoing revision", "kind": "builtin", "builtin": "static-checklist"}
     ]
   },
   "on": ["pre-push", "pr", "release"],

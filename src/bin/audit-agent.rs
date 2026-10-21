@@ -786,49 +786,13 @@ async fn run(request: Request) -> a4aa::Result<Value> {
                 .filter(|value| !value.is_null())
                 .and_then(|value| serde_json::from_value::<TokenUsage>(value).ok())
                 .map(|usage| usage_value(&usage))
-                .or_else(|| captured_usage.lock().unwrap().clone())
-                .or_else(|| extract_pi_session_usage(&request.session_file));
+                .or_else(|| captured_usage.lock().unwrap().clone());
             Ok(json!({"completed": stop_reason == "end_turn",
                       "stop_reason": stop_reason, "usage": usage,
                       "profile": identity, "served": opened.served}))
         }
         Err(error) => Err(call_error("session/prompt", error)),
     }
-}
-
-fn extract_pi_session_usage(session_file: &Path) -> Option<Value> {
-    let raw = std::fs::read_to_string(session_file).ok()?;
-    let json: Value = serde_json::from_str(&raw).ok()?;
-    let session_id = json["id"].as_str()?;
-    let home = std::env::var("HOME").ok()?;
-    let sessions_dir = PathBuf::from(home).join(".pi/agent/sessions");
-    for entry in std::fs::read_dir(sessions_dir).ok()?.flatten() {
-        if entry.file_type().ok()?.is_dir() {
-            for file in std::fs::read_dir(entry.path()).ok()?.flatten() {
-                let name = file.file_name().to_string_lossy().to_string();
-                if name.contains(session_id)
-                    && name.ends_with(".jsonl")
-                    && let Ok(content) = std::fs::read_to_string(file.path())
-                {
-                    for line in content.lines().rev() {
-                        if let Ok(msg) = serde_json::from_str::<Value>(line)
-                            && let Some(u) = msg.pointer("/message/usage")
-                            && let (Some(inp), Some(out)) =
-                                (u["input"].as_u64(), u["output"].as_u64())
-                        {
-                            return Some(json!({
-                                "input_tokens": inp,
-                                "output_tokens": out,
-                                "cache_read_tokens": u["cacheRead"].as_u64().unwrap_or(0),
-                                "cache_write_tokens": u["cacheWrite"].as_u64().unwrap_or(0),
-                            }));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
 }
 
 fn failure(code: &'static str, stage: &'static str) -> a4aa::AdapterError {

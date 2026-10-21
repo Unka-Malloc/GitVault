@@ -689,7 +689,7 @@ fn deps_audit(repo: &str, target: &Target, _opts: &Opts) -> Result<Vec<Hit>, Str
 }
 
 // ---------------------------------------------------------------------------
-// maintainer-hygiene (Sustainable Maintainer)
+// workspace-hygiene
 // ---------------------------------------------------------------------------
 
 static MERGE_ARTIFACT: LazyLock<Regex> = LazyLock::new(|| {
@@ -863,7 +863,7 @@ fn deleted_paths(repo: &str, target: &Target) -> Result<std::collections::HashSe
         .collect())
 }
 
-fn maintainer_audit(
+fn hygiene_audit(
     repo: &str,
     target: &Target,
     with_surfaces: bool,
@@ -932,7 +932,7 @@ fn maintainer_audit(
 }
 
 // ---------------------------------------------------------------------------
-// security-static-checklist (Security Enhancer)
+// static-checklist
 // ---------------------------------------------------------------------------
 
 const MAX_SCAN_BYTES: usize = 1024 * 1024;
@@ -1410,7 +1410,7 @@ fn lockfiles_for(manifest: &str) -> &'static [&'static str] {
     }
 }
 
-fn security_audit(
+fn checklist_audit(
     repo: &str,
     target: &Target,
     with_surfaces: bool,
@@ -1811,8 +1811,8 @@ pub fn audit(
                         hits.extend(found);
                     }
                 }
-                "maintainer-hygiene" => {
-                    let (found, found_surfaces) = maintainer_audit(repo, target, with_surfaces)?;
+                "workspace-hygiene" => {
+                    let (found, found_surfaces) = hygiene_audit(repo, target, with_surfaces)?;
                     surfaces.get_or_insert_with(Vec::new).extend(found_surfaces);
                     if !found.is_empty() {
                         status = "refused".into();
@@ -1822,9 +1822,9 @@ pub fn audit(
                         hits.extend(found);
                     }
                 }
-                "security-static-checklist" => {
+                "static-checklist" => {
                     let (regressions, found_surfaces) =
-                        security_audit(repo, target, with_surfaces)?;
+                        checklist_audit(repo, target, with_surfaces)?;
                     surfaces.get_or_insert_with(Vec::new).extend(found_surfaces);
                     if !regressions.is_empty() {
                         status = "regression".into();
@@ -1879,8 +1879,8 @@ pub fn audit_all(
 #[cfg(test)]
 mod tests {
     use super::{
-        Hit, clean_audit, dep_closure, dep_key, deps_map, in_scope, is_instruction_channel,
-        is_interface_surface, marker_lines, name_pattern, security_audit,
+        Hit, checklist_audit, clean_audit, dep_closure, dep_key, deps_map, in_scope,
+        is_instruction_channel, is_interface_surface, marker_lines, name_pattern,
     };
     use base64::Engine as _;
 
@@ -1958,6 +1958,8 @@ mod tests {
             "user.email=t@t",
             "-c",
             "user.name=t",
+            "-c",
+            "core.hooksPath=/dev/null",
             "commit",
             "-qm",
             "x",
@@ -2270,7 +2272,7 @@ mod tests {
 
         let target = range_target(base, head);
         let (regressions, surfaces) =
-            security_audit(root.to_str().unwrap(), &target, true).unwrap();
+            checklist_audit(root.to_str().unwrap(), &target, true).unwrap();
         let seen = |hits: &[Hit]| {
             hits.iter()
                 .map(|h| format!("{}:{}", h.path, h.rule))
