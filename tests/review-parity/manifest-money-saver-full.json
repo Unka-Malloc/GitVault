@@ -347,12 +347,34 @@
                 "reason"
               ],
               "additionalProperties": false
+            },
+            "continuity": {
+              "type": "object",
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "reviewed",
+                    "not-applicable",
+                    "unknown"
+                  ]
+                },
+                "reason": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "status",
+                "reason"
+              ],
+              "additionalProperties": false
             }
           },
           "required": [
             "sql",
             "storage",
             "network",
+            "continuity",
             "compute",
             "cloudflare",
             "vps"

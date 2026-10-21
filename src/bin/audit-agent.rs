@@ -529,6 +529,30 @@ fn call_error(stage: &'static str, failure: CallFailure) -> a4aa::AdapterError {
     }
 }
 
+/// Whether a resume refusal proves the stored session is gone: the adapter's
+/// own capability refusal, or a remote code that names the session as stale,
+/// unsupported or unknown. Any other permanent error keeps the preserved
+/// conversation for the next run rather than restarting paid work.
+fn is_stale_resume(error: &a4aa::AdapterError) -> bool {
+    if error.retryable || error.uncertain_effect {
+        return false;
+    }
+    if error.code == "agent_session_resume_unsupported" {
+        return true;
+    }
+    let remote = error
+        .detail
+        .as_deref()
+        .and_then(|detail| serde_json::from_str::<Value>(detail).ok())
+        .and_then(|detail| detail["remoteCode"].as_str().map(str::to_string))
+        .unwrap_or_default();
+    let remote = remote.as_str();
+    remote.contains("resume_unsupported")
+        || remote.contains("session_not_found")
+        || remote.contains("unknown_session")
+        || remote.contains("stale")
+}
+
 struct Opened {
     sidecar_id: String,
     native_id: String,
@@ -748,12 +772,12 @@ async fn run(request: Request) -> a4aa::Result<Value> {
                 }
             },
             Err(error) => {
-                // Only a certain, permanent refusal of the stored session may
-                // fall through to a fresh open. A transport or uncertain
-                // outcome may already have reached the agent, so the preserved
-                // conversation stays for the next run instead of being
-                // orphaned by a fresh session.
-                let definite_stale = !error.retryable && !error.uncertain_effect;
+                // Only an explicit stale/unsupported-session refusal may fall
+                // through to a fresh open: a transport or uncertain outcome
+                // may already have reached the agent, and a permanent error
+                // that is not about the session must not orphan the preserved
+                // conversation into a paid restart either.
+                let definite_stale = is_stale_resume(&error);
                 last_error = Some(error);
                 if !definite_stale {
                     break;

@@ -27,6 +27,10 @@
         "vps": {
           "status": "reviewed",
           "reason": "looked"
+        },
+        "continuity": {
+          "status": "reviewed",
+          "reason": "looked"
         }
       },
       "findings": [
@@ -105,6 +109,10 @@
         "vps": {
           "status": "reviewed",
           "reason": "looked"
+        },
+        "continuity": {
+          "status": "reviewed",
+          "reason": "looked"
         }
       },
       "findings": [],
@@ -167,6 +175,10 @@
           "reason": "looked"
         },
         "vps": {
+          "status": "reviewed",
+          "reason": "looked"
+        },
+        "continuity": {
           "status": "reviewed",
           "reason": "looked"
         }
@@ -246,6 +258,10 @@
         "vps": {
           "status": "reviewed",
           "reason": "looked"
+        },
+        "continuity": {
+          "status": "reviewed",
+          "reason": "looked"
         }
       },
       "findings": [
@@ -315,6 +331,10 @@
           "reason": "looked"
         },
         "vps": {
+          "status": "reviewed",
+          "reason": "looked"
+        },
+        "continuity": {
           "status": "reviewed",
           "reason": "looked"
         }
@@ -392,6 +412,10 @@
         "vps": {
           "status": "reviewed",
           "reason": "looked"
+        },
+        "continuity": {
+          "status": "reviewed",
+          "reason": "looked"
         }
       },
       "findings": [],
@@ -453,6 +477,10 @@
           "reason": "looked"
         },
         "vps": {
+          "status": "reviewed",
+          "reason": "looked"
+        },
+        "continuity": {
           "status": "reviewed",
           "reason": "looked"
         }
@@ -532,6 +560,10 @@
         "vps": {
           "status": "reviewed",
           "reason": "looked"
+        },
+        "continuity": {
+          "status": "reviewed",
+          "reason": "looked"
         }
       },
       "findings": [
@@ -607,6 +639,10 @@
           "reason": "looked"
         },
         "vps": {
+          "status": "reviewed",
+          "reason": "looked"
+        },
+        "continuity": {
           "status": "reviewed",
           "reason": "looked"
         }
@@ -685,6 +721,10 @@
           "reason": "looked"
         },
         "vps": {
+          "status": "reviewed",
+          "reason": "looked"
+        },
+        "continuity": {
           "status": "reviewed",
           "reason": "looked"
         }

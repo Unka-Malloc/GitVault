@@ -553,6 +553,29 @@ fn a_sealed_report_survives_a_lost_prompt_response() {
     assert_eq!(fixture.records("session-prompt.jsonl").len(), 1);
 }
 
+/// A permanent resume refusal that is not about the session being gone -
+/// authorization, quota, anything else - must not fall through to a fresh
+/// open: the preserved conversation stays resumable instead of restarting
+/// paid work.
+#[test]
+fn a_permanent_non_stale_resume_error_never_falls_through_to_fresh() {
+    let fixture = Fixture::new("permanent-resume");
+    std::fs::write(
+        fixture.run_dir.join("audit-session.json"),
+        json!({"session_id":"kept","session_ids":["kept"]}).to_string(),
+    )
+    .unwrap();
+    let (ok, result) = fixture.invoke();
+    assert!(
+        !ok,
+        "permanent non-stale resume must refuse, not restart: {result}"
+    );
+    let opens = fixture.records("session-open.jsonl");
+    assert_eq!(opens.len(), 1, "non-stale refusal must not open fresh");
+    assert_eq!(opens[0]["resume"], "kept");
+    assert!(fixture.records("session-prompt.jsonl").is_empty());
+}
+
 #[test]
 fn an_unadmitted_serving_profile_fails_closed() {
     let mut fixture = Fixture::new("complete");

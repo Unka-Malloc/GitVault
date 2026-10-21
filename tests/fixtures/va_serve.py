@@ -91,6 +91,24 @@ for line in sys.stdin:
         if MODE == "stale-resume" and params.get("resume"):
             reject(req_id, "resume_unsupported", "session/open", "stale resume")
             continue
+        if MODE == "permanent-resume" and params.get("resume"):
+            emit(
+                {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "error": {
+                        "code": -32603,
+                        "message": "authorization failed for resume",
+                        "data": {
+                            "code": "auth_denied",
+                            "stage": "session/open",
+                            "retryable": False,
+                            "uncertainEffect": False,
+                        },
+                    },
+                }
+            )
+            continue
         if MODE == "uncertain-resume" and params.get("resume"):
             emit(
                 {

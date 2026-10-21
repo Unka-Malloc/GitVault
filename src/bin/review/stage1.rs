@@ -128,25 +128,35 @@ pub(crate) fn shared_evidence_path() -> Option<PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
-fn evidence_document(path: &Path) -> serde_json::Map<String, Value> {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default()
+/// One cache entry per file under `<evidence>.d/`: concurrent checkers in the
+/// same phase share the document, and a read-modify-write on a single JSON
+/// object would lose keys. Entries write through their own temp name then
+/// rename, so a cache miss is the only failure mode - never a torn document.
+fn evidence_entry(path: &Path, key: &str) -> PathBuf {
+    path.with_extension("d")
+        .join(format!("{}.json", crate::seal::sha256_hex(key)))
 }
 
 pub(crate) fn evidence_get(path: &Path, key: &str) -> Option<Value> {
-    evidence_document(path).remove(key)
+    std::fs::read_to_string(evidence_entry(path, key))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
 }
 
 pub(crate) fn evidence_store(path: &Path, key: &str, value: Value) {
-    let mut document = evidence_document(path);
-    document.insert(key.to_string(), value);
-    let body = serde_json::to_string(&Value::Object(document)).unwrap_or_default();
-    let tmp = path.with_extension("tmp");
+    let dir = path.with_extension("d");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let entry = evidence_entry(path, key);
+    let tmp = dir.join(format!(
+        ".tmp-{}-{}",
+        std::process::id(),
+        crate::seal::sha256_hex(key)
+    ));
+    let body = serde_json::to_string(&value).unwrap_or_default();
     if std::fs::write(&tmp, body).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
+        let _ = std::fs::rename(&tmp, &entry);
     }
 }
 
@@ -2446,5 +2456,43 @@ mod tests {
         }
         assert!(!is_interface_surface("src/api.rs"));
         assert!(!is_interface_surface("docs/notes.json"));
+    }
+
+    /// Checkers in one phase write the shared evidence concurrently: each key
+    /// lives in its own entry file, so interleaved writers lose nothing.
+    #[test]
+    fn concurrent_evidence_writes_lose_no_keys() {
+        use super::{evidence_get, evidence_store};
+        let path = std::env::temp_dir().join(format!(
+            "gv-ev-{}-{:04x}",
+            std::process::id(),
+            rand::random::<u16>()
+        ));
+        let mut handles = Vec::new();
+        for writer in 0..8u32 {
+            let path = path.clone();
+            handles.push(std::thread::spawn(move || {
+                for entry in 0..10u32 {
+                    evidence_store(
+                        &path,
+                        &format!("key-{writer}-{entry}"),
+                        serde_json::json!({"writer": writer}),
+                    );
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        for writer in 0..8u32 {
+            for entry in 0..10u32 {
+                let value = evidence_get(&path, &format!("key-{writer}-{entry}"));
+                assert_eq!(
+                    value.as_ref().and_then(|v| v["writer"].as_u64()),
+                    Some(writer as u64)
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(path.with_extension("d"));
     }
 }

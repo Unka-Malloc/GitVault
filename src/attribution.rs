@@ -595,23 +595,22 @@ fn scrub_gate(ctx: &Context) -> Option<CheckerOutcome> {
         return None;
     }
 
-    let shown = removed.len().min(3);
-    let mut detail = removed[..shown]
-        .iter()
-        .map(|line| {
-            let squashed = line.split_whitespace().collect::<Vec<_>>().join(" ");
-            if squashed.chars().count() <= 72 {
-                squashed
-            } else {
-                let truncated: String = squashed.chars().take(69).collect();
-                format!("{truncated}...")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    if removed.len() > shown {
-        detail.push_str(&format!("; … and {} more", removed.len() - shown));
+    // Report categories and counts only: a matched line can carry a personal
+    // identifier, a credential-bearing URL or control sequences, and this
+    // outcome is persisted into run records - never echo the matched text.
+    let mut kinds: Vec<&'static str> = Vec::new();
+    for line in &removed {
+        if let Some((_, kind)) = attribution_match(line.as_str())
+            && !kinds.contains(&kind)
+        {
+            kinds.push(kind);
+        }
     }
+    let detail = if kinds.is_empty() {
+        "unclassified attribution".to_string()
+    } else {
+        kinds.join(", ")
+    };
 
     let replay = ctx.commit_message_source.as_deref() == Some("commit")
         || replay_in_progress(&ctx.repo_root);
@@ -821,6 +820,12 @@ mod tests {
         }
         assert_eq!(outcome.name, "attribution-message");
         assert!(outcome.stdout.contains("resubmit"));
+        // The refusal reports the matched categories, never the matched
+        // text: a banner line can carry identifiers the log must not keep.
+        assert!(outcome.stdout.contains("co-authored-by trailer"));
+        assert!(outcome.stdout.contains("generated-with badge"));
+        assert!(!outcome.stdout.contains("devin-ai-integration"));
+        assert!(!outcome.stdout.contains("Devin AI <"));
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             "Fix the thing\n\nA proper body line.\n"

@@ -920,19 +920,33 @@ fn proposed_contract_path_at(contract: &str) -> Result<PathBuf, String> {
 
 /// Installed reviewer contracts that cover `event` at blocking severity — the
 /// operator-controlled set a proposed boundary policy must still audit with.
-fn installed_boundary_contracts(event: config::Event) -> Vec<(PathBuf, String)> {
+/// Enumeration, read and parse failures fail closed: an unreadable installed
+/// contract cannot silently shrink the set the proposal is checked against.
+fn installed_boundary_contracts(event: config::Event) -> Result<Vec<(PathBuf, String)>, String> {
     let root = std::fs::canonicalize(profiles_root()).unwrap_or_else(|_| profiles_root());
     let mut contracts = Vec::new();
-    for pattern_dir in std::fs::read_dir(&root).into_iter().flatten().flatten() {
+    let pattern_dirs = std::fs::read_dir(&root)
+        .map_err(|e| format!("cannot enumerate {}: {e}", root.display()))?;
+    for pattern_dir in pattern_dirs {
+        let pattern_dir =
+            pattern_dir.map_err(|e| format!("cannot enumerate {}: {e}", root.display()))?;
         let plugins = pattern_dir.path().join("plugins");
-        for entry in std::fs::read_dir(&plugins).into_iter().flatten().flatten() {
+        let entries = match std::fs::read_dir(&plugins) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("cannot enumerate {}: {e}", plugins.display())),
+        };
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| format!("cannot enumerate {}: {e}", plugins.display()))?;
             let path = entry.path().join("contract.json");
-            let Ok(raw) = std::fs::read_to_string(&path) else {
+            if !path.is_file() {
                 continue;
-            };
-            let Ok(doc) = serde_json::from_str::<serde_json::Value>(&raw) else {
-                continue;
-            };
+            }
+            let raw =
+                std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let doc = serde_json::from_str::<serde_json::Value>(&raw)
+                .map_err(|e| format!("{}: unreadable contract: {e}", path.display()))?;
             let covers = doc["on"]
                 .as_array()
                 .map(|on| on.iter().any(|e| e.as_str() == Some(event.name())))
@@ -944,7 +958,7 @@ fn installed_boundary_contracts(event: config::Event) -> Vec<(PathBuf, String)> 
             }
         }
     }
-    contracts
+    Ok(contracts)
 }
 
 fn audit_gate(
@@ -994,6 +1008,17 @@ fn audit_gate(
              the signature stays last - certify only after these audits pass: \
              gitvault config sign"
         );
+        // `--only` narrows the run to one row, but a boundary proposal's
+        // blessing needs evidence from the whole required set - a partial
+        // audit that passes must never stand in for it.
+        if boundary && only.is_some() {
+            anyhow::bail!(
+                "refusing to audit the proposed audit policy partially: --only \
+                 runs a single checker, but a {} proposal must produce \
+                 evidence from every applicable reviewer",
+                event.name()
+            );
+        }
         // Even as a proposal the file stays inert where it counts: only rows
         // that invoke the trusted audit runner beside this binary may run,
         // bound to this repository and this installed contract set. The
@@ -1011,11 +1036,29 @@ fn audit_gate(
             }
         }
         // A boundary proposal cannot downgrade the audit it must produce:
-        // every installed blocking contract for this event still runs, at
-        // blocking severity, or the evidence under-certifies the policy an
-        // operator would then sign.
+        // the deterministic baseline sweep and every installed blocking
+        // contract for this event still run, at blocking severity, or the
+        // evidence under-certifies the policy an operator would then sign.
         if boundary && !selected.is_empty() {
-            for (contract, name) in installed_boundary_contracts(event) {
+            let baseline_kept = covered.iter().any(|(checker, found)| {
+                found.is_none() && checker.severity == config::Severity::Blocking
+            });
+            if !baseline_kept {
+                anyhow::bail!(
+                    "refusing to run the proposed audit policy: the \
+                     publication-baseline sweep is missing or downgraded for \
+                     {} - a boundary proposal must keep the deterministic \
+                     baseline at blocking severity",
+                    event.name()
+                );
+            }
+            let installed = installed_boundary_contracts(event).map_err(|why| {
+                anyhow::anyhow!(
+                    "refusing to run the proposed audit policy: the installed \
+                     blocking-reviewer set cannot be established: {why}"
+                )
+            })?;
+            for (contract, name) in installed {
                 let hit = covered.iter().any(|(checker, found)| {
                     checker.severity == config::Severity::Blocking
                         && found.as_ref() == Some(&contract)
@@ -3222,6 +3265,120 @@ mod tests {
         poisoned.env.insert("GITVAULT_PUSH_REFS".into(), "x".into());
         assert!(admissible_proposed_row(&poisoned, &repo).is_err());
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// A boundary proposal audited under `--only` produces evidence from a
+    /// single row, yet the completeness check sees the configured set - the
+    /// partial pass could then be signed as if every reviewer ran.
+    #[test]
+    fn a_boundary_proposal_refuses_a_partial_audit() {
+        let cfg = Config::default();
+        let mut policy = Policy::default();
+        policy.checkers.push(crate::config::Checker {
+            name: "anything".into(),
+            on: vec!["pre-push".into()],
+            kind: crate::config::Kind::Exec,
+            severity: crate::config::Severity::Blocking,
+            timeout_secs: 0,
+            phase: 0,
+            command: vec!["/bin/true".into()],
+            env: Default::default(),
+            repos: vec![],
+        });
+        let err = audit_gate(
+            &cfg,
+            &SigState::Inactive,
+            &policy,
+            &SigState::Invalid("checkers.toml is unsigned".into()),
+            &ctx("pre-push"),
+            "check",
+            Some("anything"),
+            true,
+        )
+        .expect_err("--only must refuse a boundary proposal");
+        assert!(err.to_string().contains("partially"), "{err}");
+        // A signed policy keeps `--only` as the operator's debug tool; the
+        // refusal belongs to the proposal path alone.
+        let outcome = audit_gate(
+            &cfg,
+            &SigState::Inactive,
+            &policy,
+            &SigState::Valid,
+            &ctx("pre-push"),
+            "check",
+            Some("anything"),
+            true,
+        );
+        assert!(
+            !outcome
+                .err()
+                .map(|err| err.to_string())
+                .unwrap_or_default()
+                .contains("partially"),
+            "the partial-audit refusal must not reach a certified policy"
+        );
+    }
+
+    /// The deterministic baseline is part of the audit a boundary policy must
+    /// produce: a proposal whose semantic reviewers all pass while the sweep
+    /// is absent would certify away the script-layer gate.
+    #[test]
+    fn a_boundary_proposal_keeps_the_baseline_sweep() {
+        let runner = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("gitvault-review");
+        let contract = std::fs::read_dir(profiles_root())
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .flat_map(|dir| {
+                std::fs::read_dir(dir.path().join("plugins"))
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            })
+            .map(|entry| entry.path().join("contract.json"))
+            .find(|path| path.is_file());
+        let (Some(contract), true) = (contract, runner.exists()) else {
+            return;
+        };
+        let cfg = Config::default();
+        let mut policy = Policy::default();
+        policy.checkers.push(crate::config::Checker {
+            name: "reviewer".into(),
+            on: vec!["pre-push".into()],
+            kind: crate::config::Kind::Exec,
+            severity: crate::config::Severity::Blocking,
+            timeout_secs: 0,
+            phase: 0,
+            command: vec![
+                runner.display().to_string(),
+                "run".into(),
+                "--contract".into(),
+                contract.display().to_string(),
+                "--repo".into(),
+                "{repo}".into(),
+            ],
+            env: Default::default(),
+            repos: vec![],
+        });
+        let err = audit_gate(
+            &cfg,
+            &SigState::Inactive,
+            &policy,
+            &SigState::Invalid("checkers.toml is unsigned".into()),
+            &ctx("pre-push"),
+            "check",
+            None,
+            true,
+        )
+        .expect_err("a proposal with no baseline row must refuse");
+        assert!(err.to_string().contains("baseline"), "{err}");
     }
 
     #[test]

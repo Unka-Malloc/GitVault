@@ -312,6 +312,7 @@ pub fn run_all(
     // check must not feed this one.
     let evidence = stage1_evidence_path();
     let _ = std::fs::remove_file(&evidence);
+    let _ = std::fs::remove_dir_all(evidence.with_extension("d"));
     let mut report = Report::default();
 
     if only.is_none()
