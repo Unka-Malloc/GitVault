@@ -6,7 +6,7 @@
 use serde_json::Value;
 use std::path::Path;
 
-fn sha256_hex(text: &str) -> String {
+pub(crate) fn sha256_hex(text: &str) -> String {
     use sha2::Digest as _;
     sha2::Sha256::digest(text.as_bytes())
         .iter()

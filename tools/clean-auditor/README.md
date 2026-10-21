@@ -11,8 +11,8 @@ request or a merge request is about to publish, in two stages:
    revision: withheld names over the whole revision, and credential shapes by
    format. One `git grep` answers both, nothing leaves the machine, nothing is
    written, and a refusal here costs no tokens.
-2. **Semantic, isolated OpenCode review** — only if stage one passes: a fresh,
-   durable OpenCode session over the same immutable range, on the provider/model
+2. **Semantic, isolated agent review** — only if stage one passes: a fresh,
+   durable audit session over the same immutable range, on the provider/model
    the synced `profile.json` declares, judging privacy / business_secret /
    operations_data / machine_path /
    personal_info / credentials, plus the two standing items below.

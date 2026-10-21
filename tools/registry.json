@@ -113,7 +113,7 @@
       "lane": "rpc",
       "command": {
         "program": {"resolve": ["pi", "{home}/.local/bin/pi", "{home}/.pi/agent/bin/pi"]},
-        "args": ["--mode", "rpc", "--approve"]
+        "args": ["--mode", "rpc", "--approve", "--tools", "read,mcp__*"]
       },
       "sessionOpen": {"method": "get_state", "params": {}},
       "sessionResume": {"method": "switch_session", "params": {"sessionPath": "{sessionId}"}},

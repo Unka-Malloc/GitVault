@@ -1,6 +1,7 @@
 # Money Saver
 
-Money Saver is a blocking GitVault checker whose model runtime is OpenCode. The
+Money Saver is a blocking GitVault checker whose model runtime is the agent the
+synced profile declares. The
 provider, model and thinking effort come from the `runtime` block of the
 synced `profile.json` — a published profile in the registry is the
 configuration mapping, hash-checked like the policy, not a local guess.
@@ -10,12 +11,12 @@ then run `gitvault-review install --source tools/money-saver`. Installation copi
 tools outside repositories to the checker's private profile directory and
 registers the checker, and writes the checker's declared AwP registry
 document. Install `gitvault-audit-agent` on PATH first; it resolves that
-document through AwP and opens an ACP session whose only MCP server is the
-stateful `gitvault-review serve` process. The review engine owns evidence,
-state and receipts; OpenCode owns the durable conversation. The base
-instructions are the synced policy plus the review date. The isolated
-OpenCode home links the operator's existing sign-in without copying credential
-values. GitVault retains its existing identity routing.
+document through AwP and opens a session via `va serve` whose only MCP server
+is the stateful `gitvault-review serve` process. The review engine owns
+evidence, state and receipts; the declared agent owns the durable
+conversation. The base instructions are the synced policy plus the review
+date. The isolated agent home links the operator's existing sign-in without
+copying credential values. GitVault retains its existing identity routing.
 
 The maintained shared skill is installed at `$HOME/.agents/skills/money-saver`.
 Existing local Agent skill directories link to this single installation. The
@@ -44,7 +45,7 @@ the same checker. No server-side protection is installed.
 The Agent has exactly three tools: immutable Git source context, catalogued official
 public documents, and structured verdict submission. It has no shell, write, deployment,
 production-query or delegation tools. Repository hooks/instructions are not loaded
-by the OpenCode session. Source retrieval excludes credential containers/runtime data files and
+by the audit session. Source retrieval excludes credential containers/runtime data files and
 redacts recognizable credentials and local identifiers; it is not a replacement for
 a dedicated privacy audit. Do not stage private operational records as source code.
 
@@ -60,7 +61,7 @@ once per review, and page through the same response. Update this installed catal
 when adding a provider or when official URLs change. Missing material evidence means
 incomplete. Pricing is retrieved at review time rather than embedded as fixed rates.
 
-Sanitized reports, draft results and the OpenCode session are retained in the
+Sanitized reports, draft results and the agent session are retained in the
 profile's private run directory; review scope scratch files are removed.
 Reports include review
 usage so the review's own cost can be assessed. No report is committed to the project.
@@ -76,7 +77,7 @@ live acceptance operation, not an implementation test.
 
 `gitvault-review full-audit --contract <contract.json> --manifest <manifest.json>
 --request <original-request.json> --output <new-private-directory>` invokes the
-same OpenCode reviewer on selected
+same reviewer on selected
 current source, including nonignored unstaged/untracked changes. The manifest maps
 project labels to local source roots under `projects`. Optional `reuse` maps a
 second selected project to its primary copy; byte-identical original source files share
@@ -96,7 +97,7 @@ bills. A full-audit report does not approve a later staged commit.
 Full audits write compact tool progress and final status without a task deadline.
 They do not deploy, mutate services, query production or automatically repeat a
 failed audit. Resume a failed full audit with `gitvault-review full-audit --resume <run-directory>`:
-the same snapshot, OpenCode session, read evidence, official document
+the same snapshot, agent session, read evidence, official document
 cache and latest draft are retained. A successful report cannot be re-audited by
 this command. Normal publication review continues to use only the operation's
 resolved snapshot. Report schemas specify coverage/status fields, project keys
@@ -114,7 +115,7 @@ repeated guessing.
 | Findings contract | Require concrete location, impact, before/after units, remedy, validation and retrieved sources. |
 | Coverage | A pass requires every snapshot path's diff and all six cost domains accounted for, with no blocker or unknown applicable coverage. |
 | Single submission | Accept one verdict per run; no cached prior approvals. |
-| OpenCode completion | Require successful engine exit and a structured verdict; provider errors/interruption refuse the publication. |
+| Agent completion | Require successful engine exit and a structured verdict; provider errors/interruption refuse the publication. |
 | Ref stability | A pushed ref that moved during review refuses the publication. |
 | Report status | A model verdict is pending until the engine and snapshot checks pass; interrupted runs remain refused. |
 | Full-audit originals and scope | Require original request read, every selected project accounted for and real inspected source locations; no unstated coverage pass. |

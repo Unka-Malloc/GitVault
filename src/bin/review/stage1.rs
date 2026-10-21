@@ -16,7 +16,7 @@ use crate::evidence::{EMPTY_TREE, git, git_ok, suffix_of};
 use regex::Regex;
 use regex::bytes::Regex as BytesRegex;
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
 
@@ -50,6 +50,32 @@ impl Hit {
             hit["remedy"] = json!(remedy);
         }
         hit
+    }
+}
+
+impl Target {
+    pub(crate) fn to_json(&self) -> Value {
+        json!({
+            "kind": self.kind,
+            "label": self.label,
+            "base": self.base,
+            "head": self.head,
+            "ref": self.ref_,
+            "scope": self.scope,
+            "fallback": self.fallback,
+        })
+    }
+
+    pub(crate) fn from_json(value: &Value) -> Option<Self> {
+        Some(Self {
+            kind: value["kind"].as_str()?.to_string(),
+            label: value["label"].as_str()?.to_string(),
+            base: value["base"].as_str().map(str::to_string),
+            head: value["head"].as_str()?.to_string(),
+            ref_: value["ref"].as_str().map(str::to_string),
+            scope: value["scope"].as_str()?.to_string(),
+            fallback: value["fallback"].as_str()?.to_string(),
+        })
     }
 }
 
@@ -88,6 +114,40 @@ impl Summary {
 /// not.
 pub struct Opts {
     pub withheld_path: Option<PathBuf>,
+}
+
+// --------------------------------------------------------- shared evidence
+
+/// The per-run evidence file the orchestrating `check` hands every spawned
+/// checker. Deterministic preflight results are recorded once and shared, so
+/// a successful baseline is not re-bought by every reviewer that follows -
+/// and a standalone run, which sees no file, resolves everything itself.
+pub(crate) fn shared_evidence_path() -> Option<PathBuf> {
+    std::env::var_os("GITVAULT_STAGE1_EVIDENCE")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
+fn evidence_document(path: &Path) -> serde_json::Map<String, Value> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default()
+}
+
+pub(crate) fn evidence_get(path: &Path, key: &str) -> Option<Value> {
+    evidence_document(path).remove(key)
+}
+
+pub(crate) fn evidence_store(path: &Path, key: &str, value: Value) {
+    let mut document = evidence_document(path);
+    document.insert(key.to_string(), value);
+    let body = serde_json::to_string(&Value::Object(document)).unwrap_or_default();
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
 }
 
 /// The paths an operation carries - one enumeration so the deterministic
@@ -306,8 +366,65 @@ fn default_withheld_path() -> PathBuf {
 ///   commit of the same push is absent from the head tree but ships in the
 ///   published history forever. Without this second scan the deterministic
 ///   stage could not see it at all.
+/// The withheld/credential sweep, memoized across sibling checkers: when the
+/// orchestrating run provided a shared evidence file, an identical completed
+/// scan is reused instead of replayed. The key binds the scan inputs - the
+/// target's immutable head/base plus the resolved withheld list - so
+/// different content can never reuse a verdict. Cache failures are silent:
+/// they cost a rescan, never a wrong verdict.
 fn clean_audit(repo: &str, target: &Target, opts: &Opts) -> Result<(String, Vec<Hit>), String> {
     let names = withheld_names(opts.withheld_path.as_ref(), &origin_slug(repo));
+    let Some(cache) = shared_evidence_path() else {
+        return clean_audit_scan(repo, target, &names);
+    };
+    let key = {
+        let mut parts = format!(
+            "clean-audit\u{0}{}\u{0}{}\u{0}",
+            target.base.as_deref().unwrap_or(""),
+            target.head
+        );
+        for name in &names {
+            parts.push_str(name);
+            parts.push('\u{0}');
+        }
+        format!("scan/{}", crate::seal::sha256_hex(&parts))
+    };
+    if let Some(cached) = evidence_get(&cache, &key) {
+        let why = cached["why"].as_str().unwrap_or_default().to_string();
+        let hits: Vec<Hit> = cached["hits"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| {
+                        Some(Hit {
+                            path: row["path"].as_str()?.to_string(),
+                            line: row["line"].as_u64()?,
+                            rule: row["rule"].as_str()?.to_string(),
+                            remedy: None,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        return Ok((why, hits));
+    }
+    let (why, hits) = clean_audit_scan(repo, target, &names)?;
+    evidence_store(
+        &cache,
+        &key,
+        json!({
+            "why": why,
+            "hits": hits.iter().map(Hit::to_json).collect::<Vec<_>>(),
+        }),
+    );
+    Ok((why, hits))
+}
+
+fn clean_audit_scan(
+    repo: &str,
+    target: &Target,
+    names: &[String],
+) -> Result<(String, Vec<Hit>), String> {
     let mut patterns: Vec<(&str, Regex)> = Vec::new();
     for name in names.iter().filter(|n| !n.trim().is_empty()) {
         patterns.push((

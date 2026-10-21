@@ -798,6 +798,80 @@ fn outgoing_push_stdin(repo: &git::Repo) -> String {
 /// `allow_proposed` splits the audit tool from the enforcement path: `check`
 /// audits a policy as a *proposal* - the evidence must exist before the
 /// blessing can be asked for - while hooks and publication fail closed.
+/// The directory `gitvault-review install` materializes checker contracts
+/// into. A proposed policy may only run contracts living here - the install
+/// surface is operator-controlled, so a contract inside it is not something a
+/// tampered checkers.toml could have written.
+fn profiles_root() -> PathBuf {
+    let base = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+                .join(".local")
+                .join("share")
+        });
+    base.join("gitvault").join("profiles")
+}
+
+/// Whether one row of an uncertified ("proposed") policy may execute. The
+/// signature boundary exists because checker rows are arbitrary code, so a
+/// proposal may only invoke the trusted audit runner that lives beside this
+/// binary: `baseline`, or `run --contract` on a contract installed under the
+/// profiles root. Anything else must refuse the run, not be skipped - an
+/// unsigned file sneaking in a foreign command cannot launder a partial audit.
+fn admissible_proposed_row(checker: &config::Checker) -> Result<(), String> {
+    if checker.kind != config::Kind::Exec {
+        return Err(format!(
+            "kind '{:?}' is not the plain exec a proposal may run",
+            checker.kind
+        ));
+    }
+    let declared = checker.command.first().map(String::as_str).unwrap_or("");
+    let trusted = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("gitvault-review")))
+        .ok_or_else(|| "the audit runner sibling is not installed".to_string())?;
+    let trusted = std::fs::canonicalize(&trusted).unwrap_or(trusted);
+    let declared_path = std::fs::canonicalize(declared)
+        .map_err(|_| format!("command '{declared}' does not resolve"))?;
+    if declared_path != trusted {
+        return Err(format!(
+            "command '{declared}' is not the audit runner next to this binary"
+        ));
+    }
+    match checker.command.get(1).map(String::as_str) {
+        Some("baseline") => Ok(()),
+        Some("run") => proposed_contract_path(&checker.command).map(|_| ()),
+        other => Err(format!(
+            "subcommand '{}' is not one a proposal may invoke",
+            other.unwrap_or("")
+        )),
+    }
+}
+
+/// The `--contract` a proposed `run` row may name: it must resolve to a file
+/// inside the installed profiles root, the operator-controlled surface the
+/// signer already owns.
+fn proposed_contract_path(command: &[String]) -> Result<PathBuf, String> {
+    let contract = command
+        .iter()
+        .position(|arg| arg == "--contract")
+        .and_then(|i| command.get(i + 1))
+        .ok_or_else(|| "run without --contract".to_string())?;
+    let contract_path = std::fs::canonicalize(contract)
+        .map_err(|_| format!("contract '{contract}' does not resolve"))?;
+    let root = std::fs::canonicalize(profiles_root()).unwrap_or_else(|_| profiles_root());
+    if contract_path.starts_with(&root) {
+        Ok(contract_path)
+    } else {
+        Err(format!(
+            "contract '{contract}' is outside the installed profiles root"
+        ))
+    }
+}
+
 fn audit_gate(
     cfg: &config::Config,
     cfg_sig: &configsig::SigState,
@@ -845,6 +919,19 @@ fn audit_gate(
              the signature stays last - certify only after these audits pass: \
              gitvault config sign"
         );
+        // Even as a proposal the file stays inert where it counts: only rows
+        // that invoke the trusted audit runner beside this binary may run.
+        // The commands are still audited - as content - by the runners that
+        // do execute.
+        for checker in &selected {
+            if let Err(why) = admissible_proposed_row(checker) {
+                anyhow::bail!(
+                    "refusing to run the proposed audit policy: checker '{}' \
+                     escapes the audit-runner boundary: {why}",
+                    checker.name
+                );
+            }
+        }
     }
     let report = checkers::run_all(cfg, policy, ctx, cfg_sig, policy_sig, only)?;
     report.print(&ctx.event);
@@ -854,6 +941,18 @@ fn audit_gate(
         anyhow::bail!(
             "audits complete, but the routing table they ran against is uncertified: {reason}\n  \
              certify it: gitvault config sign   (then rerun this {operation})"
+        );
+    }
+    // A publication boundary must produce audit evidence. An empty policy -
+    // signed or not - runs only the built-in gates and then vacuously
+    // passes, which is precisely the "no audit happened" state a boundary
+    // exists to prevent. Signature problems still refuse first; an empty
+    // policy adds its own refusal here, not a blessing.
+    if boundary && selected.is_empty() {
+        anyhow::bail!(
+            "no checkers are registered for {} - a publication boundary needs \
+             audit evidence, not a vacuous pass",
+            event.name()
         );
     }
     Ok(report)
@@ -2513,8 +2612,9 @@ fn cmd_signing_key(
 #[cfg(test)]
 mod tests {
     use super::{
-        audit_gate, drain_pending_attestations, outgoing_push_stdin, pending_attested,
-        publication_surface, read_pending, record_pending_attestation,
+        admissible_proposed_row, audit_gate, drain_pending_attestations, outgoing_push_stdin,
+        pending_attested, proposed_contract_path, publication_surface, read_pending,
+        record_pending_attestation,
     };
     use crate::checkers::Context;
     use crate::config::{Config, Policy};
@@ -2612,24 +2712,39 @@ mod tests {
 
     /// `check` is the audit-before-blessing tool: a proposed policy change
     /// must be exercisable *before* it is signed, or signing would always
-    /// come first. Enforcement paths keep refusing the same file.
+    /// come first. Enforcement paths keep refusing the same file. A boundary
+    /// the proposal registers nothing for still refuses: no audit ran, so
+    /// there is no evidence to bless.
     #[test]
     fn check_audits_a_proposed_policy_the_enforcer_would_refuse() {
         let cfg = Config::default();
         let policy = Policy::default();
+        let err = audit_gate(
+            &cfg,
+            &SigState::Inactive,
+            &policy,
+            &SigState::Invalid("checkers.toml is unsigned".into()),
+            &ctx("pre-push"),
+            "check",
+            None,
+            true,
+        )
+        .expect_err("an empty policy cannot bless a boundary, proposed or not");
+        assert!(err.to_string().contains("audit evidence"), "{err}");
+        // A non-boundary event stays free of the blessing: nothing would run,
+        // so local work is not held hostage to a signature.
         assert!(
             audit_gate(
                 &cfg,
                 &SigState::Inactive,
                 &policy,
                 &SigState::Invalid("checkers.toml is unsigned".into()),
-                &ctx("pre-push"),
+                &ctx("pre-commit"),
                 "check",
                 None,
                 true,
             )
-            .is_ok(),
-            "check must audit the proposed policy, not demand its signature first"
+            .is_ok()
         );
     }
 
@@ -2889,5 +3004,50 @@ mod tests {
         assert!(!pending_attested(&cfg, "Owner/Repo", &sha));
         assert!(!pending_attested(&cfg, "Owner/Repo", &"c".repeat(40)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_proposal_never_executes_arbitrary_commands() {
+        // The signature boundary exists because checker rows are code: a
+        // proposed policy that names anything but the trusted audit runner
+        // is refused, not executed.
+        let shell_row = crate::config::Checker {
+            name: "evil".into(),
+            on: vec!["pre-push".into()],
+            kind: crate::config::Kind::Exec,
+            severity: crate::config::Severity::Blocking,
+            timeout_secs: 0,
+            phase: 0,
+            command: vec!["/bin/sh".into(), "-c".into(), "touch /tmp/x".into()],
+            env: Default::default(),
+            repos: vec![],
+        };
+        assert!(admissible_proposed_row(&shell_row).is_err());
+    }
+
+    #[test]
+    fn a_proposed_contract_must_live_under_the_profiles_root() {
+        let outside = vec![
+            "/usr/bin/true".into(),
+            "run".into(),
+            "--contract".into(),
+            "/etc/passwd".into(),
+        ];
+        let err = proposed_contract_path(&outside).unwrap_err();
+        assert!(err.contains("profiles root"), "{err}");
+
+        // A contract that does not resolve at all refuses too: a dangling
+        // path is never inside the root.
+        let dangling = vec![
+            "/usr/bin/true".into(),
+            "run".into(),
+            "--contract".into(),
+            "/nonexistent/contract.json".into(),
+        ];
+        assert!(proposed_contract_path(&dangling).is_err());
+
+        // run without --contract has no contract to check - still a refusal.
+        let bare = vec!["/usr/bin/true".into(), "run".into()];
+        assert!(proposed_contract_path(&bare).is_err());
     }
 }

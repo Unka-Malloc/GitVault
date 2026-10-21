@@ -210,8 +210,10 @@ pub struct Record {
     pub routing_signature: String,
     /// Whether the audit policy's signature held when the run happened. A
     /// `check` may audit a proposed (uncertified) policy - the record must
-    /// not read as if a certified one ran.
-    #[serde(default)]
+    /// not read as if a certified one ran. Absent on records sealed before
+    /// this field existed: an empty default must not materialize on a
+    /// round-trip, or their seals would break.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub policy_signature: String,
     pub passed: bool,
     pub blocking_failures: usize,

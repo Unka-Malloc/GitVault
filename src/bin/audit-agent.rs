@@ -290,11 +290,9 @@ fn overlay_primary(document: &mut Value, role: &awp::Profile) -> Result<(), a4aa
     Ok(())
 }
 
-fn write_pi_mcp(run_dir: &Path, servers: &[Value]) {
+fn write_pi_mcp(run_dir: &Path, servers: &[Value]) -> std::io::Result<()> {
     let pi_dir = run_dir.join(".pi");
-    if std::fs::create_dir_all(&pi_dir).is_err() {
-        return;
-    }
+    std::fs::create_dir_all(&pi_dir)?;
     let mut mcp_servers_map = Map::new();
     for server in servers {
         if let Some(name) = server["name"].as_str() {
@@ -311,10 +309,10 @@ fn write_pi_mcp(run_dir: &Path, servers: &[Value]) {
             mcp_servers_map.insert(name.to_string(), Value::Object(spec));
         }
     }
-    let _ = std::fs::write(
+    std::fs::write(
         pi_dir.join("mcp.json"),
         serde_json::to_string_pretty(&json!({ "mcpServers": mcp_servers_map })).unwrap_or_default(),
-    );
+    )
 }
 
 fn lane_admitted(document: &Value, agent: &str) -> bool {
@@ -654,8 +652,11 @@ async fn run(request: Request) -> a4aa::Result<Value> {
     .map_err(|_| failure("audit_va_home_unwritable", "registry/load"))?;
     // For RPC agents like pi that discover project-local MCP servers from
     // .pi/mcp.json, materialize the tool server definition into the run
-    // directory. The session/open patch carries the same servers for VA.
-    write_pi_mcp(&request.run_dir, &role.mcp_servers);
+    // directory. The session/open patch carries the same servers for VA. An
+    // unwritable config must refuse here - a run that cannot arm its declared
+    // evidence tools has no verdict worth recording.
+    write_pi_mcp(&request.run_dir, &role.mcp_servers)
+        .map_err(|_| failure("audit_mcp_config_unwritable", "run/start"))?;
     let identity = json!({"id":role.id,"revision":role.revision,
                           "principal":role.principal_id()});
     let captured_usage = Arc::new(std::sync::Mutex::new(None));

@@ -267,6 +267,16 @@ pub fn identity_gate(ctx: &Context, routing_certified: bool) -> Option<CheckerOu
     })
 }
 
+/// The shared stage-1 evidence file for one check invocation. Every checker
+/// the run spawns resolves and scans into the same document; keyed by the
+/// check process so two operations never read each other's evidence.
+fn stage1_evidence_path() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "gitvault-stage1-evidence-{}.json",
+        std::process::id()
+    ))
+}
+
 /// Run the certified policy against the snapshot. `policy` must come from
 /// `Policy::load_certified` - this function executes its commands verbatim and
 /// never re-checks the signature itself. `routing_sig` is the routing table's
@@ -298,6 +308,10 @@ pub fn run_all(
     }
     // The record spans the whole run, so it starts before the first checker.
     let run = records::begin(cfg, selected.len());
+    // Fresh shared evidence for this run: a stale file left by a crashed
+    // check must not feed this one.
+    let evidence = stage1_evidence_path();
+    let _ = std::fs::remove_file(&evidence);
     let mut report = Report::default();
 
     if only.is_none()
@@ -366,6 +380,7 @@ pub fn run_all(
     if let Some(run) = run {
         records::finish(cfg, run, ctx, &report, routing_sig, policy_sig);
     }
+    let _ = std::fs::remove_file(&evidence);
     Ok(report)
 }
 
@@ -497,6 +512,11 @@ fn run_one(
         cmd.env("GITVAULT_VERIFY_HEAD", reference);
     }
     cmd.env("GITVAULT_EVENT", &ctx.event)
+        // The shared deterministic evidence for this run: every checker the
+        // run spawns gets the same file, so range resolution and the
+        // withheld/credential sweep happen once per operation instead of once
+        // per reviewer. Keyed by process, so concurrent checks never share.
+        .env("GITVAULT_STAGE1_EVIDENCE", stage1_evidence_path())
         .env("GITVAULT_IDENTITY", &ctx.identity)
         .env("GITVAULT_REPO", ctx.repo_root.display().to_string())
         .env(
