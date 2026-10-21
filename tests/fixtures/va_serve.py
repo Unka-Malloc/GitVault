@@ -128,6 +128,26 @@ for line in sys.stdin:
         record("session-prompt.jsonl", params)
         if MODE == "disconnect":
             break
+        if MODE == "sealed-drop":
+            emit(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/event",
+                    "params": {
+                        "sessionId": params.get("sessionId"),
+                        "event": {
+                            "kind": "usage",
+                            "usage": {
+                                "input": 9,
+                                "output": 4,
+                                "cachedInput": 2,
+                                "cachedWrite": 1,
+                            },
+                        },
+                    },
+                }
+            )
+            break
         if MODE == "failed":
             reject(req_id, "agent_failed", "session/prompt", "stub failed")
             continue

@@ -533,6 +533,26 @@ fn an_uncertain_resume_open_never_falls_through_to_fresh() {
     assert!(fixture.records("session-prompt.jsonl").is_empty());
 }
 
+/// A sealed report outranks a lost `session/prompt` response: the submit tool
+/// writes report.json before the turn settles, so an uncertain transport
+/// failure after that point carries the settled verdict, not a refusal. The
+/// gate still verifies the receipt's credential before honoring it.
+#[test]
+fn a_sealed_report_survives_a_lost_prompt_response() {
+    let fixture = Fixture::new("sealed-drop");
+    std::fs::write(
+        fixture.run_dir.join("report.json"),
+        json!({"verdict":"pass","gate_status":"pending"}).to_string(),
+    )
+    .unwrap();
+    let (ok, result) = fixture.invoke();
+    assert!(ok, "sealed report must outrank the lost response: {result}");
+    assert_eq!(result["completed"], true);
+    assert_eq!(result["stop_reason"], "report_sealed");
+    assert_eq!(result["usage"]["input_tokens"], 9);
+    assert_eq!(fixture.records("session-prompt.jsonl").len(), 1);
+}
+
 #[test]
 fn an_unadmitted_serving_profile_fails_closed() {
     let mut fixture = Fixture::new("complete");

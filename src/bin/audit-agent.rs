@@ -824,7 +824,22 @@ async fn run(request: Request) -> a4aa::Result<Value> {
                       "stop_reason": stop_reason, "usage": usage,
                       "profile": identity, "served": opened.served}))
         }
-        Err(error) => Err(call_error("session/prompt", error)),
+        Err(error) => {
+            // A sealed verdict on disk outranks a lost prompt response: the
+            // submit tool writes report.json before the turn settles, so an
+            // uncertain transport error after that point did not lose the
+            // review. The gate verifies the receipt's credential itself;
+            // reporting the settled report here keeps one flaky handshake
+            // from discarding paid work.
+            let error = call_error("session/prompt", error);
+            if error.uncertain_effect && request.run_dir.join("report.json").exists() {
+                let usage = captured_usage.lock().unwrap().clone();
+                Ok(json!({"completed": true, "stop_reason": "report_sealed",
+                          "usage": usage, "profile": identity, "served": opened.served}))
+            } else {
+                Err(error)
+            }
+        }
     }
 }
 
