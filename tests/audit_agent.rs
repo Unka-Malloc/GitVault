@@ -24,6 +24,7 @@ struct Fixture {
     agent: String,
     model: String,
     session: String,
+    pi_agent_dir: Option<PathBuf>,
 }
 impl Fixture {
     fn new(mode: &str) -> Self {
@@ -111,6 +112,7 @@ impl Fixture {
             agent: "opencode".into(),
             model: "opencode/stub-free".into(),
             session: "acp-stub-session".into(),
+            pi_agent_dir: None,
         }
     }
 
@@ -153,27 +155,29 @@ impl Fixture {
         )
         .unwrap();
         let _ = std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755));
-        let output = Command::new(env!("CARGO_BIN_EXE_gitvault-audit-agent"))
-            .args([
-                "--contract",
-                self.contract_dir.to_str().unwrap(),
-                "--run",
-                self.run_dir.to_str().unwrap(),
-            ])
-            .env("GITVAULT_VA_BIN", &wrapper)
-            .env("GITVAULT_VA_STUB_DIR", &self.stub_dir)
-            .env("GITVAULT_VA_STUB_MODE", &self.mode)
-            .env("GITVAULT_VA_STUB_PROFILE", &self.profile)
-            .env("GITVAULT_VA_STUB_AGENT", &self.agent)
-            .env("GITVAULT_VA_STUB_MODEL", &self.model)
-            .env("GITVAULT_VA_STUB_SESSION", &self.session)
-            .env("PYTHONUNBUFFERED", "1")
-            .current_dir(&self.run_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .unwrap();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_gitvault-audit-agent"));
+        cmd.args([
+            "--contract",
+            self.contract_dir.to_str().unwrap(),
+            "--run",
+            self.run_dir.to_str().unwrap(),
+        ])
+        .env("GITVAULT_VA_BIN", &wrapper)
+        .env("GITVAULT_VA_STUB_DIR", &self.stub_dir)
+        .env("GITVAULT_VA_STUB_MODE", &self.mode)
+        .env("GITVAULT_VA_STUB_PROFILE", &self.profile)
+        .env("GITVAULT_VA_STUB_AGENT", &self.agent)
+        .env("GITVAULT_VA_STUB_MODEL", &self.model)
+        .env("GITVAULT_VA_STUB_SESSION", &self.session)
+        .env("PYTHONUNBUFFERED", "1")
+        .current_dir(&self.run_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+        if let Some(dir) = &self.pi_agent_dir {
+            cmd.env("PI_CODING_AGENT_DIR", dir);
+        }
+        let output = cmd.output().unwrap();
         assert!(output.stdout.len() < 1024);
         let text = String::from_utf8(output.stdout).unwrap();
         let root = self.contract_dir.parent().unwrap();
@@ -486,7 +490,28 @@ fn va_serving_the_rpc_fallback_is_admitted() {
     );
     assert_eq!(fixture.records("session-open.jsonl").len(), 1);
     assert_eq!(fixture.records("session-open.jsonl")[0]["binding"], "audit");
-    assert!(fixture.run_dir.join(".pi/mcp.json").exists());
+    // The project config must carry the declared audit server - and silence
+    // every server the user's global agent config would otherwise leak in.
+    let pi_dir = fixture.stub_dir.join("pi-agent");
+    std::fs::create_dir_all(&pi_dir).unwrap();
+    std::fs::write(
+        pi_dir.join("mcp.json"),
+        json!({"mcpServers": {"foreign-corp": {"command": "evil"}}}).to_string(),
+    )
+    .unwrap();
+    fixture.pi_agent_dir = Some(pi_dir);
+    let (ok, result) = fixture.invoke();
+    assert!(ok, "{result}");
+    let mcp: Value = serde_json::from_str(
+        &std::fs::read_to_string(fixture.run_dir.join(".pi/mcp.json")).unwrap(),
+    )
+    .unwrap();
+    let servers = &mcp["mcpServers"];
+    assert_eq!(servers["foreign-corp"]["enabled"], false);
+    assert!(
+        servers["gitvault-audit"]["command"].is_string(),
+        "declared audit server must keep its real definition: {servers}"
+    );
 }
 
 #[test]

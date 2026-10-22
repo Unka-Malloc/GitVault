@@ -270,11 +270,45 @@ pub fn identity_gate(ctx: &Context, routing_certified: bool) -> Option<CheckerOu
 /// The shared stage-1 evidence file for one check invocation. Every checker
 /// the run spawns resolves and scans into the same document; keyed by the
 /// check process so two operations never read each other's evidence.
+/// Shared deterministic evidence for a run lives inside a private
+/// per-process directory: `create_dir` guarantees exclusive ownership and
+/// a 0700 mode keeps other local accounts from planting forged cache
+/// entries that a reviewer would trust as a completed sweep. When no
+/// private directory can be claimed the path simply never materializes -
+/// children miss the cache and scan independently rather than trusting
+/// state that is not ours.
 fn stage1_evidence_path() -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "gitvault-stage1-evidence-{}.json",
-        std::process::id()
-    ))
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let dir = DIR.get_or_init(|| {
+        let mut candidate = std::env::temp_dir();
+        for attempt in 0..64u32 {
+            candidate = std::env::temp_dir().join(format!(
+                "gitvault-stage1-{}-{attempt}-{:x}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or_default()
+            ));
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&candidate) {
+                Ok(()) => return candidate,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => break,
+            }
+        }
+        // Total failure returns the last candidate: its name was just
+        // generated so nobody could have planted it, and its creation
+        // already failed so nothing can be written inside - the cache
+        // degrades to a guaranteed miss for every party.
+        candidate
+    });
+    dir.join("evidence.json")
 }
 
 /// Run the certified policy against the snapshot. `policy` must come from

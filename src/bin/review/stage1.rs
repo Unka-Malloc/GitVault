@@ -144,9 +144,14 @@ pub(crate) fn evidence_get(path: &Path, key: &str) -> Option<Value> {
 }
 
 pub(crate) fn evidence_store(path: &Path, key: &str, value: Value) {
+    // The orchestrator owns the private evidence root; a missing ancestor
+    // must not be recreated here - a recreated root would land with
+    // permissive defaults outside the trusted 0700 boundary.
     let dir = path.with_extension("d");
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
+    match std::fs::create_dir(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {}
+        Err(_) => return,
     }
     let entry = evidence_entry(path, key);
     let tmp = dir.join(format!(
