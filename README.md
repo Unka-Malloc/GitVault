@@ -216,6 +216,10 @@ reviews of the same target and runtime. When the primary agent cannot serve
 the turn, the audit binding steps down its declared fallback chain — an
 unavailable agent yields to the next declared candidate, a quota-exhausted
 model to the next declared model; an exhausted chain refuses publication.
+Failover restarts the in-flight turn on the next candidate rather than
+replaying a completed one: tokens a failed attempt already spent stay
+spent, while a durable session binding resumes the same conversation
+without restarting it — only confirmed stale bindings open fresh.
 Report submission alone does not finalize a review. Recovery resumes the same
 conversation after transport failure, or reuses verified completion evidence
 when only local receipt finalization failed. Unfinished reviews retain their
