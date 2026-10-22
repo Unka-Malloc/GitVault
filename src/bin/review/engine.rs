@@ -366,49 +366,83 @@ fn repo_identity(repo: &str) -> String {
     .unwrap_or_default()
 }
 
-/// The head this checker last completed a review of — the coverage cursor.
-/// A settled report covered its head regardless of verdict: a pass is clean
-/// coverage, and a refusal carries its blocking findings forward until they
-/// are fixed or an operator ruling overrules them. A report qualifies only
-/// under the same repository identity and the same contract questions,
-/// sealed, settled, and on this head's ancestry line; anything else is not
-/// coverage of this target.
-fn cursor(
-    repo: &str,
-    runs: &Path,
+/// A checker's coverage ledger entry: the newest head it finished judging
+/// and the blocking findings still standing there. Reports are receipts;
+/// this registry is the semantics — one lookup names everything the next
+/// range must answer for.
+struct Cursor {
+    head: String,
+    verdict: String,
+    findings: Vec<Value>,
+}
+
+/// `profile/cursors/<checker>.json`: the coverage ledger, one sealed entry
+/// per repository-and-contract pair. Entries seal-chain the way receipts do
+/// — a hand-edited position breaks its own seal and reads as no coverage.
+fn cursor_file(profile: &Path, checker: &str) -> PathBuf {
+    profile.join("cursors").join(format!("{checker}.json"))
+}
+
+fn cursor_key(repo_id: &str, contract: &Contract) -> String {
+    format!(
+        "{repo_id}#{:.16}",
+        sha256(&serde_json::to_string(&contract.domains).unwrap_or_default())
+    )
+}
+
+/// The ledger entry for this repository under this contract — only a
+/// signature-clean seal chain counts; anything else is no coverage.
+fn cursor_entry(profile: &Path, contract: &Contract, repo_id: &str) -> Option<Cursor> {
+    let raw = std::fs::read_to_string(cursor_file(profile, &contract.name)).ok()?;
+    let store: Value = serde_json::from_str(&raw).ok()?;
+    let entry = &store[cursor_key(repo_id, contract)];
+    if !crate::seal::valid(entry) {
+        return None;
+    }
+    Some(Cursor {
+        head: entry["head"].as_str()?.to_string(),
+        verdict: entry["verdict"].as_str().unwrap_or("").to_string(),
+        findings: entry["findings"].as_array().cloned().unwrap_or_default(),
+    })
+}
+
+/// Record the position a settled verdict established. Only a complete
+/// judgement moves the tape — pass is clean coverage and a block parks its
+/// standing findings at the new head; an incomplete verdict judged nothing,
+/// so neither the cursor nor the findings move.
+fn cursor_advance(
+    profile: &Path,
     contract: &Contract,
     repo_id: &str,
     head: &str,
-) -> Option<(String, Value)> {
-    let mut newest: Option<(std::time::SystemTime, String, Value)> = None;
-    for entry in std::fs::read_dir(runs).ok()?.flatten() {
-        let report_path = entry.path().join("report.json");
-        let Ok(raw) = std::fs::read_to_string(&report_path) else {
-            continue;
-        };
-        let Ok(report) = serde_json::from_str::<Value>(&raw) else {
-            continue;
-        };
-        let review_head = report["review_head"].as_str().unwrap_or("");
-        let settled = matches!(report["gate_status"].as_str(), Some("passed" | "refused"));
-        if review_head.is_empty()
-            || !settled
-            || repo_id.is_empty()
-            || report["repo"].as_str() != Some(repo_id)
-            || report["review_items"] != json!(contract.domains)
-            || !crate::seal::valid(&report)
-            || !ancestor_of(repo, review_head, head)
-        {
-            continue;
-        }
-        let mtime = std::fs::metadata(&report_path)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::UNIX_EPOCH);
-        if newest.as_ref().is_none_or(|(t, _, _)| mtime > *t) {
-            newest = Some((mtime, review_head.to_string(), report));
-        }
+    verdict: &str,
+    findings: Vec<Value>,
+) {
+    if verdict != "pass" && verdict != "block" {
+        return;
     }
-    newest.map(|(_, head, report)| (head, report))
+    let path = cursor_file(profile, &contract.name);
+    let mut store: Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_else(|| json!({}));
+    let key = cursor_key(repo_id, contract);
+    let seal_prev = store[key.as_str()]["seal"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let mut entry = json!({
+        "head": head,
+        "verdict": verdict,
+        "findings": findings,
+        "seal_prev": seal_prev,
+    });
+    entry["seal"] = json!(crate::seal::seal(&seal_prev, &entry));
+    store[key.as_str()] = entry;
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = evidence::write_json(&path, &store);
 }
 
 /// The commit this review may start from: the descendant of the target's own
@@ -428,35 +462,6 @@ fn effective_base(repo: &str, base: Option<&str>, cursor_head: Option<&str>) -> 
             }
         }
     }
-}
-
-/// The blocking findings a report still stands on for a range that never
-/// opened their files: its fresh findings plus the ones it inherited from
-/// its own cursor. A finding on a path the range touched was re-reviewed,
-/// and the new verdict speaks for it.
-fn carried_blockers(
-    report: Option<&Value>,
-    changed: &std::collections::HashSet<&str>,
-) -> Vec<Value> {
-    let mut out: Vec<Value> = Vec::new();
-    let Some(report) = report else {
-        return out;
-    };
-    for key in ["findings", "carried_findings"] {
-        for f in report[key].as_array().into_iter().flatten() {
-            let blocking = f["severity"].as_str() == Some("blocking");
-            let untouched = f["file"]
-                .as_str()
-                .is_none_or(|file| !changed.contains(file));
-            let duplicate = out.iter().any(|e: &Value| {
-                e["file"] == f["file"] && e["line"] == f["line"] && e["evidence"] == f["evidence"]
-            });
-            if blocking && untouched && !duplicate {
-                out.push(f.clone());
-            }
-        }
-    }
-    out
 }
 
 /// Whether the audit's outcome stands: a pass verdict carries no blocking
@@ -727,7 +732,7 @@ fn review_target(
     settings: &Settings,
     target: &stage1::Target,
     base: Option<&str>,
-    cursor_report: Option<&Value>,
+    cursor: Option<&Cursor>,
     repo_id: &str,
     summary: Option<&stage1::Summary>,
     summaries: &[stage1::Summary],
@@ -807,8 +812,8 @@ fn review_target(
         "changed": changed.clone(),
         "runtime": runtime,
     });
-    if let Some(report) = cursor_report {
-        scope["coverage_cursor"] = json!(report["review_head"]);
+    if let Some(entry) = cursor {
+        scope["coverage_cursor"] = json!(entry.head);
     }
     if contract.stage1.is_some() {
         scope["kind"] = json!(target.kind);
@@ -876,14 +881,27 @@ fn review_target(
                 return Err("The pushed ref moved during review; publication refused".to_string());
             }
         }
-        // Blocking findings the coverage cursor proved on content this range
+        // Blocking findings the coverage ledger holds on content this range
         // did not touch keep standing — the file was never re-opened, so the
-        // sealed evidence is still the live one. They join this receipt before
-        // it seals, so the next cursor inherits the same standing findings
-        // and a hand-edited history cannot silently drop one.
+        // recorded evidence is still the live one. They join this receipt
+        // before it seals, so the ledger and the receipt tell one story.
         let changed_set: std::collections::HashSet<&str> =
             changed.iter().map(String::as_str).collect();
-        let carried = carried_blockers(cursor_report, &changed_set);
+        let carried: Vec<Value> = cursor
+            .map(|entry| {
+                entry
+                    .findings
+                    .iter()
+                    .filter(|f| f["severity"].as_str() == Some("blocking"))
+                    .filter(|f| {
+                        f["file"]
+                            .as_str()
+                            .is_none_or(|file| !changed_set.contains(file))
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
         report["carried_findings"] = json!(carried);
         // The receipt's standing result, not the checker's bare verdict: a
         // pass that still stands on blocking findings — fresh or carried —
@@ -931,6 +949,30 @@ fn review_target(
         // this only now keeps an unfinalized attempt resumable under the
         // same key.
         credential::consume(&run_dir);
+        // The coverage ledger moves with the receipt it just sealed: a
+        // complete judgement parks at this head with the blocking findings
+        // still standing — fresh ones plus the ones the range never opened.
+        let mut standing: Vec<Value> = report["carried_findings"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for f in report["findings"].as_array().into_iter().flatten() {
+            let blocking = f["severity"].as_str() == Some("blocking");
+            let duplicate = standing.iter().any(|e| {
+                e["file"] == f["file"] && e["line"] == f["line"] && e["evidence"] == f["evidence"]
+            });
+            if blocking && !duplicate {
+                standing.push(f.clone());
+            }
+        }
+        cursor_advance(
+            &settings.profile,
+            contract,
+            repo_id,
+            &target.head,
+            report["verdict"].as_str().unwrap_or(""),
+            standing,
+        );
         println!(
             "{}: {} — {}",
             contract.title,
@@ -955,8 +997,8 @@ fn review_target(
             evidence::write_json(
                 &run_dir.join("carried.json"),
                 &json!({
-                    "cursor": cursor_report
-                        .map(|r| r["review_head"].clone())
+                    "cursor": cursor
+                        .map(|entry| json!(entry.head))
                         .unwrap_or(Value::Null),
                     "findings": report["carried_findings"],
                 }),
@@ -1095,22 +1137,18 @@ fn review_gate(
         }
     }
     let repo_id = repo_identity(repo);
-    let runs = settings.profile.join(format!("{}-runs", contract.name));
     for (index, target) in targets.iter().enumerate() {
-        // The coverage cursor: this checker's newest settled review on this
-        // head's ancestry line. Content at or below it — or at or below the
-        // target's own base — is never reviewed twice.
-        let (cursor_head, cursor_report) =
-            match cursor(repo, &runs, contract, &repo_id, &target.head) {
-                Some((head, report)) => (Some(head), Some(report)),
-                None => (None, None),
-            };
-        // The identical head already carries this checker's verdict; the
-        // sealed outcome stands as-is — a signed ruling may still waive it.
-        if cursor_head.as_deref() == Some(target.head.as_str())
-            && let Some(report) = &cursor_report
+        // The coverage ledger: this checker's newest complete judgement on
+        // this head's ancestry line. Content at or below it — or at or below
+        // the target's own base — is never reviewed twice.
+        let cursor = cursor_entry(&settings.profile, contract, &repo_id)
+            .filter(|entry| ancestor_of(repo, &entry.head, &target.head));
+        // The identical head already carries this checker's judgement; the
+        // ledger's outcome stands as-is — a signed ruling may still waive it.
+        if let Some(entry) = &cursor
+            && entry.head == target.head
         {
-            if report["gate_status"].as_str() == Some("passed") {
+            if entry.verdict == "pass" && entry.findings.is_empty() {
                 println!(
                     "{}: {} already passed its semantic review ({}); reusing that verdict",
                     contract.title,
@@ -1125,16 +1163,32 @@ fn review_gate(
                 target.label,
                 &target.head[..12.min(target.head.len())],
             );
-            return Ok(outcome(report, contract, &repo_id, &target.head, None));
+            let replay = json!({
+                "verdict": entry.verdict,
+                "findings": entry.findings,
+            });
+            return Ok(outcome(&replay, contract, &repo_id, &target.head, None));
         }
-        let base = effective_base(repo, target.base.as_deref(), cursor_head.as_deref());
-        if cursor_head.is_some() && base.as_deref() != target.base.as_deref() {
+        let base = effective_base(
+            repo,
+            target.base.as_deref(),
+            cursor.as_ref().map(|entry| entry.head.as_str()),
+        );
+        if cursor.is_some() && base.as_deref() != target.base.as_deref() {
             println!(
                 "{}: {} reviews the increment since {} ({} paths)",
                 contract.title,
                 target.label,
-                &cursor_head.as_deref().unwrap_or_default()
-                    [..12.min(cursor_head.as_deref().unwrap_or_default().len())],
+                &cursor
+                    .as_ref()
+                    .map(|entry| entry.head.as_str())
+                    .unwrap_or_default()[..12.min(
+                    cursor
+                        .as_ref()
+                        .map(|entry| entry.head.as_str())
+                        .unwrap_or_default()
+                        .len()
+                )],
                 stage1::outgoing_paths_range(repo, base.as_deref(), &target.head)
                     .map(|p| p.len())
                     .unwrap_or(0),
@@ -1155,7 +1209,7 @@ fn review_gate(
             settings,
             target,
             base.as_deref(),
-            cursor_report.as_ref(),
+            cursor.as_ref(),
             &repo_id,
             summary,
             &summaries,

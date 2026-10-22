@@ -449,6 +449,17 @@ fn the_coverage_cursor_reviews_only_the_increment() {
         .expect("the inventory response must be logged");
     assert!(inventory.contains("src/main.rs"), "{inventory}");
     assert!(!inventory.contains("src/lib.rs"), "{inventory}");
+
+    // The coverage ledger recorded the judgement: a small registry entry,
+    // not an archaeological scan of reports, is what moves the tape forward.
+    let ledger: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("profile/cursors/sample-gate.json")).unwrap(),
+    )
+    .unwrap();
+    let entry = ledger.as_object().unwrap().values().next().unwrap();
+    assert_eq!(entry["head"], head2);
+    assert_eq!(entry["verdict"], "pass");
+    assert!(entry["findings"].as_array().unwrap().is_empty());
 }
 
 /// A refused verdict's blocking findings ride the cursor: while their files
@@ -511,6 +522,30 @@ fn blocking_findings_carry_until_their_file_is_touched() {
     }
     let carried = carried.expect("the increment run must record its carried findings");
     assert!(carried.contains("src/other.rs"), "{carried}");
+
+    // The ledger keeps the standing finding at the new head: the tape moved,
+    // and the refusal it carries did not evaporate — re-pushing the same
+    // head replays it without paying another review.
+    let ledger: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("profile/cursors/sample-gate.json")).unwrap(),
+    )
+    .unwrap();
+    let entry = ledger.as_object().unwrap().values().next().unwrap();
+    assert_eq!(entry["head"], head2);
+    assert_eq!(entry["verdict"], "pass");
+    assert_eq!(entry["findings"].as_array().unwrap().len(), 1);
+    std::fs::remove_file(root.join("runner-was-here")).unwrap();
+    let repeat = run_gate(&root, &repo, &base, &head2);
+    assert!(
+        !repeat.status.success(),
+        "the standing blocker refuses the same head again"
+    );
+    assert!(
+        !root.join("runner-was-here").exists(),
+        "the same head never pays for a second review"
+    );
+    let stdout = String::from_utf8_lossy(&repeat.stdout);
+    assert!(stdout.contains("was already refused"), "{stdout}");
 
     // Re-opening the finding's file lets the new verdict speak for it.
     std::fs::write(repo.join("src/other.rs"), "pub fn o() -> u8 { 1 }\n").unwrap();
