@@ -332,6 +332,215 @@ fn audited(
     false
 }
 
+/// `commit` is an ancestor of (or equal to) `head` in `repo`.
+fn ancestor_of(repo: &str, commit: &str, head: &str) -> bool {
+    if commit == head {
+        return true;
+    }
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-base", "--is-ancestor", commit, head])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// The repository's review identity: its `owner/name` slug, or the canonical
+/// checkout path when no usable remote names it. Two checkouts of one remote
+/// share coverage; a path-identified local tree never shares it with another.
+fn repo_identity(repo: &str) -> String {
+    let slug = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["remote", "get-url", "origin"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| crate::git::slug_from_remote(String::from_utf8_lossy(&o.stdout).trim()));
+    slug.or_else(|| {
+        std::fs::canonicalize(repo)
+            .ok()
+            .map(|p| format!("local:{}", p.display()))
+    })
+    .unwrap_or_default()
+}
+
+/// The head this checker last completed a review of — the coverage cursor.
+/// A settled report covered its head regardless of verdict: a pass is clean
+/// coverage, and a refusal carries its blocking findings forward until they
+/// are fixed or an operator ruling overrules them. A report qualifies only
+/// under the same repository identity and the same contract questions,
+/// sealed, settled, and on this head's ancestry line; anything else is not
+/// coverage of this target.
+fn cursor(
+    repo: &str,
+    runs: &Path,
+    contract: &Contract,
+    repo_id: &str,
+    head: &str,
+) -> Option<(String, Value)> {
+    let mut newest: Option<(std::time::SystemTime, String, Value)> = None;
+    for entry in std::fs::read_dir(runs).ok()?.flatten() {
+        let report_path = entry.path().join("report.json");
+        let Ok(raw) = std::fs::read_to_string(&report_path) else {
+            continue;
+        };
+        let Ok(report) = serde_json::from_str::<Value>(&raw) else {
+            continue;
+        };
+        let review_head = report["review_head"].as_str().unwrap_or("");
+        let settled = matches!(report["gate_status"].as_str(), Some("passed" | "refused"));
+        if review_head.is_empty()
+            || !settled
+            || repo_id.is_empty()
+            || report["repo"].as_str() != Some(repo_id)
+            || report["review_items"] != json!(contract.domains)
+            || !crate::seal::valid(&report)
+            || !ancestor_of(repo, review_head, head)
+        {
+            continue;
+        }
+        let mtime = std::fs::metadata(&report_path)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        if newest.as_ref().is_none_or(|(t, _, _)| mtime > *t) {
+            newest = Some((mtime, review_head.to_string(), report));
+        }
+    }
+    newest.map(|(_, head, report)| (head, report))
+}
+
+/// The commit this review may start from: the descendant of the target's own
+/// base and the checker's coverage cursor — content at or below either was
+/// already published or already reviewed, and is never reviewed twice. When
+/// the two are unrelated (a rewritten history line) the target's own base
+/// stands and the whole outgoing range is reviewed again.
+fn effective_base(repo: &str, base: Option<&str>, cursor_head: Option<&str>) -> Option<String> {
+    match (base, cursor_head) {
+        (_, None) => base.map(str::to_string),
+        (None, Some(cursor)) => Some(cursor.to_string()),
+        (Some(base), Some(cursor)) => {
+            if ancestor_of(repo, base, cursor) {
+                Some(cursor.to_string())
+            } else {
+                Some(base.to_string())
+            }
+        }
+    }
+}
+
+/// The blocking findings a report still stands on for a range that never
+/// opened their files: its fresh findings plus the ones it inherited from
+/// its own cursor. A finding on a path the range touched was re-reviewed,
+/// and the new verdict speaks for it.
+fn carried_blockers(
+    report: Option<&Value>,
+    changed: &std::collections::HashSet<&str>,
+) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    let Some(report) = report else {
+        return out;
+    };
+    for key in ["findings", "carried_findings"] {
+        for f in report[key].as_array().into_iter().flatten() {
+            let blocking = f["severity"].as_str() == Some("blocking");
+            let untouched = f["file"]
+                .as_str()
+                .is_none_or(|file| !changed.contains(file));
+            let duplicate = out.iter().any(|e: &Value| {
+                e["file"] == f["file"] && e["line"] == f["line"] && e["evidence"] == f["evidence"]
+            });
+            if blocking && untouched && !duplicate {
+                out.push(f.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Whether the audit's outcome stands: a pass verdict carries no blocking
+/// findings — fresh or inherited from the coverage cursor — or every
+/// blocking finding is overruled by a signature-verified operator ruling.
+/// The sealed report keeps the checker's own verdict; the waiver record
+/// lands beside it so run history shows which operator decision stood in
+/// for a fix.
+fn outcome(
+    report: &Value,
+    contract: &Contract,
+    repo_id: &str,
+    head: &str,
+    run_dir: Option<&Path>,
+) -> i32 {
+    let mut merged = report.clone();
+    let mut findings = merged["findings"].as_array().cloned().unwrap_or_default();
+    for f in report["carried_findings"].as_array().into_iter().flatten() {
+        let duplicate = findings.iter().any(|e| {
+            e["file"] == f["file"] && e["line"] == f["line"] && e["evidence"] == f["evidence"]
+        });
+        if !duplicate {
+            let mut f = f.clone();
+            f["carried"] = json!(true);
+            findings.push(f);
+        }
+    }
+    merged["findings"] = json!(findings);
+    let blocking = merged["findings"]
+        .as_array()
+        .map(|f| {
+            f.iter()
+                .filter(|f| f["severity"].as_str() == Some("blocking"))
+                .count()
+        })
+        .unwrap_or(0);
+    let slug = repo_id.strip_prefix("local:").map_or(repo_id, |_| "");
+    if report["verdict"].as_str() == Some("pass") && blocking == 0 {
+        return 0;
+    }
+    let (waived, verdict_waived) = crate::objection::waivers(&merged, &contract.name, slug, head);
+    let standing = merged["findings"]
+        .as_array()
+        .map(|f| {
+            f.iter()
+                .enumerate()
+                .filter(|(i, f)| f["severity"].as_str() == Some("blocking") && !waived.contains(i))
+                .count()
+        })
+        .unwrap_or(0);
+    if !verdict_waived && (standing != 0 || waived.is_empty()) {
+        return 1;
+    }
+    let mut note = Vec::new();
+    for i in &waived {
+        let f = &merged["findings"][*i];
+        note.push(format!(
+            "{}:{}",
+            f["file"].as_str().unwrap_or(""),
+            f["line"].as_u64().unwrap_or(0)
+        ));
+    }
+    if let Some(dir) = run_dir {
+        let _ = evidence::write_json(
+            &dir.join("waivers.json"),
+            &serde_json::json!({
+                "objection_waived": note,
+                "verdict_waived": verdict_waived,
+                "ledger": crate::objection::ledger_path(),
+            }),
+        );
+    }
+    println!(
+        "{}: outcome waived by signed operator ruling{}",
+        contract.title,
+        if note.is_empty() {
+            String::new()
+        } else {
+            format!(" — waived findings: {}", note.join(", "))
+        }
+    );
+    0
+}
+
 /// An unfinished run of exactly this target under this runtime, waiting to
 /// continue. resume.json is the lookup key; scope.json cannot serve because
 /// it is removed when a run ends.
@@ -512,10 +721,14 @@ fn stage1_lines(contract: &Contract, summary: &stage1::Summary) -> Vec<String> {
 }
 
 /// Run one review of one resolved target. Returns the exit code.
+#[allow(clippy::too_many_arguments)]
 fn review_target(
     repo: &str,
     settings: &Settings,
     target: &stage1::Target,
+    base: Option<&str>,
+    cursor_report: Option<&Value>,
+    repo_id: &str,
     summary: Option<&stage1::Summary>,
     summaries: &[stage1::Summary],
     runtime: &Map<String, Value>,
@@ -533,7 +746,13 @@ fn review_target(
         }
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     };
-    let changed = stage1::outgoing_paths_snapshot(repo, &tree)?;
+    // With a review base the range's own diff is the whole review surface —
+    // content at or below it was published or already covered by the cursor;
+    // only a base-less target inventories the whole tree.
+    let changed = match base {
+        Some(base) => stage1::outgoing_paths_range(repo, Some(base), &target.head)?,
+        None => stage1::outgoing_paths_snapshot(repo, &tree)?,
+    };
     // A path the tool surface refuses is a review that can never complete.
     // Refuse it before the review costs a token - naming the path, never its
     // content.
@@ -554,7 +773,7 @@ fn review_target(
     }
     let identity = role_identity(settings, contract);
     let resume_key = json!({
-        "base": target.base,
+        "base": base,
         "head": target.head,
         "items": contract.domains,
         "agent_profile": identity,
@@ -584,10 +803,13 @@ fn review_target(
     let mut scope = json!({
         "repo": repo,
         "tree": tree,
-        "base": target.base,
-        "changed": changed,
+        "base": base,
+        "changed": changed.clone(),
         "runtime": runtime,
     });
+    if let Some(report) = cursor_report {
+        scope["coverage_cursor"] = json!(report["review_head"]);
+    }
     if contract.stage1.is_some() {
         scope["kind"] = json!(target.kind);
         if contract
@@ -654,15 +876,38 @@ fn review_target(
                 return Err("The pushed ref moved during review; publication refused".to_string());
             }
         }
-        report["gate_status"] = json!(if report["verdict"] == "pass" {
+        // Blocking findings the coverage cursor proved on content this range
+        // did not touch keep standing — the file was never re-opened, so the
+        // sealed evidence is still the live one. They join this receipt before
+        // it seals, so the next cursor inherits the same standing findings
+        // and a hand-edited history cannot silently drop one.
+        let changed_set: std::collections::HashSet<&str> =
+            changed.iter().map(String::as_str).collect();
+        let carried = carried_blockers(cursor_report, &changed_set);
+        report["carried_findings"] = json!(carried);
+        // The receipt's standing result, not the checker's bare verdict: a
+        // pass that still stands on blocking findings — fresh or carried —
+        // is a refusal, so the reuse path never waves it through and the
+        // next cursor inherits the same blockers.
+        let standing = report["findings"]
+            .as_array()
+            .map(|f| {
+                f.iter()
+                    .filter(|f| f["severity"].as_str() == Some("blocking"))
+                    .count()
+            })
+            .unwrap_or(0)
+            + report["carried_findings"].as_array().map_or(0, Vec::len);
+        report["gate_status"] = json!(if report["verdict"] == "pass" && standing == 0 {
             "passed"
         } else {
             "refused"
         });
         report["review_usage"] = json!({"tokens": usage, "duration_ms": duration_ms as u64});
         report["agent_profile"] = identity;
-        report["review_base"] = json!(target.base);
+        report["review_base"] = json!(base);
         report["review_head"] = json!(target.head);
+        report["repo"] = json!(repo_id);
         report["review_kind"] = json!(target.kind);
         // What this pass answered, so a later run under a wider contract does
         // not reuse it (see `audited`).
@@ -705,68 +950,29 @@ fn review_target(
             }
         }
         println!("{} report: {}", contract.title, report_path.display());
-        // Operator-ruled objections: only rulings in a signature-verified
-        // ledger waive anything. The sealed report keeps the checker's own
-        // verdict; the waiver record lands beside it so the run history
-        // shows exactly which operator decision stood in for a fix.
-        let passed = report["verdict"].as_str() == Some("pass");
-        let mut waived_outcome = false;
-        if !passed {
-            let repo_slug = Command::new("git")
-                .arg("-C")
-                .arg(repo)
-                .args(["remote", "get-url", "origin"])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .and_then(|o| {
-                    crate::git::slug_from_remote(String::from_utf8_lossy(&o.stdout).trim())
-                })
-                .unwrap_or_default();
-            let (waived, verdict_waived) =
-                crate::objection::waivers(&report, &contract.name, &repo_slug, &target.head);
-            let standing = report["findings"]
-                .as_array()
-                .map(|f| {
-                    f.iter()
-                        .enumerate()
-                        .filter(|(i, f)| {
-                            f["severity"].as_str() == Some("blocking") && !waived.contains(i)
-                        })
-                        .count()
-                })
-                .unwrap_or(0);
-            if verdict_waived || (standing == 0 && !waived.is_empty()) {
-                waived_outcome = true;
-                let mut note = Vec::new();
-                for i in &waived {
-                    let f = &report["findings"][*i];
-                    note.push(format!(
-                        "{}:{}",
-                        f["file"].as_str().unwrap_or(""),
-                        f["line"].as_u64().unwrap_or(0)
-                    ));
-                }
-                evidence::write_json(
-                    &run_dir.join("waivers.json"),
-                    &serde_json::json!({
-                        "objection_waived": note,
-                        "verdict_waived": verdict_waived,
-                        "ledger": crate::objection::ledger_path(),
-                    }),
-                )?;
-                println!(
-                    "{}: outcome waived by signed operator ruling{}",
-                    contract.title,
-                    if note.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" — waived findings: {}", note.join(", "))
-                    }
-                );
-            }
+        let carried_count = report["carried_findings"].as_array().map_or(0, Vec::len);
+        if carried_count > 0 {
+            evidence::write_json(
+                &run_dir.join("carried.json"),
+                &json!({
+                    "cursor": cursor_report
+                        .map(|r| r["review_head"].clone())
+                        .unwrap_or(Value::Null),
+                    "findings": report["carried_findings"],
+                }),
+            )?;
+            println!(
+                "{}: {} blocking finding(s) carried from the previous covered head",
+                contract.title, carried_count
+            );
         }
-        Ok(if passed || waived_outcome { 0 } else { 1 })
+        Ok(outcome(
+            &report,
+            contract,
+            repo_id,
+            &target.head,
+            Some(&run_dir),
+        ))
     })();
     let _ = std::fs::remove_file(run_dir.join("scope.json"));
     // A run that never finalized its receipt is refused, never pending.
@@ -888,14 +1094,53 @@ fn review_gate(
             }));
         }
     }
+    let repo_id = repo_identity(repo);
+    let runs = settings.profile.join(format!("{}-runs", contract.name));
     for (index, target) in targets.iter().enumerate() {
-        if audited(
-            settings,
-            contract,
-            target.base.as_deref(),
-            &target.head,
-            runtime,
-        ) {
+        // The coverage cursor: this checker's newest settled review on this
+        // head's ancestry line. Content at or below it — or at or below the
+        // target's own base — is never reviewed twice.
+        let (cursor_head, cursor_report) =
+            match cursor(repo, &runs, contract, &repo_id, &target.head) {
+                Some((head, report)) => (Some(head), Some(report)),
+                None => (None, None),
+            };
+        // The identical head already carries this checker's verdict; the
+        // sealed outcome stands as-is — a signed ruling may still waive it.
+        if cursor_head.as_deref() == Some(target.head.as_str())
+            && let Some(report) = &cursor_report
+        {
+            if report["gate_status"].as_str() == Some("passed") {
+                println!(
+                    "{}: {} already passed its semantic review ({}); reusing that verdict",
+                    contract.title,
+                    target.label,
+                    &target.head[..12.min(target.head.len())],
+                );
+                continue;
+            }
+            println!(
+                "{}: {} was already refused at {}; the sealed verdict stands",
+                contract.title,
+                target.label,
+                &target.head[..12.min(target.head.len())],
+            );
+            return Ok(outcome(report, contract, &repo_id, &target.head, None));
+        }
+        let base = effective_base(repo, target.base.as_deref(), cursor_head.as_deref());
+        if cursor_head.is_some() && base.as_deref() != target.base.as_deref() {
+            println!(
+                "{}: {} reviews the increment since {} ({} paths)",
+                contract.title,
+                target.label,
+                &cursor_head.as_deref().unwrap_or_default()
+                    [..12.min(cursor_head.as_deref().unwrap_or_default().len())],
+                stage1::outgoing_paths_range(repo, base.as_deref(), &target.head)
+                    .map(|p| p.len())
+                    .unwrap_or(0),
+            );
+        }
+        if audited(settings, contract, base.as_deref(), &target.head, runtime) {
             println!(
                 "{}: {} already passed its semantic review ({}); reusing that verdict",
                 contract.title,
@@ -906,7 +1151,16 @@ fn review_gate(
         }
         let summary = summaries.get(index);
         if review_target(
-            repo, settings, target, summary, &summaries, runtime, contract,
+            repo,
+            settings,
+            target,
+            base.as_deref(),
+            cursor_report.as_ref(),
+            &repo_id,
+            summary,
+            &summaries,
+            runtime,
+            contract,
         )? != 0
         {
             return Ok(1);

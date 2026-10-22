@@ -52,14 +52,20 @@ while [ $# -gt 0 ]; do
 done
 exe="$(sed -n 's/.*"review": *"\([^"]*\)".*/\1/p' "$(dirname "$contract")/installation.json")"
 touch "$(dirname "$0")/runner-was-here"
+if [ -f "$(dirname "$0")/emit-finding" ]; then
+  submit='{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"sample_submit_review","arguments":{"verdict":"block","summary":"planted blocker","coverage":{"structure":{"status":"reviewed","reason":"looked"}},"findings":[{"file":"src/other.rs","line":1,"severity":"blocking","evidence":"planted blocker","impact":"stays standing","remedy":"reopen the file"}],"unknowns":[]}}}'
+else
+  submit='{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"sample_submit_review","arguments":{"verdict":"pass","summary":"clean","coverage":{"structure":{"status":"reviewed","reason":"looked"}},"findings":[],"unknowns":[]}}}'
+fi
 printf '%s\n' \
   '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}' \
   '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
   '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"sample_context","arguments":{"operation":"inventory"}}}' \
   '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"sample_context","arguments":{"operation":"diff","path":"src/main.rs"}}}' \
   '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"sample_context","arguments":{"operation":"diff","path":"src/lib.rs"}}}' \
-  '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"sample_submit_review","arguments":{"verdict":"pass","summary":"clean","coverage":{"structure":{"status":"reviewed","reason":"looked"}},"findings":[],"unknowns":[]}}}' \
-  | "$exe" serve --contract "$contract" --run "$run_dir" >/dev/null
+  '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"sample_context","arguments":{"operation":"diff","path":"src/other.rs"}}}' \
+  "$submit" \
+  | "$exe" serve --contract "$contract" --run "$run_dir" > "$(dirname "$0")/serve-out.jsonl"
 printf '{"completed":true,"stop_reason":"completed","usage":{"input_tokens":1,"output_tokens":1,"cache_read_tokens":0,"cache_write_tokens":0},"profile":{"id":"sample-gate","revision":null,"principal":"synthetic"}}\n'
 "#;
 
@@ -149,6 +155,9 @@ fn fixture() -> (Fixture, String, String) {
 }
 
 fn run_gate(root: &Path, repo: &Path, base: &str, head: &str) -> Output {
+    // A real pre-push resolves the pushed ref at the pushed head; the
+    // review's ref-moved check refuses a ref left pointing anywhere else.
+    git(repo, &["branch", "-f", "nightly", head]);
     Command::new(REVIEW)
         .args([
             "run",
@@ -362,4 +371,158 @@ fn release_and_pr_judge_the_whole_snapshot() {
     }
     let pr_receipt = pr_receipt.expect("the PR run must have written a receipt");
     assert!(pr_receipt["review_base"].is_null());
+}
+
+/// The coverage cursor moves forward on the tape: a head the checker already
+/// covered is never re-opened — the next run's whole review surface is the
+/// increment since it, and the sealed receipt records that base.
+#[test]
+fn the_coverage_cursor_reviews_only_the_increment() {
+    let (guard, base, _head) = fixture();
+    let (root, repo) = (guard.0.clone(), guard.0.join("repo"));
+    // lib.rs joins the tree before the first review, so a whole-tree
+    // inventory would list two paths while the later increment lists one.
+    std::fs::write(repo.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "lib"]);
+    let head1 = git(&repo, &["rev-parse", "HEAD"]);
+    let first = run_gate(&root, &repo, &base, &head1);
+    assert!(
+        first.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    std::fs::write(
+        repo.join("src/main.rs"),
+        "fn main() { println!(\"v3\"); }\n",
+    )
+    .unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "bump"]);
+    let head2 = git(&repo, &["rev-parse", "HEAD"]);
+    std::fs::remove_file(root.join("runner-was-here")).unwrap();
+    let second = run_gate(&root, &repo, &base, &head2);
+    assert!(
+        second.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        stdout.contains(&format!("reviews the increment since {}", &head1[..12])),
+        "{stdout}"
+    );
+    assert!(
+        root.join("runner-was-here").exists(),
+        "a new head still pays a review"
+    );
+
+    // The receipt seals the cursor as its base and names the repository —
+    // coverage binds to this repository's identity, never to a bare commit.
+    let runs = root.join("profile/sample-gate-runs");
+    let mut receipt = None;
+    for entry in std::fs::read_dir(&runs).unwrap() {
+        let report: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(entry.unwrap().path().join("report.json")).unwrap(),
+        )
+        .unwrap();
+        if report["review_head"] == serde_json::json!(head2) {
+            receipt = Some(report);
+        }
+    }
+    let receipt = receipt.expect("the increment run must seal a receipt");
+    assert_eq!(receipt["review_base"], head1);
+    assert!(
+        receipt["repo"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("local:")
+    );
+
+    // The reviewer was shown only the increment: the serve log's inventory
+    // response names src/main.rs and never src/lib.rs.
+    let serve_log = std::fs::read_to_string(root.join("serve-out.jsonl")).unwrap();
+    let inventory = serve_log
+        .lines()
+        .find(|line| line.contains("\"id\":2"))
+        .expect("the inventory response must be logged");
+    assert!(inventory.contains("src/main.rs"), "{inventory}");
+    assert!(!inventory.contains("src/lib.rs"), "{inventory}");
+}
+
+/// A refused verdict's blocking findings ride the cursor: while their files
+/// stay outside the increment they keep refusing the gate, and they clear
+/// only when a later range re-opens them.
+#[test]
+fn blocking_findings_carry_until_their_file_is_touched() {
+    let (guard, base, _head) = fixture();
+    let (root, repo) = (guard.0.clone(), guard.0.join("repo"));
+    std::fs::write(repo.join("src/other.rs"), "pub fn o() {}\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "other"]);
+    let head1 = git(&repo, &["rev-parse", "HEAD"]);
+
+    let marker = root.join("emit-finding");
+    std::fs::write(&marker, "").unwrap();
+    let first = run_gate(&root, &repo, &base, &head1);
+    assert!(
+        !first.status.success(),
+        "a blocking finding refuses the gate: {}",
+        String::from_utf8_lossy(&first.stdout)
+    );
+
+    // The fix touches a different file: the blocker stays outside the
+    // increment and keeps refusing even though the fresh verdict passes.
+    std::fs::remove_file(&marker).unwrap();
+    std::fs::write(
+        repo.join("src/main.rs"),
+        "fn main() { println!(\"v3\"); }\n",
+    )
+    .unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "bump"]);
+    let head2 = git(&repo, &["rev-parse", "HEAD"]);
+    let second = run_gate(&root, &repo, &base, &head2);
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        !second.status.success(),
+        "the carried blocker still refuses the gate: {stdout} stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(
+        stdout.contains("1 blocking finding(s) carried"),
+        "{stdout} stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    // The fresh review passed; the standing refusal is recorded beside the
+    // receipt as carried evidence, not inside the checker's own verdict.
+    let runs = root.join("profile/sample-gate-runs");
+    let mut carried = None;
+    for entry in std::fs::read_dir(&runs).unwrap() {
+        let path = entry.unwrap().path();
+        let report: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path.join("report.json")).unwrap())
+                .unwrap();
+        if report["review_head"] == serde_json::json!(head2) {
+            carried = std::fs::read_to_string(path.join("carried.json")).ok();
+        }
+    }
+    let carried = carried.expect("the increment run must record its carried findings");
+    assert!(carried.contains("src/other.rs"), "{carried}");
+
+    // Re-opening the finding's file lets the new verdict speak for it.
+    std::fs::write(repo.join("src/other.rs"), "pub fn o() -> u8 { 1 }\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "fix other"]);
+    let head3 = git(&repo, &["rev-parse", "HEAD"]);
+    let third = run_gate(&root, &repo, &base, &head3);
+    assert!(
+        third.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&third.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&third.stdout);
+    assert!(stdout.contains("pass — clean"), "{stdout}");
 }
