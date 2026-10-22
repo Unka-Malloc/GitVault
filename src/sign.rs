@@ -186,7 +186,7 @@ pub fn run(cfg: &Config, vault: &Vault, args: &[String], cwd: &Path) -> Result<i
     // secret. The public key's temporary file lives inside this guard and is
     // removed even if any step below fails.
     let pub_text = public_key_from_agent(&agent.sock, &crate::vault::Store::fingerprint(&key))?;
-    let pub_file = crate::ssh::TempSecret::write(&pub_text, 0o600)?;
+    let pub_file = crate::tempsecret::TempSecret::write(&pub_text, 0o600)?;
 
     // Measured invocation behaviour:
     //
@@ -248,7 +248,7 @@ pub fn run(cfg: &Config, vault: &Vault, args: &[String], cwd: &Path) -> Result<i
 /// is bounded to the call's lifetime and the deletion is guaranteed by the
 /// `TempSecret` guard rather than by a call an error path could skip.
 pub fn public_key_of_material(private: &str, passphrase: Option<&str>) -> Result<String> {
-    let secret = crate::ssh::TempSecret::write(private, 0o600)?;
+    let secret = crate::tempsecret::TempSecret::write(private, 0o600)?;
     // `ssh-keygen -y` needs the passphrase for an encrypted key and has no agent to
     // ask, so it is supplied through SSH_ASKPASS. Without this it prompts on a
     // terminal it does not have and the derivation fails.

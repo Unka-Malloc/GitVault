@@ -224,7 +224,7 @@ fn verify_signed(config_path: &Path, anchor: &Path) -> Result<()> {
 /// was fetched from the vault after the biometric gate, and it is materialised
 /// only inside a self-deleting `TempSecret` for the single ssh-keygen call.
 pub fn sign(config_path: &Path, key_material: &str) -> Result<PathBuf> {
-    let secret = crate::ssh::TempSecret::write(key_material, 0o600)?;
+    let secret = crate::tempsecret::TempSecret::write(key_material, 0o600)?;
     let sig = sig_path(config_path);
     // A stale sidecar must not be read back as this signature.
     let _ = std::fs::remove_file(&sig);

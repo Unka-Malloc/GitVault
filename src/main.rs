@@ -14,10 +14,12 @@ mod configsig;
 mod git;
 mod history;
 mod identity;
+mod objection;
 mod records;
 mod seal;
 mod sign;
 mod ssh;
+mod tempsecret;
 mod unlock;
 mod vault;
 
@@ -122,6 +124,17 @@ enum Command {
     Status {
         #[arg(long)]
         json: bool,
+    },
+
+    /// File and adjudicate objections to checker findings.
+    ///
+    /// A blocking verdict is evidence, not law: the operator may rule that a
+    /// finding does not apply. Filing is a plain record; ruling requires the
+    /// biometric vault confirmation and signs the rulings ledger — a waiver
+    /// only counts while that signature verifies.
+    Objection {
+        #[command(subcommand)]
+        command: ObjectionCommand,
     },
 
     /// Inspect or bless the configuration itself.
@@ -247,6 +260,52 @@ enum Command {
         #[arg(long, short = 'R', global = true)]
         repo: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ObjectionCommand {
+    /// File an objection against a finding (or a whole non-pass verdict).
+    ///
+    /// For a finding objection, `--finding FILE[:LINE]` locates the newest
+    /// blocking finding in the checker's latest report and pins its evidence
+    /// fingerprint. `--verdict` instead objects to a non-pass outcome (for
+    /// example an `incomplete`) and binds the ruling to the current head.
+    File {
+        /// Checker contract name, e.g. money-saver.
+        #[arg(long)]
+        checker: String,
+        /// Finding location in `FILE[:LINE]` form.
+        #[arg(long, conflicts_with = "verdict")]
+        finding: Option<String>,
+        /// Object to the checker's whole non-pass verdict for this head.
+        #[arg(long)]
+        verdict: bool,
+        /// Why the finding does not apply.
+        #[arg(long)]
+        reason: String,
+        /// Repository under review (defaults to the current working tree).
+        #[arg(long, short = 'd', default_value = ".")]
+        directory: PathBuf,
+    },
+    /// List pending objections and signed rulings.
+    List,
+    /// Rule on a pending objection: sustain (finding stands) or overrule
+    /// (waived while the ledger signature verifies).
+    ///
+    /// Requires the biometric vault confirmation, then re-signs the ledger.
+    Rule {
+        id: String,
+        /// The adjudication.
+        #[arg(long, conflicts_with = "sustain")]
+        overrule: bool,
+        #[arg(long)]
+        sustain: bool,
+        /// The operator's adjudication note.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Rescind a ruling (the finding blocks again from the next run).
+    Rescind { id: String },
 }
 
 #[derive(Subcommand)]
@@ -536,6 +595,7 @@ fn main() -> ExitCode {
         Command::Lock => cmd_lock(),
         Command::Status { json } => cmd_status(json),
         Command::Config { command } => cmd_config(cli.config.as_ref(), command),
+        Command::Objection { command } => cmd_objection(command),
         Command::Install => cmd_install(),
         Command::Api {
             path,
@@ -2769,6 +2829,226 @@ fn cmd_signing_key(
     // Always succeed: git treats a non-zero exit here as a configuration error, and
     // this command only supplies a key hint. The signer itself is what refuses.
     Ok(ExitCode::SUCCESS)
+}
+
+/// File, list, rule on, and rescind objections to checker findings.
+///
+/// Filing writes an unsigned pending record; it moves nothing. Ruling or
+/// rescinding is the gated step: the biometric confirmation opens the vault,
+/// the configuration key re-signs `objections.toml`, and only a ledger whose
+/// signature verifies waives anything at audit time.
+fn cmd_objection(command: ObjectionCommand) -> anyhow::Result<ExitCode> {
+    match command {
+        ObjectionCommand::File {
+            checker,
+            finding,
+            verdict,
+            reason,
+            directory,
+        } => {
+            let slug = remote_slug(&directory, "origin").unwrap_or_default();
+            let head = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&directory)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            let mut pending = objection::load_pending().map_err(anyhow::Error::msg)?;
+            let id = format!(
+                "ob-{}-{:04x}",
+                jiff::Timestamp::now().strftime("%Y%m%d"),
+                rand::random::<u16>()
+            );
+            let entry = if verdict {
+                objection::Pending {
+                    id: id.clone(),
+                    repo: slug,
+                    checker: checker.clone(),
+                    kind: "verdict".into(),
+                    file: String::new(),
+                    line: None,
+                    fingerprint: None,
+                    head,
+                    reason: reason.clone(),
+                    filed_at: jiff::Timestamp::now().to_string(),
+                }
+            } else {
+                let spec = finding
+                    .as_deref()
+                    .context("--finding FILE[:LINE] or --verdict is required")?;
+                let (file, line) = match spec.rsplit_once(':') {
+                    Some((f, l)) if l.chars().all(|c| c.is_ascii_digit()) => {
+                        (f.to_string(), l.parse::<u64>().ok())
+                    }
+                    _ => (spec.to_string(), None),
+                };
+                let report = latest_report(&checker)
+                    .with_context(|| format!("no report.json for checker '{checker}'"))?;
+                let findings = report["findings"].as_array().cloned().unwrap_or_default();
+                let hit = findings
+                    .iter()
+                    .find(|f| {
+                        f["severity"].as_str() == Some("blocking")
+                            && f["file"].as_str() == Some(file.as_str())
+                            && line.is_none_or(|l| f["line"].as_u64() == Some(l))
+                    })
+                    .with_context(|| {
+                        format!(
+                            "no blocking finding at {file}{} in the latest {checker} report",
+                            line.map(|l| format!(":{l}")).unwrap_or_default()
+                        )
+                    })?;
+                let fingerprint = objection::fingerprint(
+                    &checker,
+                    &file,
+                    hit["line"].as_u64().unwrap_or(0),
+                    hit["evidence"].as_str().unwrap_or(""),
+                );
+                objection::Pending {
+                    id: id.clone(),
+                    repo: slug,
+                    checker: checker.clone(),
+                    kind: "finding".into(),
+                    file,
+                    line: hit["line"].as_u64(),
+                    fingerprint: Some(fingerprint),
+                    head,
+                    reason: reason.clone(),
+                    filed_at: jiff::Timestamp::now().to_string(),
+                }
+            };
+            pending.push(entry);
+            objection::write_pending(&pending).map_err(anyhow::Error::msg)?;
+            println!(
+                "filed {id} — pending until ruled: gitvault objection rule {id} --overrule|--sustain"
+            );
+        }
+        ObjectionCommand::List => {
+            let pending = objection::load_pending().map_err(anyhow::Error::msg)?;
+            let rulings = objection::load_rulings();
+            if pending.is_empty() && rulings.is_empty() {
+                println!("no objections filed");
+                return Ok(ExitCode::SUCCESS);
+            }
+            for p in &pending {
+                println!(
+                    "pending  {} {} {} {} — {}",
+                    p.id,
+                    p.checker,
+                    p.kind,
+                    if p.file.is_empty() {
+                        p.head[..8.min(p.head.len())].to_string()
+                    } else {
+                        format!("{}:{}", p.file, p.line.unwrap_or(0))
+                    },
+                    p.reason
+                );
+            }
+            for r in &rulings {
+                println!(
+                    "ruled    {} {} {} {} → {} — {}",
+                    r.id,
+                    r.checker,
+                    r.kind,
+                    if r.file.is_empty() {
+                        r.head[..8.min(r.head.len())].to_string()
+                    } else {
+                        format!("{}:{}", r.file, r.line.unwrap_or(0))
+                    },
+                    r.verdict,
+                    r.reason
+                );
+            }
+        }
+        ObjectionCommand::Rule {
+            id,
+            overrule,
+            sustain,
+            reason,
+        } => {
+            let verdict = if overrule {
+                "overruled"
+            } else if sustain {
+                "sustained"
+            } else {
+                anyhow::bail!("rule needs --overrule or --sustain");
+            };
+            let mut pending = objection::load_pending().map_err(anyhow::Error::msg)?;
+            let position = pending
+                .iter()
+                .position(|p| p.id == id)
+                .with_context(|| format!("no pending objection '{id}'"))?;
+            let p = pending.remove(position);
+            let vault = vault::Vault::open()?;
+            unlock::ensure_open(
+                &vault,
+                &format!("GitVault: confirm to {verdict} objection {id}"),
+                false,
+                None,
+            )?;
+            let key = vault.config_key()?;
+            let mut rulings = objection::load_rulings();
+            rulings.push(objection::Ruling {
+                id: p.id,
+                repo: p.repo,
+                checker: p.checker,
+                kind: p.kind,
+                file: p.file,
+                line: p.line,
+                fingerprint: p.fingerprint,
+                head: p.head,
+                verdict: verdict.into(),
+                objection: p.reason,
+                reason: reason.unwrap_or_default(),
+                ruled_at: jiff::Timestamp::now().to_string(),
+            });
+            objection::write_rulings(&rulings, &key).map_err(anyhow::Error::msg)?;
+            objection::write_pending(&pending).map_err(anyhow::Error::msg)?;
+            println!("ruled {id} {verdict}; ledger signed");
+        }
+        ObjectionCommand::Rescind { id } => {
+            let mut rulings = objection::load_rulings();
+            let before = rulings.len();
+            rulings.retain(|r| r.id != id);
+            if rulings.len() == before {
+                anyhow::bail!("no ruling '{id}'");
+            }
+            let vault = vault::Vault::open()?;
+            unlock::ensure_open(
+                &vault,
+                &format!("GitVault: confirm to rescind objection {id}"),
+                false,
+                None,
+            )?;
+            let key = vault.config_key()?;
+            objection::write_rulings(&rulings, &key).map_err(anyhow::Error::msg)?;
+            println!("rescinded {id}; ledger re-signed");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// A checker's newest report.json under its profile run history.
+fn latest_report(checker: &str) -> Option<serde_json::Value> {
+    let runs = profiles_root()
+        .join(checker)
+        .join(format!("{checker}-runs"));
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(runs).ok()?.flatten() {
+        let report = entry.path().join("report.json");
+        let Ok(meta) = report.metadata() else {
+            continue;
+        };
+        let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        if newest.as_ref().is_none_or(|(t, _)| modified > *t) {
+            newest = Some((modified, report));
+        }
+    }
+    let (_, path) = newest?;
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
 }
 
 #[cfg(test)]

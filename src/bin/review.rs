@@ -11,8 +11,13 @@
 // beside it in src/bin/ - where Cargo would auto-discover the module as yet
 // another binary. The explicit path keeps the module tree in its own
 // directory.
+// The objection ledger is signed and verified with the configuration
+// signature machinery shared with the gate binary.
 #[path = "review/conceal.rs"]
 mod conceal;
+#[allow(dead_code)]
+#[path = "../configsig.rs"]
+mod configsig;
 #[path = "review/contract.rs"]
 mod contract;
 #[path = "review/credential.rs"]
@@ -36,6 +41,12 @@ mod git;
 mod install;
 #[path = "review/manifest.rs"]
 mod manifest;
+// Operator-ruled waivers: the signed objections ledger, shared with the
+// gate binary. This crate reads rulings; the filing and signing surface
+// belongs to `gitvault objection`.
+#[allow(dead_code)]
+#[path = "../objection.rs"]
+mod objection;
 #[path = "review/ranges.rs"]
 mod ranges;
 #[path = "review/sanitize.rs"]
@@ -48,6 +59,8 @@ mod serve;
 mod stage1;
 #[path = "review/submit.rs"]
 mod submit;
+#[path = "../tempsecret.rs"]
+mod tempsecret;
 #[path = "review/util.rs"]
 mod util;
 

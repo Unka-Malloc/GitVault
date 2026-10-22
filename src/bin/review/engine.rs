@@ -705,7 +705,68 @@ fn review_target(
             }
         }
         println!("{} report: {}", contract.title, report_path.display());
-        Ok(if report["verdict"] == "pass" { 0 } else { 1 })
+        // Operator-ruled objections: only rulings in a signature-verified
+        // ledger waive anything. The sealed report keeps the checker's own
+        // verdict; the waiver record lands beside it so the run history
+        // shows exactly which operator decision stood in for a fix.
+        let passed = report["verdict"].as_str() == Some("pass");
+        let mut waived_outcome = false;
+        if !passed {
+            let repo_slug = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["remote", "get-url", "origin"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| {
+                    crate::git::slug_from_remote(String::from_utf8_lossy(&o.stdout).trim())
+                })
+                .unwrap_or_default();
+            let (waived, verdict_waived) =
+                crate::objection::waivers(&report, &contract.name, &repo_slug, &target.head);
+            let standing = report["findings"]
+                .as_array()
+                .map(|f| {
+                    f.iter()
+                        .enumerate()
+                        .filter(|(i, f)| {
+                            f["severity"].as_str() == Some("blocking") && !waived.contains(i)
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            if verdict_waived || (standing == 0 && !waived.is_empty()) {
+                waived_outcome = true;
+                let mut note = Vec::new();
+                for i in &waived {
+                    let f = &report["findings"][*i];
+                    note.push(format!(
+                        "{}:{}",
+                        f["file"].as_str().unwrap_or(""),
+                        f["line"].as_u64().unwrap_or(0)
+                    ));
+                }
+                evidence::write_json(
+                    &run_dir.join("waivers.json"),
+                    &serde_json::json!({
+                        "objection_waived": note,
+                        "verdict_waived": verdict_waived,
+                        "ledger": crate::objection::ledger_path(),
+                    }),
+                )?;
+                println!(
+                    "{}: outcome waived by signed operator ruling{}",
+                    contract.title,
+                    if note.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — waived findings: {}", note.join(", "))
+                    }
+                );
+            }
+        }
+        Ok(if passed || waived_outcome { 0 } else { 1 })
     })();
     let _ = std::fs::remove_file(run_dir.join("scope.json"));
     // A run that never finalized its receipt is refused, never pending.
