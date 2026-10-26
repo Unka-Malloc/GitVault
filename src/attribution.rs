@@ -591,6 +591,14 @@ fn rewrite_message_file(file: &std::path::Path, contents: &str) -> std::io::Resu
         staged.write_all(contents.as_bytes())?;
         staged.sync_all()?;
         staged.set_permissions(target_meta.permissions())?;
+        // The identity of the inode this process created is what the rename
+        // may land - a path-level type check alone cannot see a swap.
+        #[cfg(unix)]
+        let staged_id = {
+            use std::os::unix::fs::MetadataExt as _;
+            let meta = staged.metadata()?;
+            (meta.dev(), meta.ino())
+        };
         drop(staged);
         // The staged inode is the one checked: regular, non-symlink, created
         // by this process. Re-verify at rename time so a swap between the
@@ -601,6 +609,29 @@ fn rewrite_message_file(file: &std::path::Path, contents: &str) -> std::io::Resu
                 std::io::ErrorKind::InvalidInput,
                 "staged message file was replaced",
             ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if (staged_meta.dev(), staged_meta.ino()) != staged_id {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "staged message file was replaced",
+                ));
+            }
+            // The rename target must still be the inspected file: `.git` is
+            // attacker-writable, and a swapped name would land the staged
+            // bytes on a different inode the gate never scrubbed.
+            let current = std::fs::symlink_metadata(file)?;
+            if current.file_type().is_symlink()
+                || !current.is_file()
+                || (current.dev(), current.ino()) != (target_meta.dev(), target_meta.ino())
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "commit message file was replaced",
+                ));
+            }
         }
         std::fs::rename(&tmp, file)
     })();
@@ -886,6 +917,7 @@ mod tests {
             release_tag: None,
             release_commit: None,
             release_assets: Vec::new(),
+            inherited_fds: Vec::new(),
             commit_message_file: Some(dir.0.join("MSG")),
             commit_message_source: source.map(str::to_string),
         }

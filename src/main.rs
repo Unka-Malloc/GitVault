@@ -851,6 +851,7 @@ fn context_for(
         release_tag,
         release_commit,
         release_assets: Vec::new(),
+        inherited_fds: Vec::new(),
         commit_message_file: matches!(event, "commit-msg" | "prepare-commit-msg")
             .then(|| hook_args.first().map(PathBuf::from))
             .flatten(),
@@ -2963,21 +2964,33 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
     //    both inode and content, unlocked and refused.
     let mut staged_digests: Vec<(PathBuf, u64, [u8; 32])> = Vec::new();
     for path in &immobilise {
-        let Ok(meta) = std::fs::symlink_metadata(path) else {
-            continue;
-        };
-        if !meta.is_file() || meta.file_type().is_symlink() {
-            continue;
+        // The flag runs recursively, so the record must too: every file in a
+        // directory tree (the hooks stubs included) is hashed and pinned by
+        // inode before sudo runs, not just the tree's top-level entry.
+        let mut stack = vec![path.clone()];
+        while let Some(entry) = stack.pop() {
+            let Ok(meta) = std::fs::symlink_metadata(&entry) else {
+                continue;
+            };
+            if meta.is_dir() && !meta.file_type().is_symlink() {
+                if let Ok(children) = std::fs::read_dir(&entry) {
+                    stack.extend(children.flatten().map(|child| child.path()));
+                }
+                continue;
+            }
+            if !meta.is_file() || meta.file_type().is_symlink() {
+                continue;
+            }
+            let now = installed_digest(&entry)?;
+            if let Some(expected) = expected.get(&entry) {
+                anyhow::ensure!(
+                    &now == expected,
+                    "{} no longer holds the installed bytes before the immutable flag - refusing",
+                    entry.display()
+                );
+            }
+            staged_digests.push((entry, meta.ino(), now));
         }
-        let now = installed_digest(path)?;
-        if let Some(expected) = expected.get(path) {
-            anyhow::ensure!(
-                &now == expected,
-                "{} no longer holds the installed bytes before the immutable flag - refusing",
-                path.display()
-            );
-        }
-        staged_digests.push((path.clone(), meta.ino(), now));
     }
     let status = std::process::Command::new("sudo")
         .args(["chflags", "-R", "schg"])
@@ -3105,7 +3118,7 @@ fn cmd_api(
         raw_fields: split(raw_fields)?,
         headers,
         body,
-        data_file: None,
+        body_stream: None,
         jq,
         silent,
     };
@@ -3431,7 +3444,7 @@ fn cmd_pr(
         raw_fields,
         headers: vec![],
         body: None,
-        data_file: None,
+        body_stream: None,
         jq,
         silent: false,
     };
@@ -3529,7 +3542,7 @@ fn get(path: String, slug: String, jq: Option<String>) -> api::Request {
         raw_fields: vec![],
         headers: vec![],
         body: None,
-        data_file: None,
+        body_stream: None,
         jq,
         silent: false,
     }
@@ -3740,11 +3753,6 @@ fn cmd_release(
     // the vault is locked. Nothing reaches GitHub until the registry passes.
     let mut release_audit: Option<ReleaseAudit> = None;
     if let ReleaseCommand::Create { tag, assets, .. } = &command {
-        // Asset files are judged before the audit: a bad path refuses before
-        // any review time or credential is spent, and the bytes the scan may
-        // judge are snapshotted privately and immutably here - the same
-        // snapshot the upload will read.
-        let staged = check_release_assets(assets)?;
         let mut ctx = context_for(
             &cfg,
             "release",
@@ -3760,9 +3768,17 @@ fn cmd_release(
                      run this from the tagged working tree"
             )
         })?;
+        // Asset files are judged before the audit: a bad path refuses before
+        // any review time or credential is spent. The snapshots are staged
+        // under GitVault's private state root - proven outside this checkout
+        // - and kept open: the scan and the upload each consume a share of
+        // the same descriptor, never a replaceable path.
+        let mut staged = check_release_assets(assets, &ctx.repo_root)?;
+        staged.share_with_audit()?;
         // The audit binds the exact asset bytes: name, size, digest and the
-        // private snapshot path go into the evidence, so the privacy scan
-        // judges and the upload reads the identical byte sequence.
+        // inherited-descriptor reference go into the evidence, so the
+        // privacy scan judges and the upload reads the identical byte
+        // sequence on every platform the descriptor share exists.
         ctx.release_assets = staged
             .assets
             .iter()
@@ -3771,10 +3787,11 @@ fn cmd_release(
                     a.name.clone(),
                     a.size,
                     a.sha256.clone(),
-                    a.staged.display().to_string(),
+                    a.audit_ref.clone().unwrap_or_default(),
                 )
             })
             .collect();
+        ctx.inherited_fds = staged.shared.clone();
         let repo_root = ctx.repo_root.clone();
         let audited = ctx
             .release_commit
@@ -3880,39 +3897,6 @@ fn cmd_release(
     emit(&cfg, &vault, req)
 }
 
-/// A descriptor duplicated so a spawned curl inherits it: `--data-binary`
-/// reads `/dev/fd/N`, the same open file description the asset digest was
-/// computed on, so a path swap cannot change what is sent. `dup` clears
-/// close-on-exec, so the child sees it; the guard closes it after the
-/// request completes.
-#[cfg(unix)]
-struct InheritedFd {
-    fd: std::os::unix::io::RawFd,
-    path: PathBuf,
-}
-
-#[cfg(unix)]
-impl InheritedFd {
-    fn share(file: &std::fs::File) -> anyhow::Result<Self> {
-        use std::os::unix::io::AsRawFd as _;
-        let fd = unsafe { libc::dup(file.as_raw_fd()) };
-        anyhow::ensure!(fd >= 0, "cannot share the asset descriptor with the upload");
-        Ok(Self {
-            fd,
-            path: PathBuf::from(format!("/dev/fd/{fd}")),
-        })
-    }
-}
-
-#[cfg(unix)]
-impl Drop for InheritedFd {
-    fn drop(&mut self) {
-        unsafe {
-            libc::close(self.fd);
-        }
-    }
-}
-
 /// What a release audit settles before the create request is built: the
 /// checkout it ran in, the commit it judged, and the staged asset snapshots
 /// the audit and upload are bound to.
@@ -3924,15 +3908,19 @@ struct ReleaseAudit {
 
 /// What the release audit binds: the asset's upload name, size and content
 /// digest, computed before the audit so the evidence names the exact bytes
-/// that may be published. The upload re-hashes each file and refuses a
-/// mismatch, so the published bytes are the audited digest.
-#[derive(Debug, Clone)]
+/// that may be published. The open `fd` is the binding object: the scan
+/// inherits a share of it and the upload streams it, so no filesystem path
+/// between staging and publish can redirect either side to different bytes.
+#[derive(Debug)]
 struct ReleaseAsset {
     /// The operator's original path - diagnostics only, never read at upload
     /// time.
     path: PathBuf,
-    /// The private immutable snapshot the audit and upload bind.
-    staged: PathBuf,
+    /// The private snapshot's open descriptor, held from staging to publish.
+    fd: std::fs::File,
+    /// The `/dev/fd/N` reference the audit evidence names, once the
+    /// descriptor share for the audit child exists.
+    audit_ref: Option<String>,
     name: String,
     size: u64,
     sha256: String,
@@ -3944,46 +3932,69 @@ struct ReleaseAsset {
 const MAX_RELEASE_ASSETS: usize = 1000;
 const MAX_ASSET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// The user-immutable flag for staged asset snapshots: no privilege needed,
-/// and the file's bytes cannot change while it is set. macOS `uchg`; other
-/// platforms have no cheap equivalent and simply skip the flag - the digest
-/// binding still applies.
-#[cfg(target_os = "macos")]
-fn set_user_immutable(path: &Path, on: bool) {
-    use std::os::unix::ffi::OsStrExt as _;
-    unsafe extern "C" {
-        fn chflags(path: *const libc::c_char, flags: u32) -> i32;
-    }
-    const UF_IMMUTABLE: u32 = 0x2;
-    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
-        return;
-    };
-    unsafe {
-        chflags(path.as_ptr(), if on { UF_IMMUTABLE } else { 0 });
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn set_user_immutable(_path: &Path, _on: bool) {}
-
-/// The private directory holding immutable snapshots of the operator's
-/// asset files: the audit evidence names and the upload reads these exact
-/// bytes, never a path that could be swapped after hashing. Dropping the
-/// guard clears the flags and removes the directory.
+/// The private directory holding snapshots of the operator's asset files.
+/// Its names are an implementation detail: the audit and the upload reach
+/// the bytes through open descriptors, so a same-user process that learns
+/// or replaces a staged path cannot redirect either side. Dropping the
+/// guard closes the descriptors and removes the directory.
 #[derive(Debug)]
 struct StagedAssets {
     dir: PathBuf,
     assets: Vec<ReleaseAsset>,
+    /// Descriptor numbers reserved for the audit child's inheritance; closed
+    /// when the staged set drops.
+    shared: Vec<i32>,
 }
 
 impl Drop for StagedAssets {
     fn drop(&mut self) {
-        if let Ok(entries) = std::fs::read_dir(&self.dir) {
-            for entry in entries.flatten() {
-                set_user_immutable(&entry.path(), false);
+        #[cfg(unix)]
+        for fd in &self.shared {
+            unsafe {
+                libc::close(*fd);
             }
         }
         let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+impl StagedAssets {
+    /// Reserve one descriptor number per asset for the audit child to
+    /// inherit. `F_DUPFD_CLOEXEC` keeps the duplicate out of unrelated
+    /// spawns until the gate's pre-exec clears the flag; the `/dev/fd/N`
+    /// reference it yields is inode-bound, so the scanner reads exactly the
+    /// bytes the upload will send, whatever happens to the staged path.
+    #[cfg(unix)]
+    fn share_with_audit(&mut self) -> anyhow::Result<()> {
+        use std::io::Seek as _;
+        use std::os::unix::io::AsRawFd as _;
+        for (index, asset) in self.assets.iter_mut().enumerate() {
+            // The share duplicates the description, offset included: rewind
+            // before it is reserved so the scanner's first read starts the
+            // bytes, not the end of them.
+            asset.fd.rewind()?;
+            let fd =
+                unsafe { libc::fcntl(asset.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 100 + index) };
+            anyhow::ensure!(
+                fd >= 0,
+                "cannot share the staged asset '{}' with the audit",
+                asset.name
+            );
+            self.shared.push(fd);
+            asset.audit_ref = Some(format!("/dev/fd/{fd}"));
+        }
+        Ok(())
+    }
+
+    /// Descriptor inheritance is what binds the scan to the upload; where it
+    /// cannot be established, a release with assets must refuse rather than
+    /// fall back to a path a same-user process could swap.
+    #[cfg(not(unix))]
+    fn share_with_audit(&mut self) -> anyhow::Result<()> {
+        if self.assets.is_empty() {
+            return Ok(());
+        }
+        anyhow::bail!("release assets need descriptor-bound staging, which this platform lacks")
     }
 }
 
@@ -3991,6 +4002,7 @@ impl Drop for StagedAssets {
 /// hashing must stay constant-memory however large the audited asset is.
 /// Reading through an already-open handle binds the digest to that inode,
 /// not to a path that could be swapped before the upload reads it again.
+#[cfg(test)]
 fn sha256_reader(mut source: impl std::io::Read) -> anyhow::Result<String> {
     use sha2::Digest as _;
     let mut hasher = sha2::Sha256::new();
@@ -4009,28 +4021,116 @@ fn sha256_reader(mut source: impl std::io::Read) -> anyhow::Result<String> {
         .collect())
 }
 
+#[cfg(test)]
 fn sha256_file(path: &Path) -> anyhow::Result<String> {
     let file =
         std::fs::File::open(path).with_context(|| format!("cannot hash '{}'", path.display()))?;
     sha256_reader(file).with_context(|| format!("cannot hash '{}'", path.display()))
 }
 
+/// Open an asset source for a single judged read: `O_NOFOLLOW` refuses a
+/// symlink swapped in after the caller's own checks, `O_NONBLOCK` keeps a
+/// FIFO from holding the open forever, and the shape/size judgement then
+/// happens on the descriptor itself rather than a re-looked-up path.
+#[cfg(unix)]
+fn open_asset_source(path: &Path) -> anyhow::Result<std::fs::File> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::io::FromRawFd as _;
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("--asset '{}' is not a readable file", path.display()))?;
+    let fd = unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    anyhow::ensure!(
+        fd >= 0,
+        "--asset '{}' is not a readable file",
+        path.display()
+    );
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(not(unix))]
+fn open_asset_source(path: &Path) -> anyhow::Result<std::fs::File> {
+    std::fs::File::open(path)
+        .with_context(|| format!("--asset '{}' is not a readable file", path.display()))
+}
+
+/// The private root staged asset snapshots live under: GitVault's own state
+/// directory, never `TMPDIR`. A staging root the environment selects could
+/// resolve inside the checkout and let generated snapshots enter the
+/// audited tree; this root is fixed and compared against the canonical
+/// repository before a byte is written.
+fn release_staging_root() -> PathBuf {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| configsig::home_dir().join(".local").join("state"));
+    base.join("gitvault").join("staging")
+}
+
 /// Pair each `--asset` file with the name GitHub will store - the file's
 /// basename - plus the size and digest that bind its bytes to the audit.
 /// Run before the release is created so a bad path or a duplicate upload
 /// name refuses before anything is published.
-fn check_release_assets(paths: &[PathBuf]) -> anyhow::Result<StagedAssets> {
+fn check_release_assets(paths: &[PathBuf], repo_root: &Path) -> anyhow::Result<StagedAssets> {
+    stage_release_assets(paths, repo_root, &release_staging_root())
+}
+
+fn stage_release_assets(
+    paths: &[PathBuf],
+    repo_root: &Path,
+    staging_root: &Path,
+) -> anyhow::Result<StagedAssets> {
     anyhow::ensure!(
         paths.len() <= MAX_RELEASE_ASSETS,
         "a release carries at most {MAX_RELEASE_ASSETS} assets; {} were given",
         paths.len()
     );
-    // Every asset is snapshotted into a private, immutable copy before the
-    // audit: the privacy scan judges and the upload reads these exact
-    // bytes, so the original path cannot be swapped, edited or redirected
-    // between the check and the wire.
-    let dir = std::env::temp_dir().join(format!(
-        "gitvault-release-{}-{:x}",
+    // Nothing to stage: no directory is created and the staging-root
+    // boundary check does not run, so a bare release does not depend on
+    // where the state root happens to resolve.
+    if paths.is_empty() {
+        return Ok(StagedAssets {
+            dir: staging_root.join("release-empty"),
+            assets: Vec::new(),
+            shared: Vec::new(),
+        });
+    }
+    // Every asset is snapshotted into a private copy before the audit and
+    // kept open until publication ends: the scan inherits a descriptor share
+    // and the upload streams the same open file, so neither side ever trusts
+    // a filesystem path a same-user process could replace. The staging root
+    // must sit outside the audited checkout - generated bytes inside the
+    // review boundary would contaminate what the audit scans.
+    let repo_canonical = repo_root
+        .canonicalize()
+        .with_context(|| format!("cannot resolve repository {}", repo_root.display()))?;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(staging_root).with_context(|| {
+        format!(
+            "cannot create asset staging root {}",
+            staging_root.display()
+        )
+    })?;
+    let root_canonical = staging_root
+        .canonicalize()
+        .with_context(|| format!("cannot resolve staging root {}", staging_root.display()))?;
+    anyhow::ensure!(
+        !root_canonical.starts_with(&repo_canonical),
+        "asset staging root {} resolves inside the audited repository {} - refusing",
+        staging_root.display(),
+        repo_root.display()
+    );
+    let dir = staging_root.join(format!(
+        "release-{}-{:x}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4049,6 +4149,7 @@ fn check_release_assets(paths: &[PathBuf]) -> anyhow::Result<StagedAssets> {
     let mut staged = StagedAssets {
         dir,
         assets: Vec::with_capacity(paths.len()),
+        shared: Vec::with_capacity(paths.len()),
     };
     for (index, path) in paths.iter().enumerate() {
         let name = path
@@ -4062,12 +4163,16 @@ fn check_release_assets(paths: &[PathBuf]) -> anyhow::Result<StagedAssets> {
             !staged.assets.iter().any(|a| a.name == name),
             "--asset names the upload '{name}' twice"
         );
-        // Shape and size gate the read: a FIFO or an over-limit file is
-        // refused before a byte is consumed.
-        let meta = std::fs::symlink_metadata(path)
+        // The source is opened once with no-follow semantics and judged on
+        // that descriptor: a swap after a path-level check cannot turn a
+        // regular file into a FIFO or a larger file mid-read.
+        let mut source = open_asset_source(path)
+            .with_context(|| format!("--asset '{}' is not a readable file", path.display()))?;
+        let meta = source
+            .metadata()
             .with_context(|| format!("--asset '{}' is not a readable file", path.display()))?;
         anyhow::ensure!(
-            meta.is_file() && !meta.file_type().is_symlink(),
+            meta.is_file(),
             "--asset '{}' is not a regular file",
             path.display()
         );
@@ -4076,20 +4181,61 @@ fn check_release_assets(paths: &[PathBuf]) -> anyhow::Result<StagedAssets> {
             "--asset '{}' exceeds the 2 GiB release-asset limit",
             path.display()
         );
-        let sha256 = sha256_file(path)
-            .with_context(|| format!("--asset '{}' is not a readable file", path.display()))?;
+        // The snapshot is private from the instant it exists: mode 0600 is
+        // applied by the create itself, not repaired afterwards, and the
+        // handle stays open as the descriptor the audit and upload bind.
         let snapshot = staged.dir.join(format!("{index:04}"));
-        std::fs::copy(path, &snapshot)
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&snapshot)
             .with_context(|| format!("cannot stage asset '{}'", path.display()))?;
-        anyhow::ensure!(
-            sha256_file(&snapshot).unwrap_or_default() == sha256,
-            "the staged snapshot of '{}' did not keep the audited bytes",
-            path.display()
-        );
-        set_user_immutable(&snapshot, true);
+        // One pass does the copy and the digest together: the hash describes
+        // the bytes that actually landed in the snapshot, so the staged
+        // digest is the audited digest by construction. The read is still
+        // bounded - a source that grows mid-copy cannot exceed the cap.
+        let sha256 = {
+            use sha2::Digest as _;
+            use std::io::Read as _;
+            let mut hasher = sha2::Sha256::new();
+            let mut buffer = [0u8; 64 * 1024];
+            let mut total = 0u64;
+            loop {
+                let read = source
+                    .read(&mut buffer)
+                    .with_context(|| format!("cannot stage asset '{}'", path.display()))?;
+                if read == 0 {
+                    break;
+                }
+                total += read as u64;
+                anyhow::ensure!(
+                    total < MAX_ASSET_BYTES,
+                    "--asset '{}' exceeds the 2 GiB release-asset limit",
+                    path.display()
+                );
+                use std::io::Write as _;
+                file.write_all(&buffer[..read])
+                    .with_context(|| format!("cannot stage asset '{}'", path.display()))?;
+                hasher.update(&buffer[..read]);
+            }
+            hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        file.sync_all()
+            .with_context(|| format!("cannot stage asset '{}'", path.display()))?;
+        std::io::Seek::rewind(&mut file)?;
         staged.assets.push(ReleaseAsset {
             path: path.clone(),
-            staged: snapshot,
+            fd: file,
+            audit_ref: None,
             name: name.to_string(),
             size: meta.len(),
             sha256,
@@ -4140,20 +4286,16 @@ fn create_release_staged(
     }
     let upload = (|| -> anyhow::Result<()> {
         for asset in staged.assets {
-            // The published bytes must be the audited digest - and they must
-            // be these exact bytes: the hash runs on the open handle of the
-            // private immutable snapshot and the upload hands curl that same
-            // descriptor, so a path swap between audit and upload cannot
-            // ride the release.
-            let mut file = std::fs::File::open(&asset.staged)
-                .with_context(|| format!("cannot open staged asset '{}'", asset.path.display()))?;
-            let now = sha256_reader(&file)?;
-            anyhow::ensure!(
-                now == asset.sha256,
-                "asset '{}' changed after the audit ({}) - refusing to publish it",
-                asset.name,
-                asset.path.display()
-            );
+            // The published bytes must be the audited bytes: the descriptor
+            // held since staging is streamed into curl and hashed on the
+            // wire, so nothing between the audit and the request - not a
+            // path swap and not a write to the staged inode - can publish
+            // bytes the scan did not judge. The rewind matters: the audit's
+            // descriptor share leaves the offset wherever the scan ended.
+            let mut file = asset
+                .fd
+                .try_clone()
+                .with_context(|| format!("cannot read staged asset '{}'", asset.path.display()))?;
             std::io::Seek::rewind(&mut file)?;
             let mut up = get(
                 format!(
@@ -4165,20 +4307,18 @@ fn create_release_staged(
                 Some(".browser_download_url".into()),
             );
             up.method = "POST".into();
-            #[cfg(unix)]
-            let _shared = {
-                let shared = InheritedFd::share(&file)?;
-                up.data_file = Some(shared.path.clone());
-                shared
-            };
-            #[cfg(not(unix))]
-            {
-                up.data_file = Some(asset.staged.clone());
-            }
             up.headers
                 .push("Content-Type: application/octet-stream".into());
-            let url = api::run_value(cfg, vault, &up)
+            up.headers.push(format!("Content-Length: {}", asset.size));
+            up.body_stream = Some(file);
+            let (url, sent) = api::run_value_streamed(cfg, vault, &up)
                 .with_context(|| format!("uploading release asset '{}'", asset.name))?;
+            anyhow::ensure!(
+                sent == asset.sha256,
+                "asset '{}' sent bytes that diverge from the audited digest ({}) - refusing",
+                asset.name,
+                asset.path.display()
+            );
             println!("{}", url.trim());
         }
         Ok(())
@@ -4577,7 +4717,8 @@ mod tests {
     use super::{
         MAX_ASSET_BYTES, MAX_RELEASE_ASSETS, branch_for_api, check_release_assets,
         fetch_remote_ref, local_pr_base, outgoing_push_stdin, parse_push_args, publication_surface,
-        push_plan, remote_mirrors, sha256_file, verify_remote_tag,
+        push_plan, remote_mirrors, sha256_file, sha256_reader, stage_release_assets,
+        verify_remote_tag,
     };
     use std::path::PathBuf;
     use std::process::Command;
@@ -4871,25 +5012,90 @@ mod tests {
     /// `--asset` files are paired with their basename before the release is
     /// created, so a missing file or a directory refuses before anything is
     /// published. The digest is what binds the audited bytes to the upload,
-    /// and the private immutable snapshot is what the scan and the upload
-    /// both read - the operator's original path is evidence only.
+    /// and the open descriptor is what the scan and the upload both consume -
+    /// the operator's original path is evidence only.
     #[test]
     fn release_assets_are_checked_before_the_create() {
         let root = scratch("release-assets");
         let file = root.join("app-v1.0.zip");
         std::fs::write(&file, b"zip").unwrap();
-        let staged = check_release_assets(std::slice::from_ref(&file)).unwrap();
+        let staged = check_release_assets(std::slice::from_ref(&file), &root).unwrap();
         assert_eq!(staged.assets.len(), 1);
         assert_eq!(staged.assets[0].name, "app-v1.0.zip");
         assert_eq!(staged.assets[0].size, 3);
         assert_eq!(staged.assets[0].sha256.len(), 64);
-        // The snapshot holds the same bytes and outlives the source: the
-        // upload binds the snapshot, so a swapped original changes nothing.
-        assert_eq!(std::fs::read(&staged.assets[0].staged).unwrap(), b"zip");
-        std::fs::write(&file, b"poisoned").unwrap();
-        assert_eq!(std::fs::read(&staged.assets[0].staged).unwrap(), b"zip");
-        assert!(check_release_assets(&[root.join("missing.bin")]).is_err());
-        assert!(check_release_assets(std::slice::from_ref(&root)).is_err());
+        assert!(check_release_assets(&[root.join("missing.bin")], &root).is_err());
+        assert!(check_release_assets(std::slice::from_ref(&root), &root).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The binding is the open descriptor, not the staged path: an attacker
+    /// who replaces the staged file's bytes - or swaps the path itself for
+    /// another file - cannot move the held descriptor off the audited inode.
+    /// The scan reads and the upload re-hashes that same description.
+    #[cfg(unix)]
+    #[test]
+    fn staged_descriptor_survives_a_path_swap() {
+        let root = scratch("release-asset-swap");
+        let file = root.join("app-v1.0.zip");
+        std::fs::write(&file, b"zip").unwrap();
+        let mut staged = check_release_assets(std::slice::from_ref(&file), &root).unwrap();
+        let digest = staged.assets[0].sha256.clone();
+        // Swap the staged path for clean bytes, then "restore" it - the
+        // sequence the published-digest check once trusted.
+        let staged_path = staged.dir.join("0000");
+        let aside = staged.dir.join("swapped");
+        std::fs::rename(&staged_path, &aside).unwrap();
+        std::fs::write(&staged_path, b"clean").unwrap();
+        let file = staged.assets[0].fd.try_clone().unwrap();
+        assert_eq!(sha256_reader(&file).unwrap(), digest);
+        // The audit's own share reaches the same inode through /dev/fd.
+        staged.share_with_audit().unwrap();
+        let audit = staged.assets[0].audit_ref.clone().unwrap();
+        assert!(audit.starts_with("/dev/fd/"), "{audit}");
+        assert_eq!(
+            sha256_reader(std::fs::File::open(&audit).unwrap()).unwrap(),
+            digest
+        );
+        assert!(!staged.shared.is_empty());
+        std::fs::rename(&aside, &staged_path).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A write to the staged inode itself - the shape a concurrent-writer
+    /// attack takes once the path is out of reach - lands on the same
+    /// descriptor the upload streams and hashes, so the sent digest can
+    /// never quietly match the audited one.
+    #[cfg(unix)]
+    #[test]
+    fn staged_inode_writes_change_the_streamed_digest() {
+        let root = scratch("release-asset-write");
+        let file = root.join("app-v1.0.zip");
+        std::fs::write(&file, b"zip").unwrap();
+        let staged = check_release_assets(std::slice::from_ref(&file), &root).unwrap();
+        let digest = staged.assets[0].sha256.clone();
+        // Truncating the staged path writes the same inode the held
+        // descriptor reads; the stream hashes what it actually sent.
+        std::fs::write(staged.dir.join("0000"), b"mutated").unwrap();
+        let file = staged.assets[0].fd.try_clone().unwrap();
+        assert_ne!(sha256_reader(&file).unwrap(), digest);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A staging root that resolves inside the audited checkout would let
+    /// generated snapshots contaminate the review boundary; it refuses
+    /// before any byte is written.
+    #[test]
+    fn staging_inside_the_repository_refuses() {
+        let root = scratch("release-staging-inside");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let file = root.join("app-v1.0.zip");
+        std::fs::write(&file, b"zip").unwrap();
+        let err = stage_release_assets(std::slice::from_ref(&file), &repo, &repo.join("staged"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("inside the audited repository"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4902,7 +5108,8 @@ mod tests {
         let many: Vec<PathBuf> = (0..=MAX_RELEASE_ASSETS)
             .map(|i| PathBuf::from(format!("/definitely/missing/{i}.bin")))
             .collect();
-        let err = check_release_assets(&many).unwrap_err().to_string();
+        let root = scratch("release-asset-count");
+        let err = check_release_assets(&many, &root).unwrap_err().to_string();
         assert!(err.contains("1000"), "{err}");
 
         let root = scratch("release-asset-size");
@@ -4912,7 +5119,7 @@ mod tests {
         let file = std::fs::File::create(&big).unwrap();
         file.set_len(MAX_ASSET_BYTES).unwrap();
         drop(file);
-        let err = check_release_assets(std::slice::from_ref(&big))
+        let err = check_release_assets(std::slice::from_ref(&big), &root)
             .unwrap_err()
             .to_string();
         assert!(err.contains("2 GiB"), "{err}");

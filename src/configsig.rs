@@ -183,13 +183,49 @@ fn has_extended_acl(path: &Path) -> bool {
     unsafe {
         let acl = acl_get_link_np(path.as_ptr(), ACL_TYPE_EXTENDED);
         if acl.is_null() {
-            return false;
+            // A null result is only "no extended ACL" when the query says
+            // so: ENOENT is the documented no-list outcome. Any other error
+            // means the ACL could not be inspected, and an uninspectable
+            // ACL may grant write access - fail closed.
+            return std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT);
         }
         let mut entry = std::ptr::null_mut();
         let present = acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) == 0;
         acl_free(acl);
         present
     }
+}
+
+/// Linux exposes extended ACLs through the `system.posix_acl_access` xattr:
+/// its presence means entries beyond the mode bits exist. A listing that
+/// fails is not proof of absence - fail closed like the macOS query.
+#[cfg(target_os = "linux")]
+fn has_extended_acl(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return true;
+    };
+    unsafe {
+        let needed = libc::llistxattr(path.as_ptr(), std::ptr::null_mut(), 0);
+        if needed <= 0 {
+            return needed < 0;
+        }
+        let mut list = vec![0u8; needed as usize];
+        let got = libc::llistxattr(path.as_ptr(), list.as_mut_ptr().cast(), list.len());
+        if got < 0 {
+            return true;
+        }
+        list[..got as usize]
+            .split(|b| *b == 0)
+            .any(|name| name == b"system.posix_acl_access")
+    }
+}
+
+/// Where no ACL primitive is known, a path cannot be proven protected:
+/// report it writable rather than bless an ancestor nobody inspected.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn has_extended_acl(_path: &Path) -> bool {
+    true
 }
 
 /// Whether any ancestor of `path` lets a non-root user rename entries. A
@@ -208,6 +244,12 @@ fn path_is_user_replaceable(path: &Path) -> bool {
         // can rename the directory's entries. Root-owned 0755 chains are the
         // trusted shape (`/usr`, `/usr/bin`).
         if meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+            return true;
+        }
+        // An extended ACL can grant write to a non-root principal even on a
+        // root-owned 0755 directory - mode bits alone cannot see it, and an
+        // ancestor that cannot be inspected is not provably protected.
+        if has_extended_acl(d) {
             return true;
         }
         dir = d.parent();

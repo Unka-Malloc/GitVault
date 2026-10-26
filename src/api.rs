@@ -187,10 +187,11 @@ pub struct Request {
     pub raw_fields: Vec<(String, String)>,
     pub headers: Vec<String>,
     pub body: Option<String>,
-    /// A file whose bytes become the request body (`curl --data-binary @path`).
-    /// Release assets ride this: they are binary, can be large, and the upload
-    /// endpoint wants the raw file rather than a JSON document.
-    pub data_file: Option<std::path::PathBuf>,
+    /// A descriptor whose bytes we stream into the request body ourselves:
+    /// curl reads a pipe, we write it while hashing, so the bytes on the
+    /// wire are provably the bytes the digest was computed on. Mutually
+    /// exclusive with `body`.
+    pub body_stream: Option<std::fs::File>,
     pub jq: Option<String>,
     pub silent: bool,
 }
@@ -312,13 +313,34 @@ fn authorize(cfg: &Config, target: &Target, vault: &Vault) -> Result<String> {
 
 /// Authorize, send the request and return the HTTP status and response body.
 /// Output policy (printing, jq, error reporting) is the caller's choice.
-fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, String)> {
+fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, String, Option<String>)> {
     // The request path is validated before any credential is touched: an
     // absolute URL under a different origin would carry the account token to a
     // host the caller chose. Relative paths always resolve under API_ROOT.
     let mut url = request_url(&req.path)?;
 
     let token = authorize(cfg, &req.target, vault)?;
+
+    // A streamed body is piped into curl: the read end becomes its
+    // `--data-binary` source, the write end is where we feed and hash the
+    // descriptor. The pipe exists before the arguments so the descriptor
+    // number can be named in them.
+    #[cfg(unix)]
+    let (pipe_read, pipe_write) = if req.body_stream.is_some() {
+        let mut fds = [0i32; 2];
+        anyhow::ensure!(
+            unsafe { libc::pipe(fds.as_mut_ptr()) } == 0,
+            "cannot pipe the request body"
+        );
+        (fds[0], fds[1])
+    } else {
+        (-1, -1)
+    };
+    #[cfg(not(unix))]
+    anyhow::ensure!(
+        req.body_stream.is_none(),
+        "a streamed request body is not supported on this platform"
+    );
 
     let mut args: Vec<String> = vec![
         "-sS".into(),
@@ -354,11 +376,12 @@ fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, String)> 
             let sep = if url.contains('?') { '&' } else { '?' };
             url.push_str(&format!("{sep}{}", query.join("&")));
         }
-    } else if req.body.is_some() && req.data_file.is_some() {
-        bail!("a request cannot carry both an inline body and a file body");
-    } else if let Some(file) = &req.data_file {
-        // curl reads the file itself, so an asset never enters argv or memory;
-        // octet-stream is the fallback when the caller names no content type.
+    } else if req.body.is_some() && req.body_stream.is_some() {
+        bail!("a request cannot carry both an inline body and a streamed body");
+    } else if req.body_stream.is_some() {
+        // curl reads the pipe as the request body; we stream the descriptor
+        // into it and hash every byte on its way to the wire. Octet-stream
+        // is the fallback when the caller names no content type.
         let content_type_set = req.headers.iter().any(|h| {
             h.split_once(':')
                 .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("content-type"))
@@ -368,7 +391,7 @@ fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, String)> 
             args.push("Content-Type: application/octet-stream".into());
         }
         args.push("--data-binary".into());
-        args.push(format!("@{}", file.display()));
+        args.push(format!("@/dev/fd/{pipe_read}"));
     } else if let Some(body) = &req.body {
         // The API only accepts JSON bodies, so an --input payload gets the
         // type declared unless the caller already named one - a manual -H
@@ -419,6 +442,56 @@ fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, String)> 
         writeln!(stdin, "Authorization: Bearer {token}")?;
         writeln!(stdin, "Accept: application/vnd.github+json")?;
     }
+    // curl reads `-H @-` until our end of stdin closes. A streamed body
+    // cannot start flowing until curl is past that read, so our stdin handle
+    // drops here rather than inside wait_with_output.
+    drop(child.stdin.take());
+
+    // The streamed body is written while curl reads it: every byte the wire
+    // carries also passes the digest, so the hash describes what was sent,
+    // not what a file contained at some earlier check.
+    #[cfg(unix)]
+    let sent_digest = if let Some(source) = req.body_stream.as_ref() {
+        use sha2::Digest as _;
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::io::FromRawFd as _;
+        let mut source = source;
+        let mut writer = unsafe { std::fs::File::from_raw_fd(pipe_write) };
+        let mut hasher = sha2::Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        let result = (|| -> Result<String> {
+            loop {
+                let read = source.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                writer.write_all(&buffer[..read])?;
+                hasher.update(&buffer[..read]);
+            }
+            Ok(hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect())
+        })();
+        // Closing the write end is how curl learns the body ended - even on
+        // a stream failure, so the child cannot wait on a pipe we abandoned.
+        drop(writer);
+        unsafe {
+            libc::close(pipe_read);
+        }
+        match result {
+            Ok(digest) => Some(digest),
+            Err(why) => {
+                let _ = child.wait_with_output();
+                return Err(why.context("could not stream the request body"));
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let sent_digest: Option<String> = None;
 
     let out = child.wait_with_output().context("curl failed")?;
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
@@ -433,11 +506,11 @@ fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, String)> 
     if status == 0 {
         bail!("request did not complete\n{}", stderr.trim());
     }
-    Ok((status, body))
+    Ok((status, body, sent_digest))
 }
 
 pub fn run(cfg: &Config, vault: &Vault, req: &Request) -> Result<i32> {
-    let (status, body) = perform(cfg, vault, req)?;
+    let (status, body, _sent) = perform(cfg, vault, req)?;
     if status >= 400 {
         // Relay the API's own message: it is the most useful thing to show, and it
         // never contains the token.
@@ -463,7 +536,7 @@ pub fn run(cfg: &Config, vault: &Vault, req: &Request) -> Result<i32> {
 /// resolving an owner's account type before choosing a list endpoint) use this;
 /// the credential handling is identical to `run`.
 pub fn run_value(cfg: &Config, vault: &Vault, req: &Request) -> Result<String> {
-    let (status, body) = perform(cfg, vault, req)?;
+    let (status, body, _sent) = perform(cfg, vault, req)?;
     if status >= 400 {
         bail!("HTTP {status}: {}", body.trim());
     }
@@ -471,6 +544,27 @@ pub fn run_value(cfg: &Config, vault: &Vault, req: &Request) -> Result<String> {
         Some(expr) => apply_jq(&body, expr),
         None => Ok(body),
     }
+}
+
+/// Like `run_value`, but for a request whose body rides `body_stream`: the
+/// caller also gets the digest of the exact bytes curl was fed, so an
+/// upload can prove it carried the audited bytes rather than bytes a file
+/// once held.
+#[cfg(unix)]
+pub fn run_value_streamed(cfg: &Config, vault: &Vault, req: &Request) -> Result<(String, String)> {
+    anyhow::ensure!(
+        req.body_stream.is_some(),
+        "a streamed upload needs its source descriptor"
+    );
+    let (status, body, sent) = perform(cfg, vault, req)?;
+    if status >= 400 {
+        bail!("HTTP {status}: {}", body.trim());
+    }
+    let value = match &req.jq {
+        Some(expr) => apply_jq(&body, expr)?,
+        None => body,
+    };
+    Ok((value, sent.unwrap_or_default()))
 }
 
 /// Percent-encode one query component. Unreserved characters pass through;

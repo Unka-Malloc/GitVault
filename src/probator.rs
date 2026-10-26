@@ -1178,6 +1178,7 @@ fn run_gate(
     action: &Value,
     ledger: Option<&Path>,
     anchor: Option<&Path>,
+    shared: &[i32],
 ) -> Result<Vec<Value>, String> {
     let mut engine = command(binary);
     engine
@@ -1185,6 +1186,26 @@ fn run_gate(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Staged asset bytes reach the scanner through these descriptors, not
+    // through a filesystem path. The parent reserved each number with
+    // F_DUPFD_CLOEXEC; clearing the flag here, after fork and before exec,
+    // is what lets the descriptor ride the spawn boundary and every exec
+    // beneath it to the checker agent.
+    #[cfg(unix)]
+    if !shared.is_empty() {
+        use std::os::unix::process::CommandExt as _;
+        let shared = shared.to_vec();
+        unsafe {
+            engine.pre_exec(move || {
+                for fd in &shared {
+                    if libc::fcntl(*fd, libc::F_SETFD, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
     // The rulings are GitVault's signed operator authority; Probator verifies
     // them against the same anchor the routing table uses. An absent ledger or
     // unarmed anchor simply waives nothing. They are set after the minimal
@@ -1271,7 +1292,13 @@ pub fn gates(ctx: &Context) -> Vec<CheckerOutcome> {
     let anchor = crate::configsig::anchor_path();
     let mut findings = Vec::new();
     for action in actions {
-        match run_gate(&binary, &action, Some(&ledger), Some(&anchor)) {
+        match run_gate(
+            &binary,
+            &action,
+            Some(&ledger),
+            Some(&anchor),
+            &ctx.inherited_fds,
+        ) {
             Ok(mut batch) => findings.append(&mut batch),
             Err(why) => return vec![blocking("probator", why, started)],
         }
@@ -1281,7 +1308,7 @@ pub fn gates(ctx: &Context) -> Vec<CheckerOutcome> {
     // actually spent - invocations, retries, usage and kept receipts live in
     // those report directories. Naming them in the outcome makes that cost
     // evidence reachable instead of leaving it unverifiable.
-    let sealed = sealed_runs_since(&profiles_root(), started);
+    let sealed = sealed_runs_since(&profiles_root(), started, ctx.repo_slug.as_deref());
     if !sealed.is_empty() {
         let note = format!(
             "audit evidence sealed under {}: {}",
@@ -1300,8 +1327,11 @@ pub fn gates(ctx: &Context) -> Vec<CheckerOutcome> {
 }
 
 /// The engine runs sealed since `started`, as `<checker>/<run>` names. These
-/// are the receipts a cost review verifies the external audit against.
-fn sealed_runs_since(profiles: &Path, started: Instant) -> Vec<String> {
+/// are the receipts a cost review verifies the external audit against. A run
+/// is only claimed when its sealed report names this repository - mtime
+/// alone cannot tell this gate's runs from a concurrent audit elsewhere,
+/// though the repository lock already serializes two audits of one repo.
+fn sealed_runs_since(profiles: &Path, started: Instant, slug: Option<&str>) -> Vec<String> {
     let cutoff = std::time::SystemTime::now()
         .checked_sub(started.elapsed())
         .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
@@ -1310,21 +1340,36 @@ fn sealed_runs_since(profiles: &Path, started: Instant) -> Vec<String> {
         return sealed;
     };
     for profile in profiles_dir.flatten() {
-        let Ok(runs) = std::fs::read_dir(profile.path().join("runs")) else {
+        let checker = profile.file_name().to_string_lossy().into_owned();
+        let Ok(runs) = std::fs::read_dir(profile.path().join(format!("{checker}-runs"))) else {
             continue;
         };
         for run in runs.flatten() {
-            let fresh = std::fs::metadata(run.path())
+            // Only a sealed report counts, and only one fresh since this
+            // gate began.
+            let report = run.path().join("report.json");
+            let fresh = std::fs::metadata(&report)
                 .and_then(|meta| meta.modified())
                 .map(|modified| modified >= cutoff)
                 .unwrap_or(false);
-            if fresh {
-                sealed.push(format!(
-                    "{}/{}",
-                    profile.file_name().to_string_lossy(),
-                    run.file_name().to_string_lossy()
-                ));
+            if !fresh {
+                continue;
             }
+            if let Some(slug) = slug {
+                let repo = std::fs::read_to_string(&report)
+                    .ok()
+                    .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                    .and_then(|value| {
+                        value
+                            .get("repo")
+                            .and_then(|repo| repo.as_str())
+                            .map(str::to_owned)
+                    });
+                if repo.as_deref() != Some(slug) {
+                    continue;
+                }
+            }
+            sealed.push(format!("{checker}/{}", run.file_name().to_string_lossy()));
         }
     }
     sealed.sort();
@@ -1356,6 +1401,7 @@ mod tests {
             release_tag: None,
             release_commit: None,
             release_assets: Vec::new(),
+            inherited_fds: Vec::new(),
             commit_message_file: None,
             commit_message_source: None,
         }
@@ -2149,16 +2195,25 @@ mod tests {
     #[test]
     fn a_gate_that_answers_with_json_is_parsed() {
         let bin = stub("cat >/dev/null; printf '[{\"severity\":\"high\",\"message\":\"x: y\"}]'");
-        let findings = run_gate(&bin, &json!({}), None, None).unwrap();
+        let findings = run_gate(&bin, &json!({}), None, None, &[]).unwrap();
         assert_eq!(findings.len(), 1);
         let _ = std::fs::remove_dir_all(bin.parent().unwrap());
     }
 
     #[test]
     fn a_missing_or_failing_gate_is_an_error_not_a_pass() {
-        assert!(run_gate(Path::new("/nonexistent/probator"), &json!({}), None, None).is_err());
+        assert!(
+            run_gate(
+                Path::new("/nonexistent/probator"),
+                &json!({}),
+                None,
+                None,
+                &[]
+            )
+            .is_err()
+        );
         let bin = stub("cat >/dev/null; echo 'gate exploded' >&2; exit 1");
-        let err = run_gate(&bin, &json!({}), None, None).unwrap_err();
+        let err = run_gate(&bin, &json!({}), None, None, &[]).unwrap_err();
         assert!(err.contains("gate exploded"), "{err}");
         let _ = std::fs::remove_dir_all(bin.parent().unwrap());
     }
@@ -2166,7 +2221,7 @@ mod tests {
     #[test]
     fn a_non_array_answer_is_an_error() {
         let bin = stub("cat >/dev/null; printf '{\"not\":\"an array\"}'");
-        let err = run_gate(&bin, &json!({}), None, None).unwrap_err();
+        let err = run_gate(&bin, &json!({}), None, None, &[]).unwrap_err();
         assert!(err.contains("not a findings array"), "{err}");
         let _ = std::fs::remove_dir_all(bin.parent().unwrap());
     }
@@ -2175,7 +2230,7 @@ mod tests {
     fn empty_output_is_an_error_not_an_empty_pass() {
         // A gate that exits 0 but prints nothing has not produced evidence.
         let bin = stub("cat >/dev/null");
-        let err = run_gate(&bin, &json!({}), None, None).unwrap_err();
+        let err = run_gate(&bin, &json!({}), None, None, &[]).unwrap_err();
         assert!(err.contains("not JSON"), "{err}");
         let _ = std::fs::remove_dir_all(bin.parent().unwrap());
     }

@@ -380,10 +380,17 @@ fn migrate_legacy_policy_file(legacy: &Path, target: &Path) -> Result<Option<Leg
             );
         }
         Err(_) => {
-            let staged = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(target);
+            // The exclusive create must also carry the private mode: under a
+            // permissive umask a plain create leaves the window between open
+            // and chmod world-readable while the policy bytes are written.
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            let staged = options.open(target);
             let mut staged = match staged {
                 Ok(file) => file,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {

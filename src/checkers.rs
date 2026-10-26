@@ -68,10 +68,16 @@ pub struct Context {
     pub release_tag: Option<String>,
     pub release_commit: Option<String>,
     /// For `release`: the assets bound to this release as
-    /// `(name, size, sha256, staged_path)` tuples, snapshotted privately and
+    /// `(name, size, sha256, staged_ref)` tuples, snapshotted privately and
     /// hashed before the audit so the evidence names the exact bytes the
-    /// publish may carry and where the scan can read them.
+    /// publish may carry. The staged ref is a `/dev/fd/N` descriptor path
+    /// inherited into the audit child, not a filesystem name a same-user
+    /// process could swap.
     pub release_assets: Vec<(String, u64, String, String)>,
+    /// Descriptors the audit child must inherit (numbers already reserved in
+    /// this process with the share flag cleared at exec): how staged asset
+    /// bytes reach the scanner without trusting a replaceable path.
+    pub inherited_fds: Vec<i32>,
     /// For `commit-msg`/`prepare-commit-msg`: the message file git hands the
     /// hook (argv[0]) and its composition source (argv[1]: `message`,
     /// `template`, `merge`, `squash` or `commit` for `-c/-C` reuse).
@@ -327,6 +333,7 @@ mod tests {
             release_tag: Some("v1.0.0".into()),
             release_commit: Some("c0ffee".into()),
             release_assets: Vec::new(),
+            inherited_fds: Vec::new(),
             commit_message_file: None,
             commit_message_source: None,
         }
