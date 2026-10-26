@@ -350,6 +350,7 @@ fn migrate_legacy_policy_file(legacy: &Path, target: &Path) -> Result<Option<Leg
                     target.display()
                 );
             }
+            protect_policy_target(target)?;
             verify_policy_target(target, &bytes)?;
             std::fs::remove_file(legacy)
                 .with_context(|| format!("cannot remove {}", legacy.display()))?;
@@ -364,28 +365,63 @@ fn migrate_legacy_policy_file(legacy: &Path, target: &Path) -> Result<Option<Leg
         std::fs::create_dir_all(parent)
             .with_context(|| format!("cannot create {}", parent.display()))?;
     }
-    match std::fs::rename(legacy, target) {
-        Ok(()) => {
-            verify_policy_target(target, &bytes)?;
-            Ok(Some(LegacyPolicyMove::Moved))
+    // The destination is claimed, never replaced: a same-user process could
+    // drop a file at the path between the absence check and the move, and a
+    // rename or write would silently take it over. A same-device move claims
+    // the name with a hard link - AlreadyExists, never a clobber - and any
+    // other failure (cross-device roots, filesystems without links) falls
+    // back to an exclusive create.
+    match std::fs::hard_link(legacy, target) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!(
+                "policy data destination {} appeared during migration - refusing",
+                target.display()
+            );
         }
         Err(_) => {
-            // A config root on another device cannot be renamed across. Copy
-            // the list, keep it private, then drop the GitVault copy.
-            std::fs::write(target, &bytes)
-                .with_context(|| format!("cannot write {}", target.display()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o600))
-                    .with_context(|| format!("cannot protect {}", target.display()))?;
+            let staged = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(target);
+            let mut staged = match staged {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    bail!(
+                        "policy data destination {} appeared during migration - refusing",
+                        target.display()
+                    );
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("cannot write {}", target.display()));
+                }
+            };
+            use std::io::Write as _;
+            if let Err(error) = staged.write_all(&bytes) {
+                let _ = std::fs::remove_file(target);
+                return Err(error).with_context(|| format!("cannot write {}", target.display()));
             }
-            verify_policy_target(target, &bytes)?;
-            std::fs::remove_file(legacy)
-                .with_context(|| format!("cannot remove {}", legacy.display()))?;
-            Ok(Some(LegacyPolicyMove::Moved))
         }
     }
+    protect_policy_target(target)?;
+    verify_policy_target(target, &bytes)?;
+    std::fs::remove_file(legacy).with_context(|| format!("cannot remove {}", legacy.display()))?;
+    Ok(Some(LegacyPolicyMove::Moved))
+}
+
+/// A policy list is private data: 0600 wherever it lands, enforced on moved
+/// and duplicate targets alike before the legacy source is removed.
+fn protect_policy_target(target: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("cannot protect {}", target.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = target;
+    Ok(())
 }
 
 fn verify_policy_target(target: &Path, expected: &[u8]) -> Result<()> {

@@ -3741,8 +3741,10 @@ fn cmd_release(
     let mut release_audit: Option<ReleaseAudit> = None;
     if let ReleaseCommand::Create { tag, assets, .. } = &command {
         // Asset files are judged before the audit: a bad path refuses before
-        // any review time or credential is spent.
-        let assets = check_release_assets(assets)?;
+        // any review time or credential is spent, and the bytes the scan may
+        // judge are snapshotted privately and immutably here - the same
+        // snapshot the upload will read.
+        let staged = check_release_assets(assets)?;
         let mut ctx = context_for(
             &cfg,
             "release",
@@ -3758,12 +3760,20 @@ fn cmd_release(
                      run this from the tagged working tree"
             )
         })?;
-        // The audit binds the exact asset bytes: name, size and digest go into
-        // the evidence, and the upload refuses a file whose digest no longer
-        // matches, so published bytes are the bytes the evidence named.
-        ctx.release_assets = assets
+        // The audit binds the exact asset bytes: name, size, digest and the
+        // private snapshot path go into the evidence, so the privacy scan
+        // judges and the upload reads the identical byte sequence.
+        ctx.release_assets = staged
+            .assets
             .iter()
-            .map(|a| (a.name.clone(), a.size, a.sha256.clone()))
+            .map(|a| {
+                (
+                    a.name.clone(),
+                    a.size,
+                    a.sha256.clone(),
+                    a.staged.display().to_string(),
+                )
+            })
             .collect();
         let repo_root = ctx.repo_root.clone();
         let audited = ctx
@@ -3775,7 +3785,7 @@ fn cmd_release(
         release_audit = Some(ReleaseAudit {
             repo_root,
             audited,
-            assets,
+            assets: staged,
         });
     }
     let vault = vault::Vault::open()?;
@@ -3807,7 +3817,7 @@ fn cmd_release(
             let ReleaseAudit {
                 repo_root,
                 audited,
-                assets,
+                assets: staged,
             } = release_audit
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("the release audit did not run"))?;
@@ -3844,7 +3854,7 @@ fn cmd_release(
                     repo_root: repo_root.as_path(),
                     audited: audited.as_str(),
                     tag: &tag,
-                    assets,
+                    assets: &staged.assets,
                     keep_draft: draft,
                 },
             );
@@ -3904,11 +3914,12 @@ impl Drop for InheritedFd {
 }
 
 /// What a release audit settles before the create request is built: the
-/// checkout it ran in, the commit it judged, and the digest-bound asset files.
+/// checkout it ran in, the commit it judged, and the staged asset snapshots
+/// the audit and upload are bound to.
 struct ReleaseAudit {
     repo_root: PathBuf,
     audited: String,
-    assets: Vec<ReleaseAsset>,
+    assets: StagedAssets,
 }
 
 /// What the release audit binds: the asset's upload name, size and content
@@ -3917,7 +3928,11 @@ struct ReleaseAudit {
 /// mismatch, so the published bytes are the audited digest.
 #[derive(Debug, Clone)]
 struct ReleaseAsset {
+    /// The operator's original path - diagnostics only, never read at upload
+    /// time.
     path: PathBuf,
+    /// The private immutable snapshot the audit and upload bind.
+    staged: PathBuf,
     name: String,
     size: u64,
     sha256: String,
@@ -3928,6 +3943,49 @@ struct ReleaseAsset {
 /// hashed or requested.
 const MAX_RELEASE_ASSETS: usize = 1000;
 const MAX_ASSET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The user-immutable flag for staged asset snapshots: no privilege needed,
+/// and the file's bytes cannot change while it is set. macOS `uchg`; other
+/// platforms have no cheap equivalent and simply skip the flag - the digest
+/// binding still applies.
+#[cfg(target_os = "macos")]
+fn set_user_immutable(path: &Path, on: bool) {
+    use std::os::unix::ffi::OsStrExt as _;
+    unsafe extern "C" {
+        fn chflags(path: *const libc::c_char, flags: u32) -> i32;
+    }
+    const UF_IMMUTABLE: u32 = 0x2;
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return;
+    };
+    unsafe {
+        chflags(path.as_ptr(), if on { UF_IMMUTABLE } else { 0 });
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_user_immutable(_path: &Path, _on: bool) {}
+
+/// The private directory holding immutable snapshots of the operator's
+/// asset files: the audit evidence names and the upload reads these exact
+/// bytes, never a path that could be swapped after hashing. Dropping the
+/// guard clears the flags and removes the directory.
+#[derive(Debug)]
+struct StagedAssets {
+    dir: PathBuf,
+    assets: Vec<ReleaseAsset>,
+}
+
+impl Drop for StagedAssets {
+    fn drop(&mut self) {
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                set_user_immutable(&entry.path(), false);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
 
 /// Stream a SHA-256 through a fixed buffer from any readable source:
 /// hashing must stay constant-memory however large the audited asset is.
@@ -3961,14 +4019,38 @@ fn sha256_file(path: &Path) -> anyhow::Result<String> {
 /// basename - plus the size and digest that bind its bytes to the audit.
 /// Run before the release is created so a bad path or a duplicate upload
 /// name refuses before anything is published.
-fn check_release_assets(paths: &[PathBuf]) -> anyhow::Result<Vec<ReleaseAsset>> {
+fn check_release_assets(paths: &[PathBuf]) -> anyhow::Result<StagedAssets> {
     anyhow::ensure!(
         paths.len() <= MAX_RELEASE_ASSETS,
         "a release carries at most {MAX_RELEASE_ASSETS} assets; {} were given",
         paths.len()
     );
-    let mut out: Vec<ReleaseAsset> = Vec::with_capacity(paths.len());
-    for path in paths {
+    // Every asset is snapshotted into a private, immutable copy before the
+    // audit: the privacy scan judges and the upload reads these exact
+    // bytes, so the original path cannot be swapped, edited or redirected
+    // between the check and the wire.
+    let dir = std::env::temp_dir().join(format!(
+        "gitvault-release-{}-{:x}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    ));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder
+        .create(&dir)
+        .with_context(|| format!("cannot stage assets in {}", dir.display()))?;
+    let mut staged = StagedAssets {
+        dir,
+        assets: Vec::with_capacity(paths.len()),
+    };
+    for (index, path) in paths.iter().enumerate() {
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -3977,7 +4059,7 @@ fn check_release_assets(paths: &[PathBuf]) -> anyhow::Result<Vec<ReleaseAsset>> 
                 anyhow::anyhow!("--asset '{}' has no usable file name", path.display())
             })?;
         anyhow::ensure!(
-            !out.iter().any(|a| a.name == name),
+            !staged.assets.iter().any(|a| a.name == name),
             "--asset names the upload '{name}' twice"
         );
         // Shape and size gate the read: a FIFO or an over-limit file is
@@ -3994,15 +4076,26 @@ fn check_release_assets(paths: &[PathBuf]) -> anyhow::Result<Vec<ReleaseAsset>> 
             "--asset '{}' exceeds the 2 GiB release-asset limit",
             path.display()
         );
-        out.push(ReleaseAsset {
+        let sha256 = sha256_file(path)
+            .with_context(|| format!("--asset '{}' is not a readable file", path.display()))?;
+        let snapshot = staged.dir.join(format!("{index:04}"));
+        std::fs::copy(path, &snapshot)
+            .with_context(|| format!("cannot stage asset '{}'", path.display()))?;
+        anyhow::ensure!(
+            sha256_file(&snapshot).unwrap_or_default() == sha256,
+            "the staged snapshot of '{}' did not keep the audited bytes",
+            path.display()
+        );
+        set_user_immutable(&snapshot, true);
+        staged.assets.push(ReleaseAsset {
             path: path.clone(),
+            staged: snapshot,
             name: name.to_string(),
             size: meta.len(),
-            sha256: sha256_file(path)
-                .with_context(|| format!("--asset '{}' is not a readable file", path.display()))?,
+            sha256,
         });
     }
-    Ok(out)
+    Ok(staged)
 }
 
 /// Create the release as a draft, upload each verified asset, re-verify the
@@ -4048,11 +4141,12 @@ fn create_release_staged(
     let upload = (|| -> anyhow::Result<()> {
         for asset in staged.assets {
             // The published bytes must be the audited digest - and they must
-            // be these exact bytes: the hash runs on the open handle and the
-            // upload hands curl that same descriptor, so a path swap between
-            // audit and upload cannot ride the release.
-            let mut file = std::fs::File::open(&asset.path)
-                .with_context(|| format!("cannot open asset '{}'", asset.path.display()))?;
+            // be these exact bytes: the hash runs on the open handle of the
+            // private immutable snapshot and the upload hands curl that same
+            // descriptor, so a path swap between audit and upload cannot
+            // ride the release.
+            let mut file = std::fs::File::open(&asset.staged)
+                .with_context(|| format!("cannot open staged asset '{}'", asset.path.display()))?;
             let now = sha256_reader(&file)?;
             anyhow::ensure!(
                 now == asset.sha256,
@@ -4079,7 +4173,7 @@ fn create_release_staged(
             };
             #[cfg(not(unix))]
             {
-                up.data_file = Some(asset.path.clone());
+                up.data_file = Some(asset.staged.clone());
             }
             up.headers
                 .push("Content-Type: application/octet-stream".into());
@@ -4776,17 +4870,24 @@ mod tests {
 
     /// `--asset` files are paired with their basename before the release is
     /// created, so a missing file or a directory refuses before anything is
-    /// published. The digest is what binds the audited bytes to the upload.
+    /// published. The digest is what binds the audited bytes to the upload,
+    /// and the private immutable snapshot is what the scan and the upload
+    /// both read - the operator's original path is evidence only.
     #[test]
     fn release_assets_are_checked_before_the_create() {
         let root = scratch("release-assets");
         let file = root.join("app-v1.0.zip");
         std::fs::write(&file, b"zip").unwrap();
-        let assets = check_release_assets(std::slice::from_ref(&file)).unwrap();
-        assert_eq!(assets.len(), 1);
-        assert_eq!(assets[0].name, "app-v1.0.zip");
-        assert_eq!(assets[0].size, 3);
-        assert_eq!(assets[0].sha256.len(), 64);
+        let staged = check_release_assets(std::slice::from_ref(&file)).unwrap();
+        assert_eq!(staged.assets.len(), 1);
+        assert_eq!(staged.assets[0].name, "app-v1.0.zip");
+        assert_eq!(staged.assets[0].size, 3);
+        assert_eq!(staged.assets[0].sha256.len(), 64);
+        // The snapshot holds the same bytes and outlives the source: the
+        // upload binds the snapshot, so a swapped original changes nothing.
+        assert_eq!(std::fs::read(&staged.assets[0].staged).unwrap(), b"zip");
+        std::fs::write(&file, b"poisoned").unwrap();
+        assert_eq!(std::fs::read(&staged.assets[0].staged).unwrap(), b"zip");
         assert!(check_release_assets(&[root.join("missing.bin")]).is_err());
         assert!(check_release_assets(std::slice::from_ref(&root)).is_err());
         let _ = std::fs::remove_dir_all(&root);

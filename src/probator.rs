@@ -472,16 +472,17 @@ fn actions(ctx: &Context) -> Result<Vec<Value>, String> {
                 return Err("the release audit names neither a tag nor a commit".into());
             }
             // The assets publish alongside the commit, so the evidence names
-            // their exact bytes: name, size and digest per file. The upload
-            // re-hashes each file against these values before it goes out.
+            // their exact bytes and where the scan can read them: name, size,
+            // digest and the private immutable snapshot path per file. The
+            // upload streams that same snapshot to GitHub.
             if !ctx.release_assets.is_empty() {
                 detail.insert(
                     "assets".into(),
                     Value::Array(
                         ctx.release_assets
                             .iter()
-                            .map(|(name, size, sha256)| {
-                                json!({"name": name, "size": size, "sha256": sha256})
+                            .map(|(name, size, sha256, staged)| {
+                                json!({"name": name, "size": size, "sha256": sha256, "staged": staged})
                             })
                             .collect(),
                     ),

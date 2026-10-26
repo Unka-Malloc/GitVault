@@ -68,9 +68,10 @@ pub struct Context {
     pub release_tag: Option<String>,
     pub release_commit: Option<String>,
     /// For `release`: the assets bound to this release as
-    /// `(name, size, sha256)` tuples, hashed before the audit so the evidence
-    /// names the exact bytes the publish may carry.
-    pub release_assets: Vec<(String, u64, String)>,
+    /// `(name, size, sha256, staged_path)` tuples, snapshotted privately and
+    /// hashed before the audit so the evidence names the exact bytes the
+    /// publish may carry and where the scan can read them.
+    pub release_assets: Vec<(String, u64, String, String)>,
     /// For `commit-msg`/`prepare-commit-msg`: the message file git hands the
     /// hook (argv[0]) and its composition source (argv[1]: `message`,
     /// `template`, `merge`, `squash` or `commit` for `-c/-C` reuse).

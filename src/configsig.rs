@@ -704,4 +704,36 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&d);
     }
+
+    /// Group/other write bits let a non-root principal rewrite the inode in
+    /// place without ever touching the name: an executable carrying them is
+    /// untrusted even under a root-owned, unreplaceable chain.
+    #[cfg(unix)]
+    #[test]
+    fn a_writable_executable_is_not_trusted() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = dir("writable-exec");
+        let binary = d.join("helper");
+        std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+        for (mode, writable) in [(0o755, false), (0o775, true), (0o757, true), (0o700, false)] {
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(mode)).unwrap();
+            let meta = std::fs::metadata(&binary).unwrap();
+            assert_eq!(file_is_untrusted_writable(&meta), writable, "mode {mode:o}");
+        }
+        // The mode bits say trusted while an ACL grants access anyway: an
+        // extended entry must register on its own.
+        #[cfg(target_os = "macos")]
+        {
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(!has_extended_acl(&binary), "the fixture carries no ACL");
+            let added = std::process::Command::new("chmod")
+                .args(["+a", "everyone deny delete"])
+                .arg(&binary)
+                .status();
+            if added.map(|s| s.success()).unwrap_or(false) {
+                assert!(has_extended_acl(&binary), "an ACL entry must register");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
