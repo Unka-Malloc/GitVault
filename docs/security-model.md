@@ -19,7 +19,11 @@ generic-password item (`gitvault-vault-key`, overridable via
 time-bounded window written to `$XDG_CONFIG_HOME/gitvault/unlock-until` (or
 `~/.config/gitvault/unlock-until`) — a timestamp,
 the machine's boot time (so a restored snapshot cannot resurrect an old
-window), and an HMAC tag keyed on the vault key. The default duration is
+window), and an HMAC tag keyed on the vault key. The helper is the fixed
+`~/.local/bin/gitvault-touchid`, resolved from the account database rather than
+`HOME`; `gitvault install` gives it `schg`, and a helper path that is not a
+regular, non-symlink file owned by root or carrying the system-immutable flag
+is refused rather than executed. The default duration is
 900 s; an operator wanting a longer window passes `gitvault unlock --ttl`,
 an explicit act — the environment cannot size it, because a same-user process
 must not stretch one confirmation indefinitely. `gitvault lock` closes the
@@ -68,10 +72,12 @@ window is a permission, not a possession:
   handed to `ssh-add` through an `SSH_ASKPASS` script deleted after use — never
   argv, never the key bytes.
 - **Biometric confirmation is requested at credential use, not before.**
-  Checkers run first and take the time they take; a window opened before an
-  audit would expire during it. `ensure_open` is called at the moment a token
-  or key is actually needed — after every blocking checker has passed — so a
-  refused publication never touches the vault at all.
+  Semantic audits run before the publishing request and take the time they
+  take; a window opened before an audit would expire during it. `ensure_open`
+  is called at the moment a token or key is actually needed for the
+  publication, so a refused publication never reaches the publishing
+  credential. A merge's read-only head fetch and target-branch metadata read
+  happen at the gate boundary before the audit and label themselves.
 - **Reads are gated too.** A read of a private repository returns its
   contents, so an open window is required for reads as well as writes; there
   is no free path through the only egress.
@@ -84,34 +90,85 @@ window is a permission, not a possession:
 
 ## The audit boundary
 
-Checkers are a list in `$XDG_CONFIG_HOME/gitvault/checkers.toml` (or
-`~/.config/gitvault/checkers.toml`) — the audit policy the routing table's
-`audit_policy` key binds — outside every work
-tree, so a repository cannot edit the terms it is judged by. The engine:
+GitVault ships no audit engine. Semantic review - the policy, reviewer
+contracts, agent prompts, run receipts and evidence - belongs to the public
+[Probator](https://github.com/Unka-Malloc/Probator) engine and lives outside
+every work tree. GitVault reaches it by executing `probator gate-audit` with
+one JSON action per review object (`{kind, target, detail}`) and reading the
+findings array it prints. `pre-push`, `pr` and `release` are publication
+boundaries. A push action carries the hook's ref lines as `push_refs` and no
+`range`, preserving the exact scope the push publishes. `gitvault check
+--event working-tree` carries a `working-tree` action; it reviews the
+uncommitted snapshot and publishes nothing, so it is an on-demand audit, not a
+boundary.
 
-- runs each checker from a **neutral working directory** with a **curated
-  environment** (`PATH`, `HOME`, `LANG`, `TMPDIR`, `GITVAULT_*` only) — ambient
-  credentials and steering variables cannot reach the check;
-- passes the repository as an absolute argument, never as cwd — the single
-  exception is `kind = "verify"` below, which stages the candidate revision;
-- is **fail-closed**: a blocking checker that is missing, times out, or exits
-  non-zero refuses the action;
-- runs every checker for the event and reports all results — no short-circuit
-  on the first refusal.
+The engine boundary is deliberately thin and fail-closed:
 
-Checker rows default to `kind = "exec"`: the declared command runs as-is
-under the curated environment above. A custom `kind = "python"` entry gets
-the engine's portable floor — `-P` and `PYTHONSAFEPATH=1`, which stop
-`sys.path` shadowing but leave user site-packages and `PYTHONPATH` alone;
-register the command with `-I` itself when the stronger isolation is wanted.
+- GitVault never parses Probator's policy file or executes its checker rows;
+  `probator inspect --json` is the machine form used to confirm that a
+  blocking hardening contract lives under the engine's profiles root, covers
+  the event, declares the full hardening domain set and runs that contract
+  through the same resolved engine. The accepted contract identity is pinned
+  to `security-enhancer` as a versioned coupling; the domain set itself is read
+  from that contract, not copied into GitVault, so an engine-side addition is
+  required rather than silently treated as missing coverage. A generic,
+  advisory, decorative or partial row is not boundary coverage. The rest of
+  the contract's vocabulary is the engine's published reference.
+- an armed installation finds the engine only at the installed path
+  `~/.local/bin/probator`, which `gitvault install` immobilises with `schg`.
+  `PATH` and a build-tree sibling are used only while enforcement is unarmed,
+  and `GITVAULT_PROBATOR` is a debug-build fixture seam, active only together
+  with the debug `GITVAULT_ANCHOR` fixture, and release binaries compile it
+  out. The child's environment is cleared and rebuilt from the account
+  home, a fixed search path and locale, plus the ruling ledger and anchor
+  GitVault sets explicitly; provider keys, `SSH_AUTH_SOCK`, `PROBATOR_*` and
+  `GITVAULT_*` are not inherited. The fixed search path puts the root-owned
+  system directories first, then the engine's own directory and
+  `~/.local/bin` so the engine can find its agent while a same-user process
+  cannot shadow the `git` helper the audit spawns; user-writable
+  package-manager directories (`/usr/local/bin`, `/opt/homebrew/bin`) are
+  present only when the engine itself resolves there, always after the system
+  directories and never twice. A missing binary is a refusal. In armed mode
+  every publication boundary re-checks the resolved path: the engine must be a
+  regular, non-symlink file that is root-owned or system-immutable (`schg`),
+  not merely executable and not merely locked once at install time. `gitvault
+  install` refuses to arm when
+  no engine is present. The on-demand `working-tree` snapshot publishes and
+  authorizes nothing; it is the only event that may run an untrusted engine,
+  and it warns.
+- a missing engine, a non-zero exit, an unreadable or empty output, a
+  non-object finding or an unclassifiable finding severity is a blocking
+  finding - the gate never reads silence as a pass;
+- findings are re-rendered with terminal control characters removed,
+  credential shapes and assignments, personal identifiers and private endpoints
+  redacted, and home/temporary/absolute host paths replaced before they are
+  printed or recorded. A finding's `path` must
+  be repository-relative; an absolute path or one containing `..` is omitted.
+  The engine's contract sends locations, not evidence, and GitVault does not
+  preserve arbitrary engine bytes;
+- the audit runs under the engine's own policy, not one a repository can edit;
+- concurrent GitVault audits of one repository serialize on an exclusive lock
+  under the state root (below);
+- GitVault passes its signed operator objection ledger and public anchor to
+  every invocation, so a ruling made through `gitvault objection` applies to
+  the engine's findings unchanged;
+- the machine-local `withheld-names.txt` and `repo-deps.txt` lists belong to
+  the engine's config root. `gitvault install` moves a list Probator lacks into
+  the account home's fixed configuration root when the install is armed,
+  deletes a byte-identical duplicate, and refuses a conflicting pair. Arming
+  also moves lists the engine itself wrote under the unarmed
+  `$XDG_CONFIG_HOME` root, so the fixed-root hand-off does not silently drop
+  them; each target is read back before its source is removed. The engine
+  child's `XDG_CONFIG_HOME` is pinned to the same root, so an environment
+  override cannot split the lists from the engine. GitVault never reads either
+  file itself.
 
-The third kind, `verify`, is the declared exception to the neutral-directory
-rule: it stages a **detached worktree of the candidate revision** inside its
-neutral directory and runs the signed command there, because a build or test
-can only exercise the code itself. `repos` scopes the row to origin slugs or
-work-tree path prefixes, and `{verify_head}` substitutes the resolved
-revision. The command still comes only from the signed policy — the
-repository never names its own test.
+What remains in GitVault is the deterministic interception surface: the
+identity-actual comparison, the AI-attribution gate and the push-history gate.
+They run before the delegated audit, cost no audit work, and are built in
+rather than registered. A blocking local gate ends the operation before the
+delegated audit: nothing would publish, so there is no decision for the review
+to inform. When they pass, the audit runs before any authorization request.
 
 **Tracked repository hooks run.** The hook dispatcher also invokes a
 checked-out `.githooks/<event>` when it is executable, so a repository's own
@@ -123,85 +180,134 @@ exists — review `.githooks/` after cloning as you would `Makefile` or CI
 scripts.
 
 `git push --no-verify` bypasses the git `pre-push` hook — git offers no local
-counter to it, so the hook alone is a convenience. The counter lives on the
-server: a successful pre-push audit posts a `gitvault/audited` commit status
-on the reviewed head, and a GitHub ruleset that requires it rejects every
-unmarked push — `--no-verify`, a web edit and another machine all fail there
-together. `GIT_IDENTITY_GUARD_CHAINED=1` skips the gateway call entirely (it
-exists as the chain's own recursion guard); it is the same class: refused by
-the server rule, not by git. The boundaries GitVault controls outright — `pr
-create`, `pr merge` and `release create` — run the checker registry before
-any credential is unlocked and refuse without contacting GitHub.
+counter to it, so the hook alone is a convenience. `gitvault push` refuses
+`--no-verify`, `--stdin`, `--follow-tags`, `--prune`, `--mirror`, parameterised
+`--branches`, `--recurse-submodules` and any option it does not model, and it
+passes git the exact refspecs the pre-audit saw. It resolves the remote with
+git's own precedence and uses that same name for the mirror lookup and the
+push, and it follows `push.default` exactly: `simple` refuses a missing or
+differently named upstream, `upstream` refuses a push remote that is not the
+branch's upstream remote, and `matching` selects only heads the remote
+advertises. Matching reads that advertised set read-only before the audit and
+refuses when it cannot, rather than selecting from the stale local mirror. A
+deletion name is resolved against `refs/heads` and `refs/tags`; a name in both
+namespaces, or in neither, refuses and requires the full ref, so the audited
+ref and the refspec git receives are the same. It also forces
+`--no-follow-tags`, `--no-recurse-submodules` and
+`--no-prune`, and refuses a remote configured with
+`remote.<name>.mirror=true`, so configuration cannot add or delete a ref after
+the audit. The wrapper's pre-audit runs from the local mirror and is
+advisory: the `pre-push` hook re-audits the refs git actually advertises, and
+that hook run is authoritative. A stale mirror base is therefore re-audited at
+the hook (which may refuse mid-push), and the engine may reuse its sealed
+verdict for a head it has already judged. A bare `git push --no-verify` from
+another checkout still leaves the local boundary.
+GitVault publishes no commit status and asks no server to re-check the audit,
+so that bypass is outside what this tool can observe. It does not remove a
+server-side protection it cannot replace: if an existing GitHub ruleset
+requires the removed `gitvault/audited` status, keep it until an equivalent
+required check exists, then replace it deliberately; do not drop the
+requirement first. `GIT_IDENTITY_GUARD_CHAINED=1`
+skips the gateway call entirely (it exists as the chain's own recursion guard);
+it is the same class: a bypass the local gate does not observe. The boundaries
+GitVault controls outright — `pr create`, `pr merge` and `release create` —
+run the audit before the publishing request and refuse without publishing.
+A merge fetches the request's head and, when `--base` is omitted, reads the
+request's target branch from its metadata at that boundary before the audit.
+That read spends the vault token, so the broker re-checks the routing
+signature immediately before issuance; an unsigned or tampered table refuses
+rather than reading private request data while it waits for the audit.
+A supplied `--base` drives the audit as a cross-check and is then verified
+against the request's own base after the audit, before the merge; a mismatch
+refuses. A create fetches the
+proposed head, fetches the base from the remote that owns the target
+repository (refreshing it and restoring the checkout's own `origin` ref
+afterwards in a fork workflow), reads the head again after the audit, and
+checks the created request's reported head against the audited commit. These
+are read-only credential uses, not the publication itself. An unknown
+`hook`/`check --event` name refuses instead of producing an empty pass.
 
-The remaining commands — `api`, `repo`, `issue` and `ssh` — do **not** run
-registered checkers, and `api` additionally *refuses* every request that
+The remaining commands — `api`, `repo`, `issue` and `ssh` — do **not** reach
+the audit engine, and `api` additionally *refuses* every request that
 would publish: content writes (`contents`, `git/*`), ref-moving endpoints
 (`merges`, `merge-upstream`, `pulls` create/merge/update-branch), releases,
-and commit statuses — the last so a hand-posted `gitvault/audited` cannot
-forge the attestation the ruleset trusts. Reads and metadata writes (issues,
-comments, labels) still pass as credential-broker operations.
+and commit statuses, so the broker cannot publish around the gate. The path is
+percent-decoded and matched on the route the server will see; an encoded
+separator, an encoded route name, or a percent escape that survives one decode
+refuses anywhere in the path, including owner/repo. A token
+is issued only after the routing signature verifies. Reads and
+metadata writes (issues, comments, labels) still pass as credential-broker
+operations.
+
+## Concurrent audits
+
+GitVault serializes audits of one repository on an exclusive lock under the
+state root (a directory named from the origin slug, or the canonical git common
+directory when there is no remote; reclaimed only when its recorded PID is
+dead, with a short grace period for the creator to write it). A second
+invocation waits for the first instead of entering the same audit, with no
+internal elapsed-time cutoff: a live owner keeps the lock however long its
+audit runs. Without that serialization two concurrent reviews can interfere
+with the audit service's shared run state, and one can end without a sealed
+report. The lock is the GitVault-side fix; serializing or resuming inside the
+audit service is the service's own responsibility.
 
 ## Run records
 
-Every run that invokes a checker writes a record under
+Every publication audit writes a record under
 `$XDG_STATE_HOME/gitvault/runs` (or `~/.local/state/gitvault/runs`): the
-repository slug, each checker's verdict and seconds, and captured output with
+repository slug, each gate's verdict and seconds, and captured finding text with
 any home or temporary path replaced by `[LOCAL_PATH]`. The store is built to
 be read by someone other than the person who ran the gate; a record that
 cannot be written is reported but never refuses an action.
 
-## Profile integrity
-
-Audit-agent prompts (`policy.md`, `SKILL.md`, `profile.json`) are synced from a
-profile registry and hash-checked. A local edit to a synced document makes the
-checker refuse to run until it is synced again — a prompt edited on this
-machine is not the prompt that was reviewed.
-
 ## Configuration attestation
 
 `config.toml` is a routing table, not a secret: which repository resolves to
-which identity, backed by which account. `checkers.toml` is the audit policy:
-the commands a gate may execute. What both require is **integrity**, so the
-control is a signature, not encryption — one signature per file, because the
-two files answer different questions and are blessed at different moments.
+which identity, backed by which account. What it requires is **integrity**, so
+the control is a signature, not encryption. `checkers.toml` is a separate
+signed policy: it authorizes the external audit engine. Only rows naming
+`probator` are admitted at the gate; a stale `gitvault-review` row refuses the
+boundary, and no row is executed. The checker set belongs to Probator.
 
-- **Audit first, blessing after.** The policy signature means *these commands
-  may execute*; the routing signature means *these identities may act*.
-  Audits run under the certified policy before the routing table's blessing
-  is asked: a gated event whose routing signature does not hold refuses only
+- **Engine authorization.** The policy signature means *this machine may run
+  the audit engine*. An uncertified policy refuses a publication boundary
+  before the engine is invoked; it is a precondition on the executable, not a
+  blessing of a verdict. `config sign` certifies both the routing table and
+  this policy.
+- **Audit first, blessing after.** The routing signature means *these
+  identities may act*. Audits run under the audit engine before that signature
+  is judged: a gated event whose routing signature does not hold refuses only
   after the audit report has been shown, so the operator always certifies
   evidence already produced, never a blind precondition. An uncertified
-  policy is never *enforced* — hooks and publication commands show its
-  declared commands, then refuse — but `gitvault check` audits it as a
-  proposal: a policy change must produce evidence before its signature, or
-  the blessing would always come first. Proposed rows are constrained to the
-  trusted audit runner bound to the reviewed repository and the installed
-  contract set, may not override `GITVAULT_*` context, and at a publication
-  boundary must keep every installed blocking reviewer for the event. Such
-  runs are marked uncertified in the report and the run record's
-  `policy_signature` field, so a proposal audit never reads as a certified
-  one. An uncertified routing table never
-  reaches a credential. A routing table that declares `audit_policy` also
-  binds the policy file's existence: deleting `checkers.toml` cannot silence
-  the audit, it refuses.
+  routing table never reaches a credential.
 - **Signing key in the vault.** `gitvault config keygen` creates an ed25519
   pair; the private half is stored in `vault.enc` beside the credentials, so
   producing a signature costs the same biometric-gated window as releasing a
-  key. `gitvault config sign` re-blesses both files after an intended edit
-  (and migrates any `[[checkers]]` rows still sitting in `config.toml` into
-  the policy file).
+  key. `gitvault config sign` re-blesses the routing table and the engine
+  policy after an intended edit.
 - **Public anchor, root-owned.** `config.pub` (an allowed-signers line, one
   `gitvault-config` principal) sits beside the configuration, but it only
   counts while root owns it. A same-user process can rewrite `config.toml`
   freely; it can neither re-sign it nor repoint the anchor. `gitvault install`
   performs the one privileged step: it transfers the anchor to `root:wheel`
-  and sets the system-immutable flag on the binaries and the hooks directory,
+  and sets the system-immutable flag on the binary and the hooks directory,
   which resists the same owner without changing how the kernel launches them
   (a user-built binary chowned to root is refused by AppleSystemPolicy).
+  Probator is installed separately; GitVault does not ship it. `gitvault
+  install` refuses to arm when no engine is present, and an engine already
+  beside the binary is added to the locked enforcement surface. Every
+  publication boundary then re-checks that the resolved engine is a regular,
+  non-symlink file that is root-owned or system-immutable, so an engine
+  installed after the last install cannot carry a verdict and a link planted at
+  the engine path cannot borrow its target's authority. The on-demand working-tree snapshot publishes nothing and
+  is the only event allowed to warn and proceed with an untrusted engine.
 - **Reads stay free, writes are a ceremony.** Every credential-bearing load
   verifies the routing signature when enforcement is armed and fails closed
   on a missing or invalid sidecar; audit surfaces classify instead of
-  refusing so the audit can precede the blessing. `gitvault config verify`
+  refusing so the audit can precede the blessing. The API broker re-checks the
+  signature immediately before it issues a token, so a metadata read inside a
+  gate cannot spend the vault on an uncertified table. `gitvault config verify`
   reports both files' state for an operator.
 - **Honest residual.** This does not change the keychain note above: a
   determined same-user process can read the vault key silently and could, in

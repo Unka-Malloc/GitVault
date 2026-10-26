@@ -1,125 +1,196 @@
 # Changelog
 
+## Unreleased
+
+- Publication coverage reads the hardening contract's declared domain set from
+  the contract file the inspected row names instead of copying the
+  `security-enhancer` domain list into GitVault. The contract identity stays a
+  documented, versioned coupling and is named in the refusal text; engine-side
+  domain additions are now required rather than silently rejected as missing
+  coverage. Finding text also redacts bare endpoint URLs, keeping the scheme
+  but not the host or path.
+- Trust in an executable now judges the path itself: the biometric helper and
+  the audit engine must be regular, non-symlink files that are root-owned or
+  carry `schg`. Previously a symlink planted at the fixed helper path inherited
+  the trust of a root-owned target such as `/usr/bin/true`, so the Touch ID
+  prompt could be answered by an executable that never asked.
+- An armed publication boundary now re-checks at every invocation that the
+  audit engine is root-owned or carries the system immutable flag (`schg`), and
+  `gitvault install` refuses to arm when no engine is present. An engine placed
+  after the last install can no longer answer a `pre-push`, `pr` or `release`
+  verdict with an empty findings array. The on-demand `working-tree` snapshot
+  publishes nothing; it is the only event that may run an untrusted engine, and
+  it warns.
+- The biometric helper is resolved from the account database rather than
+  `HOME`, and the fixed helper must be root-owned or `schg` before it runs.
+  `gitvault install` immobilises an existing helper; one installed afterwards is
+  refused until the install is re-run.
+- The API broker re-checks the routing signature immediately before issuing a
+  token. A merge's metadata read before the audit therefore cannot spend the
+  vault on an unsigned or tampered routing table, while the publication verdict
+  is still decided after the audit.
+- The `--no-verify` documentation no longer instructs operators to remove a
+  required `gitvault/audited` check before a replacement exists. GitVault still
+  posts no commit status; the local boundary's residual is stated explicitly.
+- `gitvault api` now matches publication routes on the percent-decoded path the
+  server will see. An encoded route name, an encoded path separator, or a
+  percent escape that survives one decode refuses anywhere in the relative
+  path, including owner/repo, instead of slipping past as an unknown segment.
+- `gitvault push` now resolves a deletion name against both `refs/heads` and
+  `refs/tags`. A name present in both namespaces, or in neither, refuses and
+  requires the full ref, so the audit line and the refspec git receives can
+  never name different refs. `push.default=matching` reads the remote's
+  advertised heads with a read-only `ls-remote` before the audit instead of
+  trusting the local mirror; an unreadable remote refuses rather than
+  selecting or omitting a ref git would move.
+- The audit engine's fixed `PATH` now puts the root-owned system directories
+  first, then the engine's own directory and `~/.local/bin` so the engine can
+  find its agent. User-writable package-manager directories (`/usr/local/bin`,
+  `/opt/homebrew/bin`) are omitted unless the engine itself resolves there,
+  and are never placed before a root-owned helper. A same-user process can no
+  longer substitute the `git` the audit spawns.
+- `gitvault api` refuses a path containing a `.` or `..` segment, including a
+  percent-encoded spelling, before the publication check and before the token
+  is sent. `request_url` applies the same refusal, so a traversal cannot reach
+  the API even when it does not match a publication surface.
+- `hook` and `check` parse the event at the boundary. A misspelled event
+  (`pre_pus`) now refuses instead of matching no gate and reporting success.
+- An armed install migrates `withheld-names.txt` and `repo-deps.txt` to the
+  engine's fixed configuration root, including lists the engine itself wrote
+  under the unarmed XDG root, and pins the engine child's `XDG_CONFIG_HOME` to
+  it, so a caller's environment cannot separate Clean Auditor's machine-local
+  lists from the engine. Each target is read back before its source is removed.
+- `pr create` fetches the base from the remote that owns the target
+  repository, refreshes its tracking ref, and restores the checkout's own
+  `origin` ref after the audit in a fork workflow. It re-reads the proposed
+  head after the audit, refuses a moved head before the POST, and checks the
+  created request's reported head against the audited commit (closing the
+  request if it moved in that last window).
+- Attribution at `pr merge` now scans the request's resolved target
+  `base..head` instead of a range computed against the checkout's `HEAD`; a
+  trailer in the PR head is blocking even when another branch is checked out.
+  When `--base` is supplied it is verified against the request's own metadata
+  after the audit and before the merge; a mismatch refuses.
+- A valueless `remote.<name>.mirror` key is treated as the mirror git makes it,
+  so the push plan refuses it instead of reading the empty value as "no
+  mirror".
+- `gitvault push` audits what a push carries before any credential is spent:
+  git connects to the remote to learn the refs its `pre-push` hook reports,
+  so a bare `git push` always spends the SSH credential before the audit.
+  The wrapper synthesizes the same ref lines from the arguments and the
+  local mirror, runs the audit, and hands a passing push to the real
+  `git push`. That push's `pre-push` hook re-audits the refs git actually
+  advertises; the hook run is the authoritative verdict and the wrapper's
+  pre-audit is advisory (it exists so a failing audit is known before the
+  credential is spent). Probator may reuse its sealed verdict for a head it
+  has already judged. The wrapper hands git the exact refspecs it audited
+  instead of forwarding the original argument vector, and forces
+  `--no-follow-tags`, `--no-recurse-submodules` and `--no-prune` on the real
+  push; it refuses a remote configured with `remote.<name>.mirror=true`. It
+  resolves the remote with git's precedence
+  (`branch.<name>.pushRemote`, `remote.pushDefault`, `branch.<name>.remote`,
+  then `origin`) and uses one name for the mirror and the push. A bare push
+  follows `push.default` instead of synthesizing a destination git would
+  refuse: `simple` requires a same-named upstream on the pull remote,
+  `upstream` requires the push remote to be that upstream, and `matching`
+  selects only heads the remote advertises. A `HEAD` source resolves to
+  the current branch's name, as git's own push does. It refuses `--no-verify`,
+  `--stdin`, `--follow-tags`, `--prune`, `--mirror`, parameterised
+  `--branches`, `--recurse-submodules` and any option it does not model, so no
+  ref can be selected, added or deleted after the pre-audit has run. `--tags`
+  is conservative: without the transport GitVault cannot know which tags the
+  remote already has, so it audits every local tag; Probator then skips heads
+  reachable from a remote-tracking ref and reuses its cursor for an
+  already-judged head.
+- A blocking built-in gate (identity, attribution, history) now ends the
+  operation before the delegated audit starts: nothing could publish, so a
+  refused push no longer pays for a semantic review that cannot inform a
+  decision. The run record still carries every local gate that produced
+  evidence, and a passing local boundary still runs the audit before any
+  authorization request.
+- Every vault-unlock prompt now announces itself on stderr with the
+  credential being spent; the `pr merge` head fetch labels itself too. No
+  audit path requests the vault, and a prompt can no longer read as one
+  doing so.
+- `pr merge` resolves the request's target base (or accepts `--base`) and
+  fetches `pull/N/head` at the gate boundary, freezing the fetched SHA into
+  the audit context. The same SHA is sent as the merge request's precondition,
+  so a head that moves after the audit is a refusal. A private fetch ref is
+  used instead of the shared `FETCH_HEAD`, so concurrent fetches cannot move
+  the object the audit binds.
+- `pr create` fetches the proposed head branch and audits that immutable
+  commit; a base branch containing slashes keeps its full name after the
+  remote prefix is removed. `release create` sends `target_commitish` with the
+  audited commit and refuses an existing remote tag that points elsewhere.
+- `config sign` and `config verify` resolve `audit_policy` from the routing
+  table and certify or check that exact file, instead of always assuming the
+  conventional `checkers.toml` sibling. The anchor, installed engine and
+  engine ruling authority now share one account-home path, never `HOME`.
+- An absent `checkers.toml` is classified by its signature state instead of
+  being treated as inactive: an armed publication boundary refuses it before
+  the engine runs, so the documented `config sign`-then-`install` bootstrap
+  cannot reach a gate with no engine authorization.
+- Audit consolidation: GitVault no longer ships a review engine. The two
+  review binaries, the bundled checker contracts, the
+  `docs/review-contract.schema.json` design schema and its design note, and
+  the GitVault-owned audit policy are removed; Probator's contract schema is
+  the replacement. A
+  publication audit now hands the public
+  [Probator](https://github.com/Unka-Malloc/Probator) engine one JSON action
+  per review object and projects its findings; a missing engine, a failed run
+  or an unreadable result is a blocking finding. `gitvault checkers` reads
+  `probator inspect`, and `gitvault check` no longer accepts `--only`.
+  The signed `checkers.toml` admits only rows naming the configured engine; a
+  stale `gitvault-review` row refuses the boundary before the engine runs, and
+  no row is executed. Boundary coverage requires a blocking hardening contract
+  under the engine's profiles root with the full hardening domain set
+  declared, a command that runs it against `{repo}`, and no `repos` scope
+  excluding this repository. An
+  armed installation resolves only the installed engine path; the
+  engine child gets a cleared, minimal environment (no provider keys,
+  `SSH_AUTH_SOCK`, `PROBATOR_*` or `GITVAULT_*` inheritance). GitVault
+  serializes concurrent audits of one repository on an exclusive lock, so two
+  invocations cannot enter the same review at the same time and one can lose
+  its sealed report. A waiter blocks for a live owner
+  with no internal elapsed-time cutoff; a slow audit is never rejected merely
+  because it ran long, and only a dead lock owner (or an unreadable owner
+  after a short grace) releases the lock. Finding text is re-rendered before
+  display and storage: control characters are stripped, credential shapes and
+  assignments, personal identifiers and private endpoints are redacted,
+  absolute host paths become `[LOCAL_PATH]`, and an absolute or traversing
+  finding path is omitted.
+- Push audits name their scope with `push_refs` alone: the ref lines git
+  supplied, preserving the exact remote-tip..local-head range a push publishes.
+  A push is one action however many refs it moves, so one checker set answers
+  for the whole push.
+- `gitvault check --event working-tree` now delegates the uncommitted snapshot
+  through the same `probator gate-audit` boundary with the action
+  `{"kind":"working-tree","target":"...","detail":{"range":"working-tree"}}`.
+  Policy coverage is checked against the engine's pre-push rows. A
+  working-tree audit is not a publication boundary: it publishes nothing and
+  spends no credential.
+- `gitvault install` performs the one-time hand-off of the removed review
+  engine's machine-local policy lists. `withheld-names.txt` and
+  `repo-deps.txt` now belong to the engine's config root: a list it lacks is
+  moved there, a byte-identical duplicate is deleted, and a conflicting pair
+  refuses instead of silently choosing one. GitVault itself no longer reads
+  either list.
+- `gitvault install` deploys only `gitvault` and the `gitvault-sign` wrapper;
+  the engine is installed and locked separately. The local identity,
+  attribution and push-history gates are unchanged.
+- Pull-request audits now send `head` and `base` in the engine's action
+  vocabulary. The request number is not sent: GitVault already fetched and
+  froze the head at the gate boundary, and the audit must not fetch it again.
+- `gitvault check` gained `--pr-head`, `--pr-base` and `--pr-number` so a
+  pull request can be audited outside `pr create`/`pr merge`.
+- The old `~/.local/share/gitvault/profiles` receipts and cursors are left in
+  place as history, not copied into the engine's data root. They were produced
+  by the removed internal review engine and their cursor keys predate the
+  engine's reviewer-bound key, so the engine cannot reuse them; rewriting the
+  engine field or re-keying them would assert a provenance it never issued.
+
 ## 0.2.0
 
-- The review-contract schema publishes its builtin vocabulary in neutral
-  names - `withheld-names-and-credentials`, `workspace-hygiene`,
-  `static-checklist`, `dependency-direction` - and the runtime accepts
-  exactly that set. The schema is provisional until this release and
-  carries no compatibility surface for earlier development names.
-
-- `phase` on a checker row orchestrates the run into ordered pools: rows in
-  one phase run concurrently, later phases start only while no blocking
-  failure exists, and skipped rows are recorded without spending tokens.
-
-- Run the four publication auditors through AwP profiles and bindings over
-  A4AA agent specs: the installer materializes each checker's registry
-  document from the shared declarative template `tools/registry.json` —
-  agent lane specs, the `audit` binding's fallback chain and the host's
-  secret recipes are data, never code.
-- The audit runtime is declared by the synced AwP profile — harness,
-  provider, model chain, peak/off-peak windows, quota retry and effort. A
-  profile without a `runtime` block refuses the audit; a model outside the
-  declared provider's namespace refuses the declaration. No vendor or
-  catalog is pinned by the framework.
-- Preserve each auditor's identity and profile revision in review receipts.
-- Isolate model access to the declared audit tools; host credentials are
-  resolved through the registry document's declared secret recipes, never
-  copied into checker configuration.
-- Preserve resumable conversations and require complete structured verdicts.
-- Resume interrupted conversations even after report submission, and reuse
-  validated completion evidence when only local receipt finalization failed.
-  Retain unfinished review progress independently of completed-receipt cleanup.
-- Attest a first-time head inside the same push: when the `gitvault/audited`
-  status post finds the commit unknown to the remote, the gate stages it
-  under `refs/gitvault/incoming/<sha>` — a ref no branch ruleset watches —
-  posts the mark, and deletes the staging ref, so the very first push of a
-  commit lands attested instead of needing the manual second-push ritual.
-  A staging failure still falls back to the deferred-attestation path.
-- Bind each run's verdict to a one-shot credential: the run mints a random
-  `verdict.key` before the reviewer starts, the review server signs its
-  submitted receipt with `HMAC-SHA256(key, canonical receipt)` into
-  `receipt_mac`, and the gate recomputes the signature before trusting the
-  report — a hand-written, replayed or stale `report.json` no longer
-  counts as a review. The key file dies with the verdict that sealed it;
-  a spent or missing credential refuses submission outright.
-- Conceal finished audit conversations from the harness's own session list:
-  each run records every conversation it opens in `audit-session.json`
-  (`session_ids` alongside the resume pointer), and when the run ends the
-  engine marks those recorded sessions archived with the store's native
-  flag — `hidden` on devin's sessions.db, `time_archived` on opencode's
-  session_v2, and on the Devin desktop's globalStorage index both the
-  `cognition.ai/isArchived` row flag and membership in the
-  `archivedSessions` list its sidebar's Archived filter consults — so
-  resumable transcripts stop filling the operator's visible session lists.
-  The sweep covers every checker's runs root on each gate — a checker
-  skipped by an earlier phase's refusal still gets its backlog concealed —
-  and runs only after the audit finishes: flagging a conversation while
-  its agent is still prompting breaks the turn. Each run directory carries
-  a `live` pid marker so a sibling sweep can never archive a conversation
-  mid-turn, and the store writes wait out transient database locks rather
-  than refusing. Concealment is best-effort and never gates a run.
-- Judge a push whose remote tip is not in the local object store as a whole
-  snapshot: the remote's live tip sha cannot anchor a diff it never
-  fetched, so the review object falls back to the same root-to-head
-  snapshot a first push carries, the attribution scan widens the same way,
-  and the history gate's refusal names the remedy — fetch the remote and
-  rebase, or `git pull --rebase` — instead of a bare non-fast-forward
-  refusal.
-- Refuse sibling-repository references that run against the dependency
-  direction: the Clean Auditor's deterministic stage reads a machine-local
-  `repo-deps.txt` map and blocks a document in an upstream repository that
-  names one of its downstreams — an upstream naming a downstream publishes
-  that repository's plans before it has shipped anything on its own.
-- Remove the superseded Codex/Pi bridges and launcher configuration.
-- Validate annotated release tags against their reviewed commit when checking
-  that the published reference has not changed during an audit.
-- Keep first-release reviews at whole-tree scope before and after push, so
-  publishing a branch cannot change what the release gate judges.
-- Split the audit policy into its own signed `checkers.toml`: policy
-  signatures gate whether declared checker commands may execute at all,
-  routing signatures gate verdicts and credentials, and audits always run
-  before any signature is requested.
-- Record the routing signature state in every audit run record.
-- Close the local bypass surface: `gitvault api` refuses publication writes
-  (contents, git objects and refs, merges, merge-upstream, pull-request
-  create/merge/update-branch, releases, commit statuses); the pre-push gate
-  rejects non-fast-forward updates, tag re-pointing and orphaning ref
-  deletions; and the hook dispatcher pins its gateway binary instead of
-  honouring `GITVAULT_BIN`.
-- Attest reviewed heads server-side: a passed pre-push audit posts the
-  `gitvault/audited` commit status for the exact reviewed commit, so a
-  GitHub ruleset can require it and cover `--no-verify`, web edits and other
-  machines. Tag objects peel to their commit; tips the remote already holds
-  are never marked. A status the remote cannot accept yet — the commit
-  arrives with that very push — is recorded under the pending directory and
-  reposted by the first later audited push, ruleset or not.
-- Chain run records and review receipts with sha256 seals and add
-  `gitvault records verify` to detect rewrites and gaps. Old records read as
-  unsealed, never as tampered.
-- Add `kind = "verify"` checkers: the signed policy's command runs in a
-  detached worktree of the candidate revision, scoped by `repos`, giving the
-  gate correctness evidence the repository cannot name itself.
-- Give push and pull-request reviews a real base: stage-1 scans the blobs the
-  range introduces (catching secrets added and removed mid-range) and the
-  semantic stage diffs `base..head` instead of rereading the whole tree.
-- Feed instruction-channel changes (agent rules, skills, MCP wiring) to the
-  security auditor and published-interface diffs (proto, GraphQL, schemas,
-  migrations, `.d.ts`, `*.schema.json`) to the maintainer as stage-1 surfaces
-  for semantic adjudication. `gv-allow:<rule>` on a line demotes a blocking
-  hit into a visible surface instead of hiding it.
-- `gitvault check --event pre-push` outside a hook synthesizes the refs a
-  push of the checkout would carry when stdin supplies none, instead of
-  blocking on a terminal or vacuously passing on an empty list. A scheduled
-  `gitvault check` thereby resumes provider-interrupted reviews in place -
-  the audit keeps its session, and completed verdicts arrive as sealed
-  receipts the next real push reuses.
-- `gitvault api` learns comma branches in `--jq` and declares
-  `Content-Type: application/json` for `--input` bodies automatically.
-
-The runtime requires the agent programs the deployment's registry template
-declares (this machine: OpenCode, with an optional Devin fallback), plus
-the `gitvault-review` and `gitvault-audit-agent` binaries. Update the
-checker installation along with GitVault. Existing vault credentials,
-identity routing, signed profile policy, and audit records remain user
-data.
+- Earlier 0.2.0 notes described the built-in review runtime and checker
+  registry. Both were removed in the audit consolidation above; Probator now
+  owns that surface.

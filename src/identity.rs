@@ -196,6 +196,7 @@ mod tests {
             },
             audit_policy: None,
             record_dir: None,
+            path: None,
         }
     }
 

@@ -1,9 +1,9 @@
-//! GitVault - hold the identity, intercept the action, run the checkers.
+//! GitVault - hold the identity, intercept the action, delegate the audit.
 //!
 //! The binary is the only component that decides *who* is acting. It never
-//! executes code from the repository it inspects: checkers are external commands
-//! launched with a neutral working directory, and the repository path reaches them
-//! as an absolute argument rather than by changing into it.
+//! executes code from the repository it inspects and it does not own an audit
+//! engine: publication audits are handed to `probator gate-audit`, which keeps
+//! the policy, the reviewer contracts, the receipts and the operator waivers.
 
 mod api;
 mod attribution;
@@ -15,6 +15,7 @@ mod git;
 mod history;
 mod identity;
 mod objection;
+mod probator;
 mod records;
 mod seal;
 mod sign;
@@ -56,7 +57,7 @@ enum Command {
         json: bool,
     },
 
-    /// Run the registered checkers for a git hook event.
+    /// Intercept a git hook event: local gates, then the delegated audit.
     ///
     /// Wired as `core.hooksPath` entries. git passes the event name and, for
     /// pre-push, the ref list on stdin.
@@ -68,24 +69,48 @@ enum Command {
         args: Vec<String>,
     },
 
-    /// Run the registered checkers outside a hook, for testing, for CI, and
-    /// to resume reviews a rate-limited provider left unfinished. For
-    /// `--event pre-push` the refs git would hand the hook are derived from
-    /// the checkout's outgoing branches when stdin supplies none.
+    /// Run the same interception outside a hook, for testing and for CI.
+    /// For `--event pre-push` the refs git would hand the hook are derived
+    /// from the checkout's outgoing branches when stdin supplies none.
     Check {
         #[arg(long, default_value = "pre-commit")]
         event: String,
         #[arg(long, default_value = ".")]
         directory: PathBuf,
-        /// Run only this checker.
-        #[arg(long)]
-        only: Option<String>,
         /// The release tag or exact commit, for `--event release`.
         #[arg(long)]
         tag: Option<String>,
+        /// The proposed head (branch or sha) for `--event pr`.
+        #[arg(long)]
+        pr_head: Option<String>,
+        /// The base branch for `--event pr`.
+        #[arg(long)]
+        pr_base: Option<String>,
+        /// The request number for `--event pr`.
+        #[arg(long)]
+        pr_number: Option<String>,
     },
 
-    /// Inspect recorded checker runs.
+    /// Audit what this push would carry, then run it.
+    ///
+    /// A bare `git push` connects to the remote before it runs the pre-push
+    /// hook - the hook's stdin is built from the remote's advertised refs,
+    /// which only the transport can supply - so the SSH credential is spent
+    /// before the audit has run. This entry restores the intended order: the
+    /// same ref lines are synthesized locally from the arguments and the
+    /// remote's mirror refs, the audit runs with no credential touched, and
+    /// only a passing audit hands control to the real `git push`. That push's
+    /// hook then re-audits the refs git actually advertises; the hook's run is
+    /// the authoritative verdict, so this pre-audit is advisory. It exists to
+    /// avoid spending the SSH credential before a failing audit is known.
+    /// Arguments are not forwarded unchanged: git receives the exact refspecs
+    /// the pre-audit examined.
+    Push {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Inspect recorded audit runs.
     ///
     /// Read-only: no vault, no network, no writes. Records are built to be
     /// read by someone other than the person who ran the gate, so nothing
@@ -95,7 +120,7 @@ enum Command {
         command: RecordsCommand,
     },
 
-    /// Show the effective checker registry.
+    /// Show the audit policy Probator enforces.
     Checkers {
         #[arg(long)]
         json: bool,
@@ -318,13 +343,12 @@ enum ConfigCommand {
     /// verification.
     Keygen,
 
-    /// Sign the configuration and the audit policy after editing them.
+    /// Sign the configuration and the engine-authorization policy.
     ///
     /// Editing `config.toml` or `checkers.toml` stays a plain file edit; this
     /// command is the ceremony that certifies both, gated by the same human
-    /// confirmation as releasing a credential. `[[checkers]]` rows still left
-    /// in `config.toml` migrate into `checkers.toml` first, so each file is
-    /// certified under its own signature.
+    /// confirmation as releasing a credential. The policy's signature is what
+    /// lets the audit engine run.
     Sign,
 
     /// Report the configuration's signature state. Fails when enforcement is
@@ -483,6 +507,9 @@ enum PrCommand {
         method: String,
         #[arg(long)]
         subject: Option<String>,
+        /// Target branch; read from the pull request when omitted.
+        #[arg(long)]
+        base: Option<String>,
     },
     /// Close a pull request without merging.
     Close { number: u64 },
@@ -501,7 +528,7 @@ enum RecordsCommand {
         #[arg(long)]
         json: bool,
     },
-    /// One recorded run, including what each checker printed.
+    /// One recorded run, including what each gate printed.
     Show {
         id: String,
         #[arg(long)]
@@ -579,15 +606,20 @@ fn main() -> ExitCode {
         Command::Check {
             event,
             directory,
-            only,
             tag,
+            pr_head,
+            pr_base,
+            pr_number,
         } => cmd_check(
             cli.config.as_ref(),
             &event,
             &directory,
-            only.as_deref(),
             tag.as_deref(),
+            pr_head.as_deref(),
+            pr_base.as_deref(),
+            pr_number.as_deref(),
         ),
+        Command::Push { args } => cmd_push(cli.config.as_ref(), &args),
         Command::Records { command } => cmd_records(cli.config.as_ref(), command),
         Command::Checkers { json } => cmd_checkers(cli.config.as_ref(), json),
         Command::Auth { command } => cmd_auth(cli.config.as_ref(), command),
@@ -691,30 +723,34 @@ fn cmd_resolve(
 }
 
 fn cmd_checkers(config: Option<&PathBuf>, json: bool) -> anyhow::Result<ExitCode> {
+    // The checker set belongs to Probator; the signed GitVault policy only
+    // authorizes the engine. Show the former and report the latter's state.
     let (cfg, cfg_path, _) = config::Config::load_unverified(config)?;
-    let (policy, _policy_path, policy_sig) = config::Policy::load_state(&cfg_path, &cfg)?;
-    if let configsig::SigState::Invalid(reason) = &policy_sig {
+    let (_policy, _policy_path, policy_sig) = config::Policy::load_state(&cfg_path, &cfg)?;
+    if let configsig::SigState::Invalid(reason) = policy_sig {
         eprintln!("warning: audit policy is uncertified - {reason}");
     }
+    let bin = probator::engine().map_err(anyhow::Error::msg)?;
+    let mut command = probator::command(&bin);
+    command.arg("inspect");
     if json {
-        println!("{}", serde_json::to_string_pretty(&policy.checkers)?);
-        return Ok(ExitCode::SUCCESS);
+        command.arg("--json");
     }
-    if policy.checkers.is_empty() {
-        println!("no checkers registered");
-        return Ok(ExitCode::SUCCESS);
-    }
-    for c in &policy.checkers {
-        println!(
-            "{:<24} on={:<26} severity={:<9} timeout={}s",
-            c.name,
-            c.on.join(","),
-            c.severity,
-            c.timeout_secs
+    let output = command.output().with_context(|| {
+        format!(
+            "cannot run {} - Probator is the audit engine and must be installed",
+            bin.display()
+        )
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "probator inspect failed ({}): {}",
+            output.status,
+            stderr.trim()
         );
-        println!("    kind    : {:?}", c.kind);
-        println!("    command : {}", c.command.join(" "));
     }
+    print!("{}", String::from_utf8_lossy(&output.stdout));
     Ok(ExitCode::SUCCESS)
 }
 
@@ -725,7 +761,13 @@ fn context_for(
     directory: &Path,
     release_tag: Option<String>,
     hook_args: &[String],
+    stdin_override: Option<String>,
 ) -> anyhow::Result<checkers::Context> {
+    // Both `hook` and `check` take the event from an argument. An unknown
+    // spelling would match no gate and reach no engine, so the report would be
+    // an empty pass - a typo at a publication boundary must refuse instead.
+    // `working-tree` is part of the accepted vocabulary.
+    config::Event::parse(event)?;
     let repo = git::Repo::discover(directory)?;
     let outcome = identity::resolve(cfg, &repo, false)?;
 
@@ -736,7 +778,11 @@ fn context_for(
     // review" - a vacuous pass at a publication boundary. `check` then
     // synthesizes the refs a push of this checkout would carry, which is also
     // what a scheduled resume of unfinished reviews needs to drive the gate.
-    let stdin = if event == "pre-push" {
+    // An explicit override (`gitvault push` derives its lines from argv, not
+    // a pipe) skips the read entirely.
+    let stdin = if let Some(lines) = stdin_override {
+        Some(lines)
+    } else if event == "pre-push" {
         let mut buf = String::new();
         if !std::io::stdin().is_terminal() {
             std::io::stdin().read_to_string(&mut buf)?;
@@ -795,6 +841,7 @@ fn context_for(
         stdin,
         push_remote,
         pr_base: None,
+        pr_base_sha: None,
         pr_head: None,
         pr_number: None,
         release_tag,
@@ -844,183 +891,884 @@ fn outgoing_push_stdin(repo: &git::Repo) -> String {
     buf
 }
 
-/// Run the certified audit policy and print the report BEFORE any signature
-/// question is asked. Audits first, blessing after: the routing signature only
-/// gates the verdict, never the audit.
+/// The audited push: audit the refs this command would move, then let git do
+/// the moving. Git's own order is connect, advertise, hook, send - so a bare
+/// `git push` spends the SSH credential before the pre-push hook exists.
+/// Here evidence is produced first from the local mirror (stale by at most a
+/// fetch, the same stand-in `check` uses) and the real push runs only on a
+/// pass. Its hook then re-audits the refs git actually advertises: that run is
+/// the authoritative verdict, and this pre-audit is advisory. The separation
+/// keeps a failing audit from spending the credential while leaving git's
+/// hook as the only authority on what is really being pushed. Probator may
+/// reuse its sealed verdict for a head it has already judged, so the hook
+/// does not always start a second model review.
+fn cmd_push(config: Option<&PathBuf>, args: &[String]) -> anyhow::Result<ExitCode> {
+    let (cfg, cfg_path, cfg_sig) = config::Config::load_unverified(config)?;
+    let (policy, _policy_path, policy_sig) = config::Policy::load_state(&cfg_path, &cfg)?;
+    let repo = git::Repo::discover(&PathBuf::from("."))?;
+    let plan = push_plan(&repo, args)?;
+    let mut ctx = context_for(
+        &cfg,
+        "pre-push",
+        &PathBuf::from("."),
+        None,
+        &[],
+        Some(plan.stdin),
+    )?;
+    ctx.push_remote = plan.remote.clone();
+    let report = audit_gate(&cfg, &cfg_sig, &policy, &policy_sig, &ctx, "push")?;
+    if report.exit_code() != ExitCode::SUCCESS {
+        return Ok(report.exit_code());
+    }
+    if plan.refs.is_empty() {
+        // `git push` with no refspec would re-apply push.default and could
+        // move a ref the plan never audited. Nothing selected is nothing to
+        // send; report the no-op instead of handing git an empty command.
+        eprintln!("gitvault: nothing to push - no ref moved and no git push started");
+        return Ok(ExitCode::SUCCESS);
+    }
+    eprintln!(
+        "gitvault: audits passed; the `git push` that follows spends its own \
+         SSH credential - no audit asked for it"
+    );
+    // Hand git the exact refspecs that were audited rather than the original
+    // argument vector. `--all`, `--tags`, `--delete` and a default push have
+    // already been expanded; options that could select another ref were
+    // refused above. `--no-follow-tags` and `--no-recurse-submodules` override
+    // the matching configuration, so no ref is added after the pre-audit.
+    let mut command = std::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(&ctx.repo_root)
+        .arg("push")
+        .args(&plan.args)
+        .arg("--")
+        .arg(plan.remote.as_deref().unwrap_or("origin"));
+    for reference in &plan.refs {
+        command.arg(reference.git_refspec());
+    }
+    let status = command
+        .stdin(std::process::Stdio::inherit())
+        .status()
+        .context("failed to run git push")?;
+    Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
+}
+
+/// A single ref the audited push will move. `gitvault push` hands git these
+/// exact refspecs, so the set of audited lines and the set of refs git may
+/// update are the same set, not two independently-parsed arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannedRef {
+    local_ref: String,
+    local_sha: String,
+    remote_ref: String,
+    remote_sha: String,
+    delete: bool,
+    force: bool,
+}
+
+impl PlannedRef {
+    /// The `<local ref> <local sha> <remote ref> <remote sha>` line the
+    /// pre-push hook would receive.
+    fn audit_line(&self) -> String {
+        if self.delete {
+            format!(
+                "(delete) {} {} {}",
+                zero_sha(),
+                self.remote_ref,
+                self.remote_sha
+            )
+        } else {
+            format!(
+                "{} {} {} {}",
+                self.local_ref, self.local_sha, self.remote_ref, self.remote_sha
+            )
+        }
+    }
+
+    /// The refspec handed to git. A deletion is `:<dst>`; a forced update
+    /// keeps its leading `+`.
+    fn git_refspec(&self) -> String {
+        if self.delete {
+            format!(":{}", self.remote_ref)
+        } else if self.force {
+            format!("+{}:{}", self.local_ref, self.remote_ref)
+        } else if self.local_ref == self.remote_ref {
+            self.local_ref.clone()
+        } else {
+            format!("{}:{}", self.local_ref, self.remote_ref)
+        }
+    }
+}
+
+/// What `cmd_push` audits before handing the push to git.
+#[derive(Debug)]
+struct PushPlan {
+    /// The remote the refspecs target, as git would resolve it from the
+    /// arguments (or the branch's configured push remote).
+    remote: Option<String>,
+    /// Every ref the command will move, already resolved against the local
+    /// mirror. These are handed to git as explicit refspecs.
+    refs: Vec<PlannedRef>,
+    /// Non-ref-selection options that may pass through (`--force`, `--atomic`,
+    /// `--dry-run`, ...). Ref selection and hook-skipping options never do.
+    args: Vec<String>,
+    /// The same refs rendered as the `<local ref> <local sha> <remote ref>
+    /// <remote sha>` lines the hook would receive.
+    stdin: String,
+}
+
+/// The push-argument shape the plan needs: which positional words are the
+/// remote and the refspecs, which scope flags change what is sent, and which
+/// options are safe to pass through unchanged.
+#[derive(Default)]
+struct PushArgs {
+    remote: Option<String>,
+    refspecs: Vec<String>,
+    all: bool,
+    mirror: bool,
+    tags: bool,
+    delete: bool,
+    /// `--no-verify` (or a git-accepted abbreviation): it would tell the real
+    /// `git push` to skip the pre-push hook, the authoritative audit of the
+    /// refs git actually advertises.
+    no_verify: bool,
+    /// `--stdin`: the ref list would arrive on stdin, so it cannot be
+    /// enumerated and audited before git consumes it.
+    read_stdin: bool,
+    /// `--follow-tags`: git would add annotated tags it selects after the
+    /// pre-audit has already run.
+    follow_tags: bool,
+    /// `--prune`: git would delete remote refs this checkout has no local
+    /// view of, so the pre-audit cannot name what the push removes.
+    prune: bool,
+    /// `--repo` supplied the remote; every positional word is then a
+    /// refspec, not a remote name.
+    repo_option: bool,
+    /// A parameterised ref selection (`--branches=<pattern>`) or a transport
+    /// that can publish submodule refs: not modelled by the pre-audit.
+    unmodelled: Option<String>,
+    /// Options that select neither refs nor the hook, such as `--force`,
+    /// `--atomic` and `--dry-run`; forwarded to the reconstructed push.
+    pass_through: Vec<String>,
+}
+
+/// Whether `arg` names `long`, or is an unambiguous prefix of it. git's
+/// parse-options accepts enough of a long option to be unique (`--no-v`,
+/// `--std`), so matching only the full spelling would leave a bypass.
+fn is_long_option(arg: &str, long: &str, shortest: usize) -> bool {
+    let name = arg.split_once('=').map(|(name, _)| name).unwrap_or(arg);
+    name.len() >= shortest && long.starts_with(name)
+}
+
+/// The value of a push option that takes one, from `--flag=value` or the next
+/// token. A next token beginning with `-` is not silently consumed as a value:
+/// it would hide a following option behind a positional ref.
+fn push_option_value(
+    args: &[String],
+    i: &mut usize,
+    inline: Option<&str>,
+    allow_hyphen: bool,
+) -> Option<String> {
+    if let Some(value) = inline {
+        return Some(value.to_string());
+    }
+    let value = args.get(*i + 1)?;
+    if value.starts_with('-') && !allow_hyphen {
+        return None;
+    }
+    *i += 1;
+    Some(value.clone())
+}
+
+fn parse_push_args(args: &[String]) -> PushArgs {
+    let mut parsed = PushArgs::default();
+    let mut positional: Vec<&str> = Vec::new();
+    let mut i = 0;
+    let mut bare = false;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if bare {
+            positional.push(arg);
+            i += 1;
+            continue;
+        }
+        if arg == "--" {
+            bare = true;
+            i += 1;
+            continue;
+        }
+        let (name, inline_value) = match arg.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (arg, None),
+        };
+        match name {
+            "--all" => parsed.all = true,
+            "--no-all" => parsed.all = false,
+            "--branches" if inline_value.is_none() => parsed.all = true,
+            "--no-branches" => parsed.all = false,
+            "--mirror" => parsed.mirror = true,
+            "--no-mirror" => parsed.mirror = false,
+            "--tags" => parsed.tags = true,
+            "--no-tags" => parsed.tags = false,
+            "-d" | "--delete" => parsed.delete = true,
+            "--no-delete" => parsed.delete = false,
+            "-o" | "--push-option" => {
+                if let Some(value) = push_option_value(args, &mut i, inline_value, true) {
+                    parsed.pass_through.push(name.to_string());
+                    parsed.pass_through.push(value);
+                } else {
+                    parsed.unmodelled = Some(format!("{name} has no value"));
+                }
+            }
+            "--repo" => match push_option_value(args, &mut i, inline_value, false) {
+                Some(value) if !value.is_empty() => {
+                    parsed.remote = Some(value);
+                    parsed.repo_option = true;
+                }
+                _ => parsed.unmodelled = Some("--repo has no value".to_string()),
+            },
+            "--exec" | "--receive-pack" => {
+                if let Some(value) = push_option_value(args, &mut i, inline_value, false) {
+                    parsed.pass_through.push(name.to_string());
+                    parsed.pass_through.push(value);
+                } else {
+                    parsed.unmodelled = Some(format!("{name} has no value"));
+                }
+            }
+            _ if is_long_option(arg, "--no-verify", 6) => parsed.no_verify = true,
+            _ if is_long_option(arg, "--stdin", 5) => parsed.read_stdin = true,
+            _ if is_long_option(arg, "--follow-tags", 7) => parsed.follow_tags = true,
+            // `--prune` deletes remote refs this checkout cannot enumerate
+            // from its mirror; the pre-audit must see every ref a push moves.
+            _ if is_long_option(arg, "--prune", 6) => parsed.prune = true,
+            _ if name == "--branches" => {
+                parsed.unmodelled =
+                    Some("--branches selects refs the pre-audit cannot enumerate".to_string());
+            }
+            _ if name == "--recurse-submodules" => {
+                parsed.unmodelled =
+                    Some("--recurse-submodules can publish submodule refs".to_string());
+            }
+            // Options that only affect transport or reporting, never the set
+            // of refs or the hook. Each is forwarded verbatim.
+            _ if matches!(
+                name,
+                "-f" | "--force"
+                    | "-u"
+                    | "--set-upstream"
+                    | "--atomic"
+                    | "--no-atomic"
+                    | "--signed"
+                    | "--no-signed"
+                    | "-n"
+                    | "--dry-run"
+                    | "-v"
+                    | "--verbose"
+                    | "-q"
+                    | "--quiet"
+                    | "--progress"
+                    | "--no-progress"
+                    | "--no-verbose"
+                    | "--no-quiet"
+                    | "--no-dry-run"
+                    | "--no-porcelain"
+                    | "--no-set-upstream"
+                    | "--no-force"
+                    | "--no-force-with-lease"
+                    | "--no-force-if-includes"
+                    | "--porcelain"
+                    | "--thin"
+                    | "--no-thin"
+                    | "--ipv4"
+                    | "-4"
+                    | "--ipv6"
+                    | "-6"
+                    | "--no-prune"
+                    | "--verify"
+                    | "--no-follow-tags"
+                    | "--no-recurse-submodules"
+            ) =>
+            {
+                parsed.pass_through.push(arg.to_string());
+            }
+            _ if is_long_option(arg, "--force-with-lease", 8)
+                || is_long_option(arg, "--force-if-includes", 7) =>
+            {
+                parsed.pass_through.push(arg.to_string());
+            }
+            _ if arg.starts_with('-') => {
+                if parsed.unmodelled.is_none() {
+                    parsed.unmodelled = Some(format!(
+                        "{arg} is not modelled by the pre-audit; push explicit refspecs instead"
+                    ));
+                }
+            }
+            _ => positional.push(arg),
+        }
+        i += 1;
+    }
+    if parsed.repo_option {
+        parsed.refspecs = positional.iter().map(|s| s.to_string()).collect();
+    } else {
+        parsed.remote = positional.first().map(|s| s.to_string()).or(parsed.remote);
+        parsed.refspecs = positional.iter().skip(1).map(|s| s.to_string()).collect();
+    }
+    parsed
+}
+
+impl PushArgs {
+    /// Ref-selection options the pre-audit cannot model. Refusing them keeps
+    /// the wrapper's promise: every ref git may publish has been judged before
+    /// the transport is touched. `--no-verify` is worse still - it skips the
+    /// real hook's re-check of the advertised refs entirely.
+    fn unmodelled(&self) -> Option<&str> {
+        if self.no_verify {
+            Some("--no-verify would skip the pre-push audit that re-checks the advertised refs")
+        } else if self.read_stdin {
+            Some("--stdin keeps the ref list off the pre-audit's command line")
+        } else if self.follow_tags {
+            Some("--follow-tags lets git add tags after the pre-audit has run")
+        } else if self.prune {
+            // Prune deletes remote refs whose local counterpart is gone; the
+            // pre-audit has no local name for them to judge or carry.
+            Some("--prune would delete refs the local mirror cannot enumerate")
+        } else if self.mirror {
+            // A mirror can delete remote refs GitVault has no local view of;
+            // the pre-audit cannot enumerate the whole target namespace.
+            Some("--mirror would move refs the local mirror does not describe")
+        } else {
+            self.unmodelled.as_deref()
+        }
+    }
+}
+
+fn git_config(root: &Path, key: &str) -> Option<String> {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "--get", key])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Whether `remote` is configured to mirror the whole ref namespace. The
+/// `--mirror` command-line flag is refused by the parser, but
+/// `remote.<name>.mirror=true` gives git the same behaviour, and
+/// `--no-mirror` does not override it - a mirrored push would publish refs
+/// the plan never enumerated. `--get` drops a valueless key (git still treats
+/// it as true), so the boolean is read with `--bool`, and an unreadable or
+/// invalid value refuses rather than being mistaken for "not a mirror".
+fn remote_mirrors(repo: &git::Repo, remote: &str) -> bool {
+    let key = format!("remote.{remote}.mirror");
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo.root)
+        .args(["config", "--bool", "--get", &key])
+        .output();
+    match output {
+        Ok(out) => match out.status.code() {
+            // The key is absent: not a mirror.
+            Some(1) => false,
+            Some(0) => String::from_utf8_lossy(&out.stdout).trim() == "true",
+            // Bad value or another git failure: a configuration this plan
+            // cannot read is not a remote it will push through.
+            _ => true,
+        },
+        Err(_) => true,
+    }
+}
+
+/// `(refname, objectname)` for every ref under `prefix` - heads or tags.
+fn refs_under(repo: &git::Repo, prefix: &str) -> Vec<(String, String)> {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo.root)
+        .args(["for-each-ref", "--format=%(refname) %(objectname)", prefix])
+        .output()
+        .ok()
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|line| {
+                    let mut fields = line.split_whitespace();
+                    match (fields.next(), fields.next()) {
+                        (Some(name), Some(sha)) => Some((name.to_string(), sha.to_string())),
+                        _ => None,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn zero_sha() -> String {
+    "0".repeat(40)
+}
+
+/// The remote's position for `remote_ref`, read from this checkout's mirror.
+/// Only branch destinations live under `refs/remotes`; tags and other
+/// namespaces get the zeros a real first push would carry.
+fn mirror_sha(repo: &git::Repo, remote: Option<&str>, remote_ref: &str) -> String {
+    let Some(short) = remote_ref.strip_prefix("refs/heads/") else {
+        return zero_sha();
+    };
+    remote
+        .and_then(|name| {
+            repo.resolve_commit(&format!("refs/remotes/{name}/{short}"))
+                .ok()
+        })
+        .unwrap_or_else(zero_sha)
+}
+
+/// The heads the remote advertises right now, as `(refname, oid)`.
+///
+/// `push.default=matching` is defined by the remote's refs, not by this
+/// checkout's mirror: a stale mirror would make the wrapper hand git refspecs
+/// a real `git push` would not have selected (or omit ones it would). The
+/// advertised set is read read-only before the audit, which is a credential
+/// use but not a publication; a failed or unreadable answer refuses instead
+/// of falling back to the mirror.
+fn advertised_heads(repo: &git::Repo, remote: &str) -> anyhow::Result<Vec<(String, String)>> {
+    eprintln!(
+        "gitvault: reading {remote}'s advertised heads so push.default=matching selects \
+         what git would send (a read-only credential use before its report)"
+    );
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo.root)
+        .args(["ls-remote", "--heads", "--", remote])
+        .output()
+        .context("failed to run git ls-remote")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "cannot read {remote}'s advertised heads; refusing push.default=matching rather \
+         than selecting from a stale local mirror - pass explicit refspecs"
+    );
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (oid, name) = line.split_once('\t')?;
+            let name = name.trim();
+            name.starts_with("refs/heads/")
+                .then(|| (name.to_string(), oid.trim().to_string()))
+        })
+        .collect())
+}
+
+/// The ref name a bare destination word normalizes to, mirroring git's own
+/// expansion: a tag source keeps `refs/tags/`, everything else is a branch.
+fn normalize_dst(dst: &str, tag_source: bool) -> String {
+    if dst.starts_with("refs/") {
+        dst.to_string()
+    } else if tag_source {
+        format!("refs/tags/{dst}")
+    } else {
+        format!("refs/heads/{dst}")
+    }
+}
+
+/// Resolve a refspec source to the `(local ref, local sha)` pair the hook
+/// would report. Branches and tags resolve under their namespaces first so
+/// the line names the ref, not a raw revision expression.
+fn resolve_push_src(repo: &git::Repo, src: &str) -> anyhow::Result<(String, String)> {
+    for candidate in [
+        format!("refs/heads/{src}"),
+        format!("refs/tags/{src}"),
+        src.to_string(),
+    ] {
+        if let Ok(sha) = repo.resolve_commit(&candidate) {
+            let local_ref = if candidate.starts_with("refs/") {
+                candidate
+            } else {
+                src.to_string()
+            };
+            return Ok((local_ref, sha));
+        }
+    }
+    anyhow::bail!("push source '{src}' does not resolve here - git would refuse it too")
+}
+
+/// The remote ref a deletion names. A plain name is resolved against the local
+/// tag and branch namespaces, and a name that exists in both is refused: git's
+/// short-name expansion would otherwise pick one, while the audit line and the
+/// refspec handed to git could name different refs. A name that exists in
+/// neither is refused too - the operator must spell the full remote ref rather
+/// than have GitVault guess at a namespace for a ref this checkout cannot see.
+fn deletion_ref(repo: &git::Repo, name: &str) -> anyhow::Result<String> {
+    let name = name.trim();
+    anyhow::ensure!(!name.is_empty(), "a deletion names no ref");
+    if name.starts_with("refs/") {
+        return Ok(name.to_string());
+    }
+    let branch = format!("refs/heads/{name}");
+    let tag = format!("refs/tags/{name}");
+    let has_branch = repo.resolve_commit(&branch).is_ok();
+    let has_tag = repo.resolve_commit(&tag).is_ok();
+    match (has_branch, has_tag) {
+        (true, true) => anyhow::bail!(
+            "deletion '{name}' is ambiguous: both {branch} and {tag} exist; name the \
+             full ref so the audit line and git delete the same one"
+        ),
+        (true, false) => Ok(branch),
+        (false, true) => Ok(tag),
+        (false, false) => anyhow::bail!(
+            "deletion '{name}' matches no local branch or tag; name the full remote \
+             ref (refs/heads/{name} or refs/tags/{name})"
+        ),
+    }
+}
+
+/// One refspec word resolved into the ref the hook and git will both see.
+/// `:dst` and `--delete` names are deletions; `+src[:dst]` keeps its forced
+/// update; `src[:dst]` maps the resolved source onto the destination's mirror
+/// position.
+fn planned_ref(
+    repo: &git::Repo,
+    spec: &str,
+    remote: Option<&str>,
+    delete: bool,
+) -> anyhow::Result<PlannedRef> {
+    let (force, spec) = match spec.strip_prefix('+') {
+        Some(spec) => (true, spec),
+        None => (false, spec),
+    };
+    if let Some(dst) = spec.strip_prefix(':') {
+        let remote_ref = deletion_ref(repo, dst)?;
+        return Ok(PlannedRef {
+            local_ref: String::new(),
+            local_sha: zero_sha(),
+            remote_ref: remote_ref.clone(),
+            remote_sha: mirror_sha(repo, remote, &remote_ref),
+            delete: true,
+            force: false,
+        });
+    }
+    let (src, dst) = match spec.split_once(':') {
+        Some((src, dst)) => (src, dst),
+        // No destination: the source name is the destination, except for
+        // `HEAD`, which git resolves to the current branch's name.
+        None => (spec, ""),
+    };
+    if delete {
+        // `push --delete origin a b` lists plain names, not `:name` refspecs.
+        let remote_ref = deletion_ref(repo, src)?;
+        return Ok(PlannedRef {
+            local_ref: String::new(),
+            local_sha: zero_sha(),
+            remote_ref: remote_ref.clone(),
+            remote_sha: mirror_sha(repo, remote, &remote_ref),
+            delete: true,
+            force: false,
+        });
+    }
+    let (local_ref, local_sha) = resolve_push_src(repo, src)?;
+    // `git push origin HEAD` publishes the current branch under its own name.
+    // Treating HEAD as a literal branch name would create refs/heads/HEAD and
+    // push to a ref the operator never asked for.
+    let remote_ref = if dst.is_empty() && src == "HEAD" {
+        let branch = repo.current_branch().ok_or_else(|| {
+            anyhow::anyhow!(
+                "HEAD is detached and no destination was given - git would refuse too; \
+                 name the remote branch explicitly (HEAD:<branch>)"
+            )
+        })?;
+        format!("refs/heads/{branch}")
+    } else {
+        normalize_dst(
+            if dst.is_empty() { src } else { dst },
+            local_ref.starts_with("refs/tags/"),
+        )
+    };
+    Ok(PlannedRef {
+        local_ref,
+        local_sha,
+        remote_ref: remote_ref.clone(),
+        remote_sha: mirror_sha(repo, remote, &remote_ref),
+        delete: false,
+        force,
+    })
+}
+
+/// The remote a `git push` from this checkout would use, by git's own
+/// precedence: the argument, `branch.<name>.pushRemote`,
+/// `remote.pushDefault`, `branch.<name>.remote`, then `origin`. The same name
+/// drives both the mirror lookup and the reconstructed push, so the two can
+/// never target different repositories.
+fn resolved_push_remote(repo: &git::Repo, explicit: Option<String>) -> Option<String> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    let branch = repo.current_branch();
+    let branch_config = |key: &str| {
+        branch
+            .as_deref()
+            .and_then(|branch| git_config(&repo.root, &format!("branch.{branch}.{key}")))
+    };
+    branch_config("pushRemote")
+        .or_else(|| git_config(&repo.root, "remote.pushDefault"))
+        .or_else(|| branch_config("remote"))
+        .or_else(|| Some("origin".to_string()))
+}
+
+/// The upstream branch's local name, `refs/heads/` stripped: the destination
+/// `simple` and `upstream` push to. `None` means the branch has no upstream.
+fn upstream_branch(repo: &git::Repo, branch: &str) -> Option<String> {
+    git_config(&repo.root, &format!("branch.{branch}.merge"))
+        .and_then(|merge| merge.strip_prefix("refs/heads/").map(str::to_string))
+}
+
+/// The refs a bare `git push` of this checkout would carry, honoring
+/// `push.default` exactly as git does:
+///
+/// * `simple` requires an upstream with the same name when it pushes to the
+///   branch's pull remote; pushing to a different remote behaves as `current`;
+/// * `upstream` requires an upstream on the branch's pull remote and pushes
+///   to the upstream's name;
+/// * `current` pushes the current branch to its own name;
+/// * `matching` pushes only heads the target remote advertises; that set is
+///   read read-only before the audit, not inferred from a stale local mirror.
+///
+/// A destination git would refuse is a refusal here too, never a synthesized
+/// branch the operator did not ask for.
+fn default_push_refs(repo: &git::Repo, remote: Option<&str>) -> anyhow::Result<Vec<PlannedRef>> {
+    let mode = git_config(&repo.root, "push.default").unwrap_or_else(|| "simple".to_string());
+    if mode == "nothing" {
+        anyhow::bail!("push.default is 'nothing' and no refspec was given - git would refuse too");
+    }
+    if mode == "matching" {
+        // Matching is defined by the remote's refs. Read the advertised set
+        // read-only before the audit and use its object ids as the review
+        // bases too; a stale local mirror is not authoritative for which refs
+        // git would select.
+        let remote = remote.unwrap_or("origin");
+        let advertised = advertised_heads(repo, remote)?;
+        let mut selected = Vec::new();
+        for (name, sha) in refs_under(repo, "refs/heads") {
+            let Some((_, remote_sha)) = advertised.iter().find(|(refname, _)| refname == &name)
+            else {
+                continue;
+            };
+            selected.push(PlannedRef {
+                local_ref: name.clone(),
+                local_sha: sha,
+                remote_ref: name,
+                remote_sha: remote_sha.clone(),
+                delete: false,
+                force: false,
+            });
+        }
+        return Ok(selected);
+    }
+    let branch = repo.current_branch().ok_or_else(|| {
+        anyhow::anyhow!("not on a branch and no refspec given - git would refuse this push too")
+    })?;
+    let local_ref = format!("refs/heads/{branch}");
+    let local_sha = repo.resolve_commit(&local_ref)?;
+    let upstream = upstream_branch(repo, &branch);
+    // Git's default remote is `origin` even when `branch.<name>.remote` is
+    // unset; `simple` treats a push there as the pull-remote case.
+    let pull_remote = git_config(&repo.root, &format!("branch.{branch}.remote"))
+        .unwrap_or_else(|| "origin".to_string());
+    let pushing_elsewhere = remote.is_some_and(|remote| remote != pull_remote);
+    let dst = match mode.as_str() {
+        "current" => branch.clone(),
+        "simple" => {
+            if pushing_elsewhere {
+                // Git switches to `current` semantics for another remote: no
+                // upstream is required and the branch keeps its own name.
+                branch.clone()
+            } else {
+                let Some(upstream) = upstream.as_deref() else {
+                    anyhow::bail!(
+                        "push.default is 'simple' and branch '{branch}' has no upstream branch - \
+                         git would refuse too; pass an explicit refspec (or `-u`) instead"
+                    );
+                };
+                if upstream != branch {
+                    anyhow::bail!(
+                        "push.default is 'simple' and the upstream branch '{upstream}' does not \
+                         match '{branch}' - git would refuse too; pass an explicit refspec instead"
+                    );
+                }
+                branch.clone()
+            }
+        }
+        "upstream" => {
+            let Some(upstream) = upstream.as_deref() else {
+                anyhow::bail!(
+                    "push.default is 'upstream' and branch '{branch}' has no upstream branch - \
+                     git would refuse too; pass an explicit refspec instead"
+                );
+            };
+            if !pushing_elsewhere {
+                upstream.to_string()
+            } else {
+                anyhow::bail!(
+                    "push.default is 'upstream' but the push remote is not the upstream of \
+                     '{branch}' - git would refuse too; pass an explicit refspec instead"
+                );
+            }
+        }
+        other => {
+            anyhow::bail!(
+                "push.default is '{other}', which git does not accept - \
+                 fix the configuration or pass an explicit refspec"
+            )
+        }
+    };
+    let remote_ref = format!("refs/heads/{dst}");
+    Ok(vec![PlannedRef {
+        local_ref,
+        local_sha,
+        remote_sha: mirror_sha(repo, remote, &remote_ref),
+        remote_ref,
+        delete: false,
+        force: false,
+    }])
+}
+
+/// Build the audit surface for `gitvault push`: the remote, the exact refs
+/// git will be told to move, and the lines the pre-push hook would receive.
+///
+/// `--no-verify`, `--stdin`, `--follow-tags`, `--prune`, `--mirror`,
+/// parameterised ref selection and any option the parser does not model are
+/// refused: the plan must see every ref before the transport is touched. The
+/// same `refs` vector is handed to git afterwards, so there is no second
+/// argument parse that could select something the audit did not see.
+fn push_plan(repo: &git::Repo, args: &[String]) -> anyhow::Result<PushPlan> {
+    let parsed = parse_push_args(args);
+    if let Some(why) = parsed.unmodelled() {
+        anyhow::bail!(
+            "gitvault push refuses this option: {why}\n  \
+             push the refs explicitly (or use --tags) so the pre-audit sees every ref"
+        );
+    }
+    if parsed.delete && (parsed.all || parsed.tags) {
+        anyhow::bail!(
+            "gitvault push refuses --delete with --all/--tags: name the refs to delete explicitly"
+        );
+    }
+    if parsed.all && parsed.tags {
+        anyhow::bail!("gitvault push refuses --all with --tags; git refuses that combination too");
+    }
+    // The remote git would push to, by its own precedence. The mirror lookup
+    // and the reconstructed push both use this one name, so a configured
+    // `pushRemote`/`remote.pushDefault` cannot make them disagree. A URL or
+    // path here just misses every mirror, which reads as the honest "new refs"
+    // zeros.
+    let remote = resolved_push_remote(repo, parsed.remote.clone());
+    if let Some(name) = remote.as_deref()
+        && remote_mirrors(repo, name)
+    {
+        anyhow::bail!(
+            "remote '{name}' sets remote.{name}.mirror=true, which would push the whole ref \
+             namespace - GitVault cannot pre-audit that set; set the option to false or push \
+             explicit refspecs to a non-mirror remote"
+        );
+    }
+    // Git gives `remote.<name>.push` precedence over `push.default` when no
+    // refspec or selector is on the command line. Those configured refspecs
+    // can rename, force or delete refs, so following push.default instead
+    // would audit (and publish) a different set than git would. Refuse the
+    // bare push rather than guess; an explicit refspec or --all/--tags
+    // bypasses the configured list, exactly as git does.
+    let bare_push = !parsed.all && !parsed.tags && !parsed.delete && parsed.refspecs.is_empty();
+    if bare_push
+        && let Some(name) = remote.as_deref()
+        && git_config(&repo.root, &format!("remote.{name}.push")).is_some()
+    {
+        anyhow::bail!(
+            "remote '{name}' sets remote.{name}.push, whose configured refspecs GitVault \
+             cannot pre-audit; push the refs explicitly (or use --all/--tags) so the \
+             pre-audit sees every ref"
+        );
+    }
+    let mut refs: Vec<PlannedRef> = Vec::new();
+    if parsed.all {
+        for (name, sha) in refs_under(repo, "refs/heads") {
+            refs.push(PlannedRef {
+                remote_sha: mirror_sha(repo, remote.as_deref(), &name),
+                local_ref: name.clone(),
+                local_sha: sha,
+                remote_ref: name,
+                delete: false,
+                force: false,
+            });
+        }
+    }
+    if parsed.tags {
+        for (name, sha) in refs_under(repo, "refs/tags") {
+            refs.push(PlannedRef {
+                local_ref: name.clone(),
+                local_sha: sha,
+                remote_sha: zero_sha(),
+                remote_ref: name,
+                delete: false,
+                force: false,
+            });
+        }
+    }
+    for spec in &parsed.refspecs {
+        refs.push(planned_ref(repo, spec, remote.as_deref(), parsed.delete)?);
+    }
+    // A bare push follows push.default. An explicit selector that matched
+    // nothing (`--tags` with no tags, `matching` with no advertised head)
+    // is a no-op, not an invitation to fall back to the current branch.
+    let selected = parsed.all || parsed.tags || !parsed.refspecs.is_empty();
+    if refs.is_empty() && !selected {
+        if parsed.delete {
+            anyhow::bail!("--delete without a ref name - git would refuse this push too");
+        }
+        refs = default_push_refs(repo, remote.as_deref())?;
+    }
+    refs.sort_by(|a, b| {
+        (&a.remote_ref, &a.local_ref, a.delete).cmp(&(&b.remote_ref, &b.local_ref, b.delete))
+    });
+    refs.dedup_by(|a, b| {
+        a.remote_ref == b.remote_ref && a.local_ref == b.local_ref && a.delete == b.delete
+    });
+    let mut stdin = refs
+        .iter()
+        .map(PlannedRef::audit_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !stdin.is_empty() {
+        stdin.push('\n');
+    }
+    let mut git_args = parsed.pass_through;
+    // Override configuration that could add refs after the audit: follow-tags
+    // and recursive submodule refs. `--prune` is refused above, `--mirror`
+    // is refused above, and a mirror-configured remote is refused before the
+    // plan is built; these close the command-line paths.
+    for required in ["--no-follow-tags", "--no-recurse-submodules", "--no-prune"] {
+        if !git_args.iter().any(|arg| arg == required) {
+            git_args.push(required.to_string());
+        }
+    }
+    Ok(PushPlan {
+        remote,
+        refs,
+        args: git_args,
+        stdin,
+    })
+}
+
+/// Run the local interception gates and the delegated Probator audit, and
+/// print the report BEFORE the routing signature is asked about. Audits first,
+/// blessing after: the routing signature only gates the verdict, never the
+/// audit.
 ///
 /// `pre-push`, `pr` and `release` are publication boundaries unconditionally:
-/// they spend credentials or put content on GitHub, so an uncertified policy
-/// or routing table refuses them even when the policy registers no checkers -
-/// an emptied policy file must never read as "no audit required". Every other
-/// event is held to the signatures only when the policy's commands would
-/// actually execute: an event the policy says nothing about runs nothing, and
-/// local work (commits, messages) is never held hostage to a blessing.
-/// `allow_proposed` splits the audit tool from the enforcement path: `check`
-/// audits a policy as a *proposal* - the evidence must exist before the
-/// blessing can be asked for - while hooks and publication fail closed.
-/// The directory `gitvault-review install` materializes checker contracts
-/// into. A proposed policy may only run contracts living here - the install
-/// surface is operator-controlled, so a contract inside it is not something a
-/// tampered checkers.toml could have written.
-fn profiles_root() -> PathBuf {
-    let base = std::env::var("XDG_DATA_HOME")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
-                .join(".local")
-                .join("share")
-        });
-    base.join("gitvault").join("profiles")
-}
-
-/// Whether one row of an uncertified ("proposed") policy may execute. The
-/// signature boundary exists because checker rows are arbitrary code, so a
-/// proposal may only invoke the trusted audit runner that lives beside this
-/// binary: `baseline`, or `run --contract` on a contract installed under the
-/// profiles root. Anything else must refuse the run, not be skipped - an
-/// unsigned file sneaking in a foreign command cannot launder a partial audit.
-fn admissible_proposed_row(
-    checker: &config::Checker,
-    repo_root: &Path,
-) -> Result<Option<PathBuf>, String> {
-    if checker.kind != config::Kind::Exec {
-        return Err(format!(
-            "kind '{:?}' is not the plain exec a proposal may run",
-            checker.kind
-        ));
-    }
-    // A proposal gets no environment of its own at all: `GITVAULT_*` context
-    // would retarget the audit and loader variables like DYLD_* or PATH turn
-    // the trusted runner into a different process. Installed rows carry none.
-    if let Some(key) = checker.env.keys().next() {
-        return Err(format!(
-            "env '{key}' — a proposal may not override the runner environment"
-        ));
-    }
-    let declared = checker.command.first().map(String::as_str).unwrap_or("");
-    let trusted = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("gitvault-review")))
-        .ok_or_else(|| "the audit runner sibling is not installed".to_string())?;
-    let trusted = std::fs::canonicalize(&trusted).unwrap_or(trusted);
-    let declared_path = std::fs::canonicalize(declared)
-        .map_err(|_| format!("command '{declared}' does not resolve"))?;
-    if declared_path != trusted {
-        return Err(format!(
-            "command '{declared}' is not the audit runner next to this binary"
-        ));
-    }
-    // Exact argument shape: the runner may only ever audit this repository.
-    // `{repo}` resolves to the run context's root; a literal path must be the
-    // same directory so a proposal cannot grade an unrelated tree.
-    let tail = &checker.command[1..];
-    let mut contract: Option<PathBuf> = None;
-    let mut seen_repo = false;
-    let sub = tail.first().map(String::as_str).unwrap_or("");
-    if sub != "baseline" && sub != "run" {
-        return Err(format!(
-            "subcommand '{sub}' is not one a proposal may invoke"
-        ));
-    }
-    let mut args = tail[1..].iter();
-    while let Some(flag) = args.next() {
-        match flag.as_str() {
-            "--repo" => {
-                if seen_repo {
-                    return Err("duplicate --repo".to_string());
-                }
-                seen_repo = true;
-                let value = args.next().ok_or("--repo without a value")?;
-                if value != "{repo}" {
-                    let canon = std::fs::canonicalize(value)
-                        .map_err(|_| format!("--repo '{value}' does not resolve"))?;
-                    let root = std::fs::canonicalize(repo_root)
-                        .unwrap_or_else(|_| repo_root.to_path_buf());
-                    if canon != root {
-                        return Err(format!(
-                            "--repo '{value}' is not the repository under review"
-                        ));
-                    }
-                }
-            }
-            "--contract" if sub == "run" => {
-                if contract.is_some() {
-                    return Err("duplicate --contract".to_string());
-                }
-                let value = args.next().ok_or("--contract without a value")?;
-                contract = Some(proposed_contract_path_at(value)?);
-            }
-            other => return Err(format!("argument '{other}' is outside the audit shape")),
-        }
-    }
-    if !seen_repo {
-        return Err("missing --repo binding to the repository under review".to_string());
-    }
-    if sub == "run" && contract.is_none() {
-        return Err("run without --contract".to_string());
-    }
-    Ok(contract)
-}
-
-/// The `--contract` a proposed `run` row may name, as a path value.
-fn proposed_contract_path_at(contract: &str) -> Result<PathBuf, String> {
-    let contract_path = std::fs::canonicalize(contract)
-        .map_err(|_| format!("contract '{contract}' does not resolve"))?;
-    let root = std::fs::canonicalize(profiles_root()).unwrap_or_else(|_| profiles_root());
-    if contract_path.starts_with(&root) {
-        Ok(contract_path)
-    } else {
-        Err(format!(
-            "contract '{contract}' is outside the installed profiles root"
-        ))
-    }
-}
-
-/// Installed reviewer contracts that cover `event` at blocking severity — the
-/// operator-controlled set a proposed boundary policy must still audit with.
-/// Enumeration, read and parse failures fail closed: an unreadable installed
-/// contract cannot silently shrink the set the proposal is checked against.
-fn installed_boundary_contracts(event: config::Event) -> Result<Vec<(PathBuf, String)>, String> {
-    let root = std::fs::canonicalize(profiles_root()).unwrap_or_else(|_| profiles_root());
-    let mut contracts = Vec::new();
-    let pattern_dirs = std::fs::read_dir(&root)
-        .map_err(|e| format!("cannot enumerate {}: {e}", root.display()))?;
-    for pattern_dir in pattern_dirs {
-        let pattern_dir =
-            pattern_dir.map_err(|e| format!("cannot enumerate {}: {e}", root.display()))?;
-        let plugins = pattern_dir.path().join("plugins");
-        let entries = match std::fs::read_dir(&plugins) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(format!("cannot enumerate {}: {e}", plugins.display())),
-        };
-        for entry in entries {
-            let entry =
-                entry.map_err(|e| format!("cannot enumerate {}: {e}", plugins.display()))?;
-            let path = entry.path().join("contract.json");
-            if !path.is_file() {
-                continue;
-            }
-            let raw =
-                std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-            let doc = serde_json::from_str::<serde_json::Value>(&raw)
-                .map_err(|e| format!("{}: unreadable contract: {e}", path.display()))?;
-            let covers = doc["on"]
-                .as_array()
-                .map(|on| on.iter().any(|e| e.as_str() == Some(event.name())))
-                .unwrap_or(false);
-            let blocking = doc["severity"].as_str() == Some("blocking");
-            if covers && blocking {
-                let name = doc["name"].as_str().unwrap_or("?").to_string();
-                contracts.push((path, name));
-            }
-        }
-    }
-    Ok(contracts)
-}
-
+/// they spend credentials or put content on GitHub, so an uncertified routing
+/// table refuses them only after the audit report is on screen. Local events
+/// (`pre-commit`, the message hooks) never spend a credential and never reach
+/// Probator, so they are not held hostage to a blessing. `working-tree` does
+/// reach the engine, but it publishes nothing - it is an on-demand look at
+/// the uncommitted tree - so it is not a publication boundary either.
 fn audit_gate(
     cfg: &config::Config,
     cfg_sig: &configsig::SigState,
@@ -1028,161 +1776,44 @@ fn audit_gate(
     policy_sig: &configsig::SigState,
     ctx: &checkers::Context,
     operation: &str,
-    only: Option<&str>,
-    allow_proposed: bool,
 ) -> anyhow::Result<checkers::Report> {
-    let event = config::Event::parse(&ctx.event)?;
-    let selected = policy.checkers_for(event);
-    let boundary = matches!(
-        event,
-        config::Event::PrePush | config::Event::Pr | config::Event::Release
-    );
-    // Rows may carry a `repos` scope that `run_all` honors by dropping
-    // non-matching rows. Every completeness judgment below must reason
-    // about the rows that would actually execute for this repository -
-    // a policy scoped entirely elsewhere must not count as audit evidence.
-    let effective: Vec<&config::Checker> = selected
-        .iter()
-        .copied()
-        .filter(|c| only.is_some() || c.applies_to(ctx.repo_slug.as_deref(), &ctx.repo_root))
-        .filter(|c| only.is_none_or(|name| c.name == name))
-        .collect();
-    // Checker rows are arbitrary code, so running them unsigned is the
-    // privilege hole this guard closes. `selected` only shapes the refusal
-    // message; it is never a precondition for checking the signature.
-    if let configsig::SigState::Invalid(reason) = policy_sig
-        && (boundary || !selected.is_empty())
-    {
-        let declared = if selected.is_empty() {
-            format!("it registers no checkers for {}", event.name())
-        } else {
-            format!(
-                "it declares:\n    {}",
-                selected
-                    .iter()
-                    .map(|c| format!("{} -> {}", c.name, c.command.join(" ")))
-                    .collect::<Vec<_>>()
-                    .join("\n    ")
-            )
-        };
-        if !allow_proposed {
-            anyhow::bail!(
-                "refusing to run an uncertified audit policy: {reason}\n  \
-                 {declared}\n  \
-                 if this is the policy audits should enforce, certify it: gitvault config sign"
-            );
-        }
-        eprintln!(
-            "gitvault: auditing the proposed audit policy (uncertified: {reason})\n  \
-             {declared}\n  \
-             the signature stays last - certify only after these audits pass: \
-             gitvault config sign"
-        );
-        // `--only` narrows the run to one row, but a boundary proposal's
-        // blessing needs evidence from the whole required set - a partial
-        // audit that passes must never stand in for it.
-        if boundary && only.is_some() {
-            anyhow::bail!(
-                "refusing to audit the proposed audit policy partially: --only \
-                 runs a single checker, but a {} proposal must produce \
-                 evidence from every applicable reviewer",
-                event.name()
-            );
-        }
-        // Even as a proposal the file stays inert where it counts: only rows
-        // that invoke the trusted audit runner beside this binary may run,
-        // bound to this repository and this installed contract set. The
-        // commands are still audited - as content - by the runners that
-        // do execute.
-        let mut covered: Vec<(&config::Checker, Option<PathBuf>)> = Vec::new();
-        for checker in &selected {
-            match admissible_proposed_row(checker, &ctx.repo_root) {
-                Ok(contract) => covered.push((checker, contract)),
-                Err(why) => anyhow::bail!(
-                    "refusing to run the proposed audit policy: checker '{}' \
-                     escapes the audit-runner boundary: {why}",
-                    checker.name
-                ),
-            }
-        }
-        // A boundary proposal cannot downgrade the audit it must produce:
-        // the deterministic baseline sweep and every installed blocking
-        // contract for this event still run, at blocking severity, or the
-        // evidence under-certifies the policy an operator would then sign.
-        if boundary && !selected.is_empty() {
-            let baseline_kept = covered.iter().any(|(checker, found)| {
-                found.is_none()
-                    && checker.severity == config::Severity::Blocking
-                    && checker.applies_to(ctx.repo_slug.as_deref(), &ctx.repo_root)
-            });
-            if !baseline_kept {
-                anyhow::bail!(
-                    "refusing to run the proposed audit policy: the \
-                     publication-baseline sweep is missing or downgraded for \
-                     {} - a boundary proposal must keep the deterministic \
-                     baseline at blocking severity",
-                    event.name()
-                );
-            }
-            let installed = installed_boundary_contracts(event).map_err(|why| {
-                anyhow::anyhow!(
-                    "refusing to run the proposed audit policy: the installed \
-                     blocking-reviewer set cannot be established: {why}"
-                )
-            })?;
-            for (contract, name) in installed {
-                let hit = covered.iter().any(|(checker, found)| {
-                    checker.severity == config::Severity::Blocking
-                        && found.as_ref() == Some(&contract)
-                        && checker.applies_to(ctx.repo_slug.as_deref(), &ctx.repo_root)
-                });
-                if !hit {
-                    anyhow::bail!(
-                        "refusing to run the proposed audit policy: installed \
-                         reviewer '{name}' is missing or downgraded for {} - a \
-                         boundary proposal must keep every installed blocking \
-                         reviewer",
-                        event.name()
-                    );
-                }
-            }
-        }
+    let boundary = matches!(ctx.event.as_str(), "pre-push" | "pr" | "release");
+    // The rows are not executed, but a signed row naming another executor
+    // would still be a signed claim that some other program is the audit
+    // engine. Only probator may appear; a stale gitvault-review row refuses
+    // the boundary before the engine runs. Local events never reach the
+    // engine, so their policy rows are not consulted.
+    if crate::probator::applies(&ctx.event) {
+        policy.admit_engine_rows()?;
     }
-    let report = checkers::run_all(cfg, policy, ctx, cfg_sig, policy_sig, only)?;
+    // The policy file is the signed declaration that this machine trusts
+    // Probator as its audit engine. An uncertified policy cannot authorize a
+    // publication audit at all, so the refusal comes before the engine runs.
+    if let configsig::SigState::Invalid(reason) = policy_sig
+        && boundary
+    {
+        anyhow::bail!(
+            "refusing to run an uncertified audit policy: {reason}\n  \
+             the policy authorizes Probator as the audit engine\n  \
+             certify it: gitvault config sign"
+        );
+    }
+    let report = checkers::audit(cfg, ctx, cfg_sig, policy_sig)?;
     report.print(&ctx.event);
     if let configsig::SigState::Invalid(reason) = cfg_sig
-        && (boundary || !selected.is_empty())
+        && boundary
     {
         anyhow::bail!(
             "audits complete, but the routing table they ran against is uncertified: {reason}\n  \
              certify it: gitvault config sign   (then rerun this {operation})"
         );
     }
-    // A publication boundary must produce audit evidence. An empty policy -
-    // signed or not - runs only the built-in gates and then vacuously
-    // passes, which is precisely the "no audit happened" state a boundary
-    // exists to prevent. Signature problems still refuse first; an empty
-    // policy adds its own refusal here, not a blessing.
-    if boundary && effective.is_empty() {
-        let why = if selected.is_empty() {
-            format!("no checkers are registered for {}", event.name())
-        } else {
-            format!(
-                "no checkers registered for {} apply to this repository",
-                event.name()
-            )
-        };
-        anyhow::bail!(
-            "{why} - a publication boundary needs audit evidence, not a \
-             vacuous pass"
-        );
-    }
     Ok(report)
 }
 
 /// The publication gate every GitHub-reaching operation must pass: run the
-/// checkers registered for the event, print the verdicts, and fail closed.
-/// One copy so a new publish path cannot quietly forget it.
+/// audit, print the verdicts, and fail closed. One copy so a new publish path
+/// cannot quietly forget it.
 fn run_publication_gate(
     cfg: &config::Config,
     cfg_sig: &configsig::SigState,
@@ -1191,12 +1822,10 @@ fn run_publication_gate(
     ctx: &checkers::Context,
     operation: &str,
 ) -> anyhow::Result<()> {
-    let report = audit_gate(
-        cfg, cfg_sig, policy, policy_sig, ctx, operation, None, false,
-    )?;
+    let report = audit_gate(cfg, cfg_sig, policy, policy_sig, ctx, operation)?;
     anyhow::ensure!(
         report.exit_code() == ExitCode::SUCCESS,
-        "a blocking checker refused this {operation}; nothing was sent to GitHub"
+        "a blocking gate refused this {operation}; nothing was sent to GitHub"
     );
     Ok(())
 }
@@ -1207,363 +1836,375 @@ fn cmd_hook(config: Option<&PathBuf>, event: &str, args: &[String]) -> anyhow::R
     // git runs hooks with cwd set to the top level of the working tree, so "."
     // resolves correctly and no directory argument is needed from the hook shim.
     // For pre-push, argv[0] is the remote the push targets.
-    let ctx = context_for(&cfg, event, &PathBuf::from("."), None, args)?;
-    let report = audit_gate(
-        &cfg,
-        &cfg_sig,
-        &policy,
-        &policy_sig,
-        &ctx,
-        "operation",
-        None,
-        false,
-    )?;
-    if report.exit_code() == ExitCode::SUCCESS && event == "pre-push" {
-        // Pending attestations drain on every audited push - including an
-        // up-to-date one that moves no refs - so a first push's deferred
-        // status always finds a later trigger, ruleset or not.
-        drain_pending_attestations(&cfg)?;
-        publish_audited_status(&cfg, &ctx)?;
-    }
+    let ctx = context_for(&cfg, event, &PathBuf::from("."), None, args, None)?;
+    let report = audit_gate(&cfg, &cfg_sig, &policy, &policy_sig, &ctx, "operation")?;
     Ok(report.exit_code())
 }
 
-/// Mark every head this push actually audited with the `gitvault/audited`
-/// commit status, so a server-side required check can enforce "the reviewed
-/// revision is the one that landed" - closing `--no-verify`, the web UI and
-/// other machines into the same gate.
+/// Fetch one remote ref into a process-private ref and return the commit it
+/// resolved to.
 ///
-/// The attestation stays honest by marking only heads the audit examined:
-/// the deterministic and semantic review covers every pushed ref, so each
-/// new head earns its mark. A `verify` row exercises one candidate revision
-/// (the checked-out or first head) - it strengthens the evidence without
-/// being the basis for the multi-head marking. A tip already reachable from
-/// the pushed remote's refs added no unreviewed content to this audit, so
-/// it earns no status here. The credential spend happens now, after the
-/// report exists - audits first, blessing after.
-fn publish_audited_status(cfg: &config::Config, ctx: &checkers::Context) -> anyhow::Result<()> {
-    // Attest where the push lands: the push remote's own repository. A named
-    // remote that cannot resolve gets no attestation at all - falling back to
-    // an unrelated slug would mark the wrong repository with evidence meant
-    // for this one. An unnamed remote (a `check` context) uses origin's slug.
-    let slug = match ctx.push_remote.as_deref() {
-        Some(name) => match remote_slug(&ctx.repo_root, name) {
-            Some(slug) => slug,
-            None => {
-                eprintln!(
-                    "gitvault: push remote '{name}' does not resolve to a repository; \
-                     audited status not posted"
-                );
-                return Ok(());
-            }
-        },
-        None => match ctx.repo_slug.clone() {
-            Some(slug) => slug,
-            // No remote to attest against; nothing was sent anywhere.
-            None => return Ok(()),
-        },
-    };
-    let mut heads: Vec<String> = Vec::new();
-    for line in ctx.stdin.as_deref().unwrap_or("").lines() {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        let Some(sha) = fields.get(1) else { continue };
-        if sha.trim_matches('0').is_empty() {
-            continue; // a deletion has no head to mark
-        }
-        let sha = (*sha).to_string();
-        if !heads.contains(&sha) {
-            heads.push(sha);
-        }
-    }
-    if heads.is_empty() {
-        return Ok(());
-    }
-    let vault = vault::Vault::open()?;
-    for sha in heads {
-        // A pushed object is not always a commit: an annotated tag carries its
-        // tag object, and /statuses on one 422s - which fail-closed would turn
-        // into a refusal after the audits already passed. Peel to the commit;
-        // an object with no commit has no status surface and is skipped.
-        let Some(commit) = peel_commit(&ctx.repo_root, &sha) else {
-            continue;
-        };
-        // Skip tips the pushed remote already holds: the audit skipped them
-        // too, so marking them would attest to a review that never happened.
-        // Scoped to the push remote's own mirrors - another remote holding
-        // the commit says nothing about this repository, and counting it
-        // would deadlock a ruleset that requires the status there.
-        let mirror = ctx
-            .push_remote
-            .as_deref()
-            .map(|name| format!("refs/remotes/{name}"))
-            .unwrap_or_else(|| "refs/remotes".to_string());
-        if git::refs_containing(&ctx.repo_root, &commit, &[&mirror]) {
-            continue;
-        }
-        let code = api::run(cfg, &vault, &audited_status_request(&slug, &commit))?;
-        if code != 0 {
-            // A status only attaches to a commit GitHub already knows, and a
-            // first-time head arrives with this very push. Probe: an unknown
-            // commit is the chicken-and-egg case - stage the objects under a
-            // ref no branch ruleset watches, post the status against the now
-            // known commit, and this same push then lands with its mark.
-            // A commit GitHub does know and still cannot mark is a real
-            // failure, and the push fails closed rather than landing
-            // unattested.
-            let known = api::run(cfg, &vault, &commit_known_probe(&slug, &commit))? == 0;
-            anyhow::ensure!(
-                !known,
-                "the audit passed but the `gitvault/audited` status could not be posted \
-                 for {commit}; the push is refused rather than landing without its evidence"
-            );
-            if staged_attestation(cfg, ctx, &vault, &slug, &commit) {
-                eprintln!("gitvault: marked {commit:.12} audited on {slug} (objects staged)");
-                continue;
-            }
-            eprintln!(
-                "gitvault: {commit:.12} is not on {slug} yet and staging it failed - this \
-                 push lands the objects and the remote refuses the ref update for the \
-                 missing status; run `git push` again to attest and land (the audits are \
-                 already sealed)"
-            );
-            record_pending_attestation(cfg, &slug, &sha, &ctx.repo_root);
-            continue;
-        }
-        eprintln!("gitvault: marked {commit:.12} audited on {slug}");
-    }
-    Ok(())
-}
-
-/// The `gitvault/audited` commit-status request - one authority for both the
-/// immediate and the deferred posting path, so the context a ruleset
-/// requires cannot drift between them.
-fn audited_status_request(slug: &str, sha: &str) -> api::Request {
-    api::Request {
-        method: "POST".to_string(),
-        path: format!("/repos/{slug}/statuses/{sha}"),
-        target: api::Target::Repo(slug.to_string()),
-        fields: vec![
-            ("state".to_string(), "success".to_string()),
-            ("context".to_string(), "gitvault/audited".to_string()),
-            (
-                "description".to_string(),
-                "publication audit passed on this machine".to_string(),
-            ),
-        ],
-        raw_fields: Vec::new(),
-        headers: Vec::new(),
-        body: None,
-        jq: None,
-        silent: true,
-    }
-}
-
-/// Stage a first-time head so the status can post in the same push: push
-/// the commit to `refs/gitvault/incoming/<sha>` - a ref branch rulesets do
-/// not watch - post the attestation, then delete the staging ref. The
-/// status rides the commit, not the ref, so the mark survives the cleanup
-/// and the real push lands already attested. `--no-verify` keeps the
-/// staging pushes from re-entering this hook. Any failure leaves the
-/// caller on the deferred path.
-fn staged_attestation(
-    cfg: &config::Config,
-    ctx: &checkers::Context,
-    vault: &vault::Vault,
-    slug: &str,
-    commit: &str,
-) -> bool {
-    let Some(remote) = ctx.push_remote.as_deref() else {
-        return false;
-    };
-    let staging = format!("refs/gitvault/incoming/{commit}");
-    let stage = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&ctx.repo_root)
-        .args([
-            "push",
-            "--no-verify",
-            "-q",
-            remote,
-            &format!("{commit}:{staging}"),
-        ])
-        .output();
-    if !stage.map(|out| out.status.success()).unwrap_or(false) {
-        return false;
-    }
-    let marked = api::run(cfg, vault, &audited_status_request(slug, commit))
-        .map(|code| code == 0)
-        .unwrap_or(false);
+/// The destination is unique per invocation, and it is deleted before this
+/// function returns. `--no-write-fetch-head` leaves the shared `FETCH_HEAD`
+/// untouched, so no concurrent or later fetch can change the object id this
+/// review binds.
+fn fetch_remote_ref(
+    repo_root: &std::path::Path,
+    remote: &str,
+    source: &str,
+    tag: &str,
+) -> anyhow::Result<String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let destination = format!(
+        "refs/gitvault/fetch/{}-{tag}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let result = (|| -> anyhow::Result<String> {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args([
+                "fetch",
+                "--no-tags",
+                "--quiet",
+                // Do not touch the shared FETCH_HEAD; the private ref is the
+                // only handle this run reads back.
+                "--no-write-fetch-head",
+                "--",
+                remote,
+                &format!("+{source}:{destination}"),
+            ])
+            .status()
+            .context("failed to run git fetch")?;
+        anyhow::ensure!(
+            status.success(),
+            "cannot fetch {source} from {remote} for review"
+        );
+        git::commit_at(repo_root, &destination).ok_or_else(|| {
+            anyhow::anyhow!("fetched {source} from {remote} but {destination} did not resolve")
+        })
+    })();
     let _ = std::process::Command::new("git")
         .arg("-C")
-        .arg(&ctx.repo_root)
-        .args(["push", "--no-verify", "-q", remote, &format!(":{staging}")])
-        .output();
-    marked
+        .arg(repo_root)
+        .args(["update-ref", "-d", &destination])
+        .status();
+    result
 }
 
-/// Whether GitHub can name the commit - the chicken-and-egg probe the
-/// immediate path uses to tell "lands with this push" from "real posting
-/// failure". The deferred path skips it: a failed POST keeps the pending
-/// file either way, so the retry itself is the probe.
-fn commit_known_probe(slug: &str, sha: &str) -> api::Request {
-    api::Request {
-        method: "GET".to_string(),
-        path: format!("/repos/{slug}/commits/{sha}"),
-        target: api::Target::Repo(slug.to_string()),
-        fields: Vec::new(),
-        raw_fields: Vec::new(),
-        headers: Vec::new(),
-        body: None,
-        jq: None,
-        silent: true,
-    }
-}
-
-/// One deferred `gitvault/audited` posting: the audit that produced it is
-/// sealed, only the remote's knowledge of the commit was missing.
-fn pending_dir(cfg: &config::Config) -> PathBuf {
-    records::run_dir(cfg)
-        .parent()
-        .map(|dir| dir.join("pending"))
-        .unwrap_or_else(|| PathBuf::from("pending"))
-}
-
-/// Stash the attestation this push could not post. The file is a reminder,
-/// not the authority: it names the pushed object, and the drain re-proves
-/// against the sealed record chain before credentials are spent. Only the
-/// pushed sha goes in the name so a repeated first push dedupes itself.
-fn record_pending_attestation(cfg: &config::Config, slug: &str, sha: &str, repo: &Path) {
-    let dir = pending_dir(cfg);
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
-    }
-    let name = format!("{}__{}.json", slug.replace('/', "_"), sha);
-    let body = serde_json::json!({
-        "slug": slug,
-        "sha": sha,
-        "repo": repo,
-        "recorded_at": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
-    });
-    let _ = std::fs::write(
-        dir.join(name),
-        serde_json::to_string_pretty(&body).unwrap_or_default(),
-    );
-}
-
-/// Read one pending attestation file into `(slug, pushed sha, repo)`. Slug
-/// and sha are shape-checked before either can reach a request path or a
-/// `git` argument: a pending file is same-user writable input, so it is
-/// parsed like one.
-fn read_pending(path: &Path) -> Option<(String, String, PathBuf)> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let doc: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    let slug = doc["slug"].as_str()?.to_string();
-    let sha = doc["sha"].as_str()?.to_string();
-    let repo = PathBuf::from(doc["repo"].as_str()?);
-    let slug_ok = slug.split('/').count() == 2
-        && slug
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'));
-    let sha_ok = sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit());
-    (slug_ok && sha_ok).then_some((slug, sha, repo))
-}
-
-/// Whether the sealed run log carries a passed pre-push that pushed `sha` to
-/// `slug` - the evidence a deferred attestation replays. A planted pending
-/// file earns nothing on its own: only a commit a real audited run already
-/// pushed may be marked. `Sound` and `Gap` links both carry a recomputing
-/// self-seal (a gap means the predecessor was pruned or lost, not that this
-/// record was rewritten); `Broken` and `Unsealed` evidence is refused.
-fn pending_attested(cfg: &config::Config, slug: &str, sha: &str) -> bool {
-    let links: std::collections::HashMap<String, records::Link> =
-        records::verify(cfg).into_iter().collect();
-    records::list(cfg).unwrap_or_default().into_iter().any(|r| {
-        r.passed
-            && r.event == "pre-push"
-            && r.repository == slug
-            && matches!(
-                links.get(&r.id),
-                Some(records::Link::Sound | records::Link::Gap)
-            )
-            && r.range
-                .refs
-                .lines()
-                .any(|line| line.split_whitespace().nth(1) == Some(sha))
+/// The remote whose URL names `slug`, never a different remote's.
+fn remote_for_slug(repo_root: &std::path::Path, slug: &str) -> Option<String> {
+    remote_names(repo_root).into_iter().find(|remote| {
+        remote_slug(repo_root, remote).is_some_and(|candidate| candidate.eq_ignore_ascii_case(slug))
     })
 }
 
-/// Post every deferred attestation whose commit the remote now knows. Each
-/// entry must re-earn its mark before the vault is even opened: the pushed
-/// sha peels to the commit in the recording repo (content-addressed, so the
-/// relation cannot be forged), and the sealed record chain must show a
-/// passed audit pushing that sha. A commit still unknown keeps its file -
-/// the failed POST is the probe, so no extra request exists - and per-entry
-/// errors stay best-effort: a stale, forged or unroutable pending must not
-/// hold every later push hostage; the file remains for the next drain.
-fn drain_pending_attestations(cfg: &config::Config) -> anyhow::Result<()> {
-    let dir = pending_dir(cfg);
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Ok(());
+/// Fetch `pull/<n>/head` and return the commit it resolved to.
+///
+/// Called at the gate boundary, before the audit runs: private content crosses
+/// the transport here, and doing the fetch inside the audit would bury the
+/// prompt inside the run where it reads as the audit demanding the vault. The
+/// resolved sha is what the engine reviews and what the merge request then
+/// names as its precondition.
+fn fetch_pr_head(repo_root: &std::path::Path, number: u64, slug: &str) -> anyhow::Result<String> {
+    eprintln!(
+        "gitvault: fetching pull/{number}/head so the audit has the request's head \
+         (a read-only credential use before its report)"
+    );
+    // The ref lives in the repository the request targets. `origin` is only
+    // right when the checkout IS that repository: a fork checkout's own
+    // `pull/<n>` namespace belongs to unrelated requests and would shadow the
+    // real head with an unrelated commit. Resolve the remote whose slug is
+    // the target.
+    let remote = remote_for_slug(repo_root, slug).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no remote in this checkout points at {slug}; \
+             add it before reviewing that repository's pull requests"
+        )
+    })?;
+    fetch_remote_ref(
+        repo_root,
+        &remote,
+        &format!("refs/pull/{number}/head"),
+        "pr-head",
+    )
+}
+
+/// Fetch the proposed head branch from the remote that owns it and return the
+/// commit the audit must review. A branch that cannot be resolved refuses the
+/// boundary: auditing a local tracking ref after the remote has moved would
+/// bless content the request does not propose. Called once before the audit
+/// and once immediately before the POST, so the same resolved value can be
+/// compared across the review.
+fn fetch_pr_branch_head(
+    repo_root: &std::path::Path,
+    head: &str,
+    slug: &str,
+) -> anyhow::Result<String> {
+    let (owner, branch) = match head.split_once(':') {
+        Some((owner, branch)) => (Some(owner.trim()), branch.trim()),
+        None => (None, head.trim()),
     };
-    let mut pending: Vec<(PathBuf, String, String)> = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some((slug, sha, repo)) = read_pending(&path) else {
+    anyhow::ensure!(!branch.is_empty(), "the pull request head branch is empty");
+    eprintln!(
+        "gitvault: fetching {head} from its remote (a read-only credential use; \
+         the audit binds the resolved commit)"
+    );
+    let remote = match owner {
+        Some(owner) => {
+            // `owner:branch` on the target's own owner means the target
+            // repository; prefer its exact remote over a different repository
+            // that happens to share the owner.
+            let target_owner = slug.split('/').next().unwrap_or_default();
+            let exact = if target_owner.eq_ignore_ascii_case(owner) {
+                remote_for_slug(repo_root, slug)
+            } else {
+                None
+            };
+            exact.or_else(|| {
+                remote_names(repo_root).into_iter().find(|remote| {
+                    remote_slug(repo_root, remote).is_some_and(|candidate| {
+                        candidate
+                            .split('/')
+                            .next()
+                            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(owner))
+                    })
+                })
+            })
+        }
+        None => remote_for_slug(repo_root, slug),
+    }
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "no remote in this checkout points at {}; add it before opening a pull request \
+             from that head",
+            owner.unwrap_or(slug)
+        )
+    })?;
+    fetch_remote_ref(
+        repo_root,
+        &remote,
+        &format!("refs/heads/{branch}"),
+        "pr-branch",
+    )
+}
+
+/// The branch name the target repository understands: drop a leading remote
+/// name, even when the branch itself contains slashes (`origin/release/1.0`
+/// is the branch `release/1.0`, not a branch named `origin`).
+fn branch_for_api(repo_root: &std::path::Path, base: &str) -> String {
+    let base = base.strip_prefix("refs/heads/").unwrap_or(base);
+    let Some((first, rest)) = base.split_once('/') else {
+        return base.to_string();
+    };
+    if remote_names(repo_root).iter().any(|r| r == first) {
+        return rest.to_string();
+    }
+    base.to_string()
+}
+
+/// A tracking ref temporarily pointed at another remote's commit for the
+/// duration of an audit. Probator resolves a pull request's base through
+/// `refs/remotes/origin/<branch>`; when the request targets a repository this
+/// checkout does not name `origin` (a fork workflow), the target commit is
+/// placed there for the audit and the previous ref is put back afterwards.
+#[derive(Debug)]
+struct BorrowedTrackingRef {
+    repo_root: PathBuf,
+    reference: String,
+    previous: Option<String>,
+}
+
+impl Drop for BorrowedTrackingRef {
+    fn drop(&mut self) {
+        let mut command = std::process::Command::new("git");
+        command.arg("-C").arg(&self.repo_root).arg("update-ref");
+        match &self.previous {
+            Some(sha) => {
+                command.arg(&self.reference).arg(sha);
+            }
+            None => {
+                command.arg("-d").arg(&self.reference);
+            }
+        }
+        // A failed restore leaves a tracking ref pointing at the target
+        // base; it is reported but cannot be allowed to mask the audit result.
+        if let Ok(output) = command.output()
+            && !output.status.success()
+        {
             eprintln!(
-                "gitvault: ignoring malformed pending attestation {}",
-                path.display()
+                "gitvault: warning: could not restore {} after the audit",
+                self.reference
             );
+        }
+    }
+}
+
+/// The remote's default branch, read from its symbolic `HEAD`. Used only when
+/// a pull request omits `--base`, where the target's default is the base the
+/// request will actually use.
+fn remote_default_branch(repo_root: &std::path::Path, remote: &str) -> anyhow::Result<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["ls-remote", "--symref", "--", remote, "HEAD"])
+        .output()
+        .context("failed to run git ls-remote")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "cannot resolve {remote}'s default branch for the pull request base; \
+         pass --base <branch>"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let Some((reference, name)) = line.split_once('\t') else {
             continue;
         };
-        let Some(commit) = peel_commit(&repo, &sha) else {
-            eprintln!(
-                "gitvault: pending attestation for {slug}@{sha:.12} cannot be peeled in {repo:?}; keeping"
-            );
-            continue;
-        };
-        if !pending_attested(cfg, &slug, &sha) {
-            eprintln!(
-                "gitvault: pending attestation for {slug}@{sha:.12} has no sealed audit to replay; not posting"
-            );
-            continue;
+        if name.trim() == "HEAD"
+            && let Some(branch) = reference.trim().strip_prefix("ref: refs/heads/")
+        {
+            return Ok(branch.to_string());
         }
-        pending.push((path, slug, commit));
     }
-    if pending.is_empty() {
-        return Ok(());
-    }
-    let vault = match vault::Vault::open() {
-        Ok(vault) => vault,
-        Err(error) => {
-            eprintln!("gitvault: vault unavailable, deferred attestations wait: {error}");
-            return Ok(());
-        }
+    anyhow::bail!(
+        "cannot resolve {remote}'s default branch for the pull request base; \
+         pass --base <branch>"
+    )
+}
+
+/// Resolve the pull request's target branch for the audit, against the remote
+/// that owns the target repository.
+///
+/// Probator resolves a PR base through `refs/remotes/origin/<branch>`, so the
+/// tracking ref must be refreshed from the target's remote at the gate
+/// boundary: a stale local ref would review a base the request no longer has,
+/// and a fork checkout's `origin` is not the target at all. The resolved
+/// branch, the commit it points at and an optional guard that restores
+/// `origin`'s ref after the audit are returned together, so the attribution
+/// gate and the engine read the same base commit.
+fn local_pr_base(
+    repo_root: &std::path::Path,
+    base: &str,
+    slug: &str,
+) -> anyhow::Result<(Option<String>, String, Option<BorrowedTrackingRef>)> {
+    let target = remote_for_slug(repo_root, slug).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no remote in this checkout points at {slug}; \
+             add it before reviewing that repository's pull requests"
+        )
+    })?;
+    let base = base.trim();
+    let branch = if base.is_empty() {
+        eprintln!(
+            "gitvault: reading {target}'s default branch so the audit has the request's \
+             base (a read-only credential use before its report)"
+        );
+        remote_default_branch(repo_root, &target)?
+    } else {
+        let branch = branch_for_api(repo_root, base);
+        anyhow::ensure!(!branch.is_empty(), "the pull request base branch is empty");
+        branch
     };
-    for (path, slug, commit) in pending {
-        match api::run(cfg, &vault, &audited_status_request(&slug, &commit)) {
-            Ok(0) => {
-                let _ = std::fs::remove_file(&path);
-                eprintln!("gitvault: marked {commit:.12} audited on {slug} (deferred)");
-            }
-            Ok(_) => {} // commit not known to the remote yet - retry next run
-            Err(error) => {
-                eprintln!("gitvault: deferred attestation for {slug}@{commit:.12} failed: {error}");
-            }
-        }
+    let target_tracking = format!("refs/remotes/{target}/{branch}");
+    eprintln!(
+        "gitvault: fetching {target}/{branch} so the audit has the request's base \
+         (a read-only credential use before its report)"
+    );
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "fetch",
+            "--no-tags",
+            "--quiet",
+            "--no-write-fetch-head",
+            "--",
+            &target,
+            &format!("+refs/heads/{branch}:{target_tracking}"),
+        ])
+        .status()
+        .context("failed to run git fetch")?;
+    anyhow::ensure!(
+        status.success(),
+        "cannot resolve the pull request base '{base}' from {target}; \
+         fetch {target}/{branch} first"
+    );
+    let fetched = git::commit_at(repo_root, &target_tracking).ok_or_else(|| {
+        anyhow::anyhow!("fetched {target}/{branch} but {target_tracking} did not resolve")
+    })?;
+    if target == "origin" {
+        // The fetch already updated the ref Probator reads.
+        return Ok((Some(branch), fetched, None));
     }
-    Ok(())
+    // The engine reads origin's namespace. Point it at the target's freshly
+    // fetched commit for this audit only.
+    let reference = format!("refs/remotes/origin/{branch}");
+    let previous = git::commit_at(repo_root, &reference);
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["update-ref", &reference, &fetched])
+        .status()
+        .context("failed to run git update-ref")?;
+    anyhow::ensure!(
+        status.success(),
+        "cannot stage {target}/{branch} under {reference} for the audit"
+    );
+    let guard = BorrowedTrackingRef {
+        repo_root: repo_root.to_path_buf(),
+        reference,
+        previous,
+    };
+    Ok((Some(branch), fetched, Some(guard)))
+}
+
+/// The merge request's own target branch and current head, read at the gate
+/// boundary. A merge must audit the commits the request actually proposes onto
+/// its target, not whatever branch this checkout happens to have checked out.
+fn pull_request_metadata(
+    cfg: &config::Config,
+    vault: &vault::Vault,
+    slug: &str,
+    number: u64,
+) -> anyhow::Result<(String, String)> {
+    let req = get(
+        format!("/repos/{slug}/pulls/{number}"),
+        slug.to_string(),
+        None,
+    );
+    let body = api::run_value(cfg, vault, &req).with_context(|| {
+        format!(
+            "cannot read pull request #{number} metadata; the merge must audit the \
+             request's own target base and head"
+        )
+    })?;
+    let value: serde_json::Value =
+        serde_json::from_str(&body).context("pull request metadata is not JSON")?;
+    let base = value
+        .pointer("/base/ref")
+        .and_then(serde_json::Value::as_str)
+        .filter(|base| !base.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("pull request #{number} metadata has no base branch"))?;
+    let head = value
+        .pointer("/head/sha")
+        .and_then(serde_json::Value::as_str)
+        .filter(|head| !head.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("pull request #{number} metadata has no head commit"))?;
+    Ok((base.to_string(), head.to_string()))
 }
 
 /// The `Owner/Repo` a push actually lands on: the named remote's URL parsed
 /// for its slug, never a different remote's.
 fn remote_slug(repo_root: &std::path::Path, remote: &str) -> Option<String> {
+    // `remote.<name>.url` is the configured URL: a url.insteadOf rewrite
+    // changes the transport, not the repository's identity, and must not
+    // hide which repo a remote points at.
     let url = std::process::Command::new("git")
         .arg("-C")
         .arg(repo_root)
-        .args(["remote", "get-url", remote])
+        .args(["config", &format!("remote.{remote}.url")])
         .output()
         .ok()
         .filter(|out| out.status.success())
@@ -1572,11 +2213,22 @@ fn remote_slug(repo_root: &std::path::Path, remote: &str) -> Option<String> {
     url.and_then(|url| git::slug_from_remote(&url))
 }
 
-/// The commit a pushed object attests to, when it has one: annotated tags and
-/// other non-commit objects peel through `^{commit}`, a plain commit resolves
-/// to itself.
-fn peel_commit(repo_root: &std::path::Path, sha: &str) -> Option<String> {
-    git::commit_at(repo_root, sha)
+fn remote_names(repo_root: &std::path::Path) -> Vec<String> {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["remote"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|line| line.trim().to_string())
+                .filter(|line| !line.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn cmd_records(config: Option<&PathBuf>, command: RecordsCommand) -> anyhow::Result<ExitCode> {
@@ -1704,22 +2356,22 @@ fn cmd_check(
     config: Option<&PathBuf>,
     event: &str,
     directory: &Path,
-    only: Option<&str>,
     tag: Option<&str>,
+    pr_head: Option<&str>,
+    pr_base: Option<&str>,
+    pr_number: Option<&str>,
 ) -> anyhow::Result<ExitCode> {
     let (cfg, cfg_path, cfg_sig) = config::Config::load_unverified(config)?;
     let (policy, _policy_path, policy_sig) = config::Policy::load_state(&cfg_path, &cfg)?;
-    let ctx = context_for(&cfg, event, directory, tag.map(str::to_string), &[])?;
-    let report = audit_gate(
-        &cfg,
-        &cfg_sig,
-        &policy,
-        &policy_sig,
-        &ctx,
-        "check",
-        only,
-        true,
-    )?;
+    // `check` is the proposal-facing command: even an event that does not
+    // reach the engine must not present a stale gitvault-review row as an
+    // accepted policy.
+    policy.admit_engine_rows()?;
+    let mut ctx = context_for(&cfg, event, directory, tag.map(str::to_string), &[], None)?;
+    ctx.pr_head = pr_head.map(str::to_string);
+    ctx.pr_base = pr_base.map(str::to_string);
+    ctx.pr_number = pr_number.map(str::to_string);
+    let report = audit_gate(&cfg, &cfg_sig, &policy, &policy_sig, &ctx, "check")?;
     Ok(report.exit_code())
 }
 
@@ -1887,12 +2539,22 @@ fn cmd_config_sign(config: Option<&PathBuf>) -> anyhow::Result<ExitCode> {
         anyhow::bail!("nothing to sign at {}", path.display());
     }
     // Checker rows left in the routing table migrate out before signing, so
-    // each file is certified under its own signature: the blessing the user
-    // gives here covers exactly what both files contain now.
-    if config::Config::migrate_checkers(&path)? {
-        println!(
-            "moved checker entries to {}",
-            config::Policy::path_for(&path).display()
+    // each file is certified under its own signature. The policy no longer
+    // selects checkers - it authorizes the engine - but its signature still
+    // gates the publication boundary.
+    if let Some(policy_path) = config::Config::migrate_checkers(&path)? {
+        println!("moved checker entries to {}", policy_path.display());
+    }
+    // Resolve the policy from the routing table itself, not from the
+    // conventional sibling: `audit_policy` is signed into that table, and a
+    // custom path must be the file this command actually certifies.
+    let (cfg, _, _) = config::Config::load_unverified(Some(&path))?;
+    let policy_path = config::Policy::resolve(&path, &cfg);
+    if cfg.audit_policy.is_some() && !policy_path.exists() {
+        anyhow::bail!(
+            "the routing table declares an audit policy at {} but the file is absent\n  \
+             restore it or amend and re-certify: gitvault config sign",
+            policy_path.display()
         );
     }
     let vault = vault::Vault::open()?;
@@ -1905,7 +2567,6 @@ fn cmd_config_sign(config: Option<&PathBuf>) -> anyhow::Result<ExitCode> {
     let key = vault.config_key()?;
     let sig = configsig::sign(&path, &key)?;
     println!("signed {} -> {}", path.display(), sig.display());
-    let policy_path = config::Policy::path_for(&path);
     if policy_path.exists() {
         let sig = configsig::sign(&policy_path, &key)?;
         println!("signed {} -> {}", policy_path.display(), sig.display());
@@ -1916,6 +2577,7 @@ fn cmd_config_sign(config: Option<&PathBuf>) -> anyhow::Result<ExitCode> {
 /// Report the attestation state. Read-only: it may advise, never gate.
 fn cmd_config_verify(config: Option<&PathBuf>) -> anyhow::Result<ExitCode> {
     let path = config.cloned().unwrap_or_else(config::Config::default_path);
+    let (cfg, _, _) = config::Config::load_unverified(Some(&path))?;
     let anchor = configsig::anchor_path();
     match configsig::anchor_state(&anchor) {
         configsig::Anchor::Absent => {
@@ -1938,7 +2600,14 @@ fn cmd_config_verify(config: Option<&PathBuf>) -> anyhow::Result<ExitCode> {
                     return Ok(ExitCode::FAILURE);
                 }
             }
-            let policy_path = config::Policy::path_for(&path);
+            let policy_path = config::Policy::resolve(&path, &cfg);
+            if cfg.audit_policy.is_some() && !policy_path.exists() {
+                eprintln!(
+                    "signature: INVALID - the routing table declares an audit policy at {} but the file is absent",
+                    policy_path.display()
+                );
+                return Ok(ExitCode::FAILURE);
+            }
             if policy_path.exists() {
                 match configsig::verify(&policy_path) {
                     Ok(()) => println!("signature: valid for {}", policy_path.display()),
@@ -1953,26 +2622,130 @@ fn cmd_config_verify(config: Option<&PathBuf>) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Provision this machine: deploy the binary beside it, lay down the hook
-/// dispatchers, then hand the enforcement surface to root.
+/// Install `src` at `target` atomically, with `mode` permissions: the bytes
+/// land on a temporary file in the same directory, then `rename(2)` swaps it
+/// into place. Both properties this path needs live in the rename:
+///
+/// - A running process keeps the inode it mapped; rewriting that file's
+///   contents in place invalidates its pages and macOS kills it with a code
+///   signature error mid-audit. A rename swaps the directory entry, never
+///   the mapped file.
+/// - A file ever executed while root-owned is provenance-poisoned
+///   permanently; only a fresh inode clears the record, so overwriting in
+///   place can never cure it.
+fn install_atomic(src: &Path, target: &Path, mode: u32) -> anyhow::Result<()> {
+    let tmp = target.with_extension(format!("staging-{}", std::process::id()));
+    // The staging file must not exist already: a planted symlink there would
+    // turn the copy into a write through it. `create_new` refuses any entry.
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .is_err()
+    {
+        anyhow::bail!(
+            "staging path {} already exists - refusing to install over it",
+            tmp.display()
+        );
+    }
+    let result = (|| -> anyhow::Result<()> {
+        std::fs::copy(src, &tmp)
+            .with_context(|| format!("cannot stage {} for {}", src.display(), target.display()))?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+        std::fs::rename(&tmp, target).with_context(|| {
+            format!(
+                "cannot move {} into place at {}",
+                tmp.display(),
+                target.display()
+            )
+        })?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Provision this machine: deploy the binary, lay down the hook dispatchers,
+/// then hand the enforcement surface to root.
 ///
 /// The privileged step is one `sudo` run inside this command. What lands under
-/// root: the binaries, the hooks directory and - when present - the signature
-/// anchor. What deliberately stays user-owned: `config.toml` and
-/// `checkers.toml` (edits are allowed, only unsigned loads are refused) and
-/// their `.sig` sidecars (rewritten by every `gitvault config sign`).
+/// root: the binary, the hooks directory and - when present - the signature
+/// anchor. What deliberately stays user-owned: `config.toml` (edits are
+/// allowed, only unsigned loads are refused) and its `.sig` sidecar
+/// (rewritten by every `gitvault config sign`). Probator is installed
+/// separately: GitVault never ships or copies it, but a `probator` and
+/// `probator-agent` already beside the binary join the locked set.
 fn cmd_install() -> anyhow::Result<ExitCode> {
-    let home = PathBuf::from(std::env::var("HOME").context("HOME is not set")?);
+    // The installed surface and the anchor must both live under the account
+    // home, even when HOME points somewhere else: a redirect must not split
+    // the trust root from the files it protects.
+    let home = configsig::account_home()?;
     let bin_dir = home.join(".local/bin");
     let hooks = home.join(".git-hooks");
     std::fs::create_dir_all(&bin_dir)?;
     std::fs::create_dir_all(&hooks)?;
 
+    // Hand the removed review engine's machine-local policy lists to the
+    // configured engine and delete the dead GitVault copies before anything
+    // is locked down. The engine reads `withheld-names.txt` and
+    // `repo-deps.txt` from its own config root; a second copy under GitVault
+    // would be an unread, stale policy source. A conflicting pair refuses
+    // instead of picking one. The anchor is handed to root later in this
+    // command, so resolve the root the armed engine will read (the account
+    // home's fixed configuration directory), not the pre-install unarmed
+    // state that could honour a caller's XDG_CONFIG_HOME. When this install
+    // arms, lists the engine itself wrote under the unarmed XDG root move
+    // across too; otherwise arming would silently change which lists it reads.
+    let arming = configsig::anchor_path().exists();
+    for (source, action) in config::migrate_legacy_policy_data(arming)? {
+        match action {
+            config::LegacyPolicyMove::Moved => eprintln!(
+                "gitvault: moved policy data {} into the engine's config root",
+                source.display()
+            ),
+            config::LegacyPolicyMove::DuplicateRemoved => eprintln!(
+                "gitvault: removed duplicate policy data {} (the engine's identical copy remains)",
+                source.display()
+            ),
+        }
+    }
+
+    // An armed installation hands publication verdicts to the engine, so it
+    // must not arm with no engine to run. Probator is installed separately;
+    // refusing here is what keeps install order from becoming a silent
+    // weakening. An unarmed first install may still warn and proceed, because
+    // no boundary trusts the engine yet.
+    let installed_engine = probator::installed_engine_path();
+    if arming && installed_engine.is_none() {
+        anyhow::bail!(
+            "refusing to arm without an audit engine: probator is not installed at {}\n  \
+             install Probator first, then re-run `gitvault install`",
+            bin_dir.join("probator").display()
+        );
+    }
+
+    let exe = std::env::current_exe().context("cannot locate the running binary")?;
+    let exe = exe.canonicalize().unwrap_or(exe);
+
     // The enforcement surface this run will immobilise: everything the steps
-    // below lay down, plus sibling helpers that exist already.
+    // below lay down, the Touch ID helper and audit engine when they exist
+    // already. The engine is never installed or copied here - Probator is a
+    // separate tool - but it is locked if present.
     let target = bin_dir.join("gitvault");
     let sign_wrapper = bin_dir.join("gitvault-sign");
     let mut immobilise: Vec<PathBuf> = vec![target.clone(), sign_wrapper.clone()];
+    // The audit engine is not shipped here, but if it is already installed it
+    // belongs to the enforcement surface: a same-user process that can swap
+    // `probator` for a program printing an empty findings array can pass every
+    // audit. Lock what exists; never copy or install it.
+    for name in ["probator", "probator-agent"] {
+        let engine = bin_dir.join(name);
+        if engine.exists() {
+            immobilise.push(engine);
+        }
+    }
     let touchid = bin_dir.join("gitvault-touchid");
     if touchid.exists() {
         immobilise.push(touchid.clone());
@@ -2003,32 +2776,29 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
         anyhow::bail!("sudo chown failed; the enforcement surface stays locked");
     }
 
-    // 1. Deploy the binary next to any sibling helpers. An existing target is
-    //    REMOVED first: fs::copy overwrites in place, preserving the inode - and
-    //    the kernel's provenance record with it. A file that was ever executed
-    //    while root-owned is poisoned permanently ("Killed: 9"); restoring
-    //    ownership and clearing xattrs do not revive it. A fresh inode carries
-    //    a clean record, and that is the only cure.
-    let exe = std::env::current_exe().context("cannot locate the running binary")?;
-    let exe = exe.canonicalize().unwrap_or(exe);
-    // Reinstalling through the installed binary itself: exe and target are
-    // the same file. Removing the target would delete the running binary
-    // before the copy — the self-delete that loses the gate entirely.
+    // 1. Deploy the binaries atomically. A rename over the target gives the
+    //    fresh inode a poisoned provenance record needs AND never touches the
+    //    mapped pages a running process holds - the in-place rewrite that
+    //    used to kill a mid-audit runner with a code signature error.
+    //
+    //    Reinstalling through the installed binary itself: exe and target are
+    //    the same file, and copying it onto itself would only churn the inode.
     let self_install = target
         .canonicalize()
         .map(|resolved| resolved == exe)
         .unwrap_or(false);
-    if target.exists() && !self_install {
-        std::fs::remove_file(&target).with_context(|| {
-            format!(
-                "cannot remove {} before reinstall - is it still schg-flagged?",
-                target.display()
-            )
-        })?;
-    }
     if !self_install {
-        std::fs::copy(&exe, &target)
-            .with_context(|| format!("cannot install {} to {}", exe.display(), target.display()))?;
+        install_atomic(&exe, &target, 0o755)?;
+    }
+    // Warn, but do not install: the audit engine is installed and versioned on
+    // its own. Its absence refuses every publication audit at run time; an
+    // armed install was already refused above.
+    if installed_engine.is_none() {
+        eprintln!(
+            "gitvault: probator is not installed at {} - \
+             publication audits will refuse until it is installed and this install is re-run",
+            bin_dir.join("probator").display()
+        );
     }
     if !sign_wrapper.exists() {
         std::fs::write(
@@ -2041,17 +2811,11 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
     // The touchid helper is a Mach-O too: if an earlier run left it poisoned,
     // a rewrite onto a fresh inode cures it the same way.
     if touchid.exists() {
-        let bytes = std::fs::read(&touchid)
-            .with_context(|| format!("cannot read {}", touchid.display()))?;
         let mode = touchid
             .metadata()
-            .map(|m| m.permissions())
-            .unwrap_or_else(|_| std::fs::Permissions::from_mode(0o755));
-        std::fs::remove_file(&touchid)
-            .with_context(|| format!("cannot refresh {}", touchid.display()))?;
-        std::fs::write(&touchid, &bytes)
-            .with_context(|| format!("cannot rewrite {}", touchid.display()))?;
-        std::fs::set_permissions(&touchid, mode)?;
+            .map(|m| m.permissions().mode() & 0o777)
+            .unwrap_or(0o755);
+        install_atomic(&touchid, &touchid, mode)?;
     }
 
     // 2. Hook dispatchers, written only when missing: an existing dispatcher is
@@ -2259,23 +3023,36 @@ fn publication_surface(method: &str, path: &str) -> Option<String> {
     ) {
         return None;
     }
-    // Normalize an absolute API URL back to its path before matching. The
-    // origin lives in api::API_ROOT alone - a second literal here would drift
-    // from it, skip normalization, and silently unguard absolute-URL writes.
-    let path = path
-        .strip_prefix(crate::api::API_ROOT)
-        .unwrap_or(path)
-        .trim_start_matches('/')
-        .split(['?', '#'])
-        .next()
-        .unwrap_or("");
+    let verb = method.to_ascii_uppercase();
+    // A dot segment (including a percent-encoded spelling) is normalized by
+    // curl and the API server after this match would run. It is refused as a
+    // publication attempt rather than matched against a different path than
+    // the one the transport will send. The same rule lives in api::request_url,
+    // so a traversal cannot slip past this check and still be sent.
+    if crate::api::path_has_traversal(path) {
+        return Some(format!("{verb} /{path} (unsafe path segment)"));
+    }
+    // Match the route the server will see, not the raw percent spelling:
+    // `%63ontents` is a contents write, and `%2f` changes the segment
+    // boundaries. A percent escape that survives one decode - anywhere in the
+    // path, including owner/repo - is ambiguous, so the write refuses instead
+    // of guessing what a second decode would route to.
+    let Some(decoded) = crate::api::decoded_api_path(path) else {
+        return Some(format!("{verb} /{path} (undecodable path)"));
+    };
+    if decoded.contains('%') {
+        return Some(format!("{verb} /{path} (double-encoded path)"));
+    }
+    if crate::api::has_encoded_separator(path) {
+        return Some(format!("{verb} /{path} (encoded path separator)"));
+    }
+    let path = decoded.trim_start_matches('/');
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     // repos/{owner}/{repo}/<surface>/...
     if segments.len() < 3 || segments[0] != "repos" {
         return None;
     }
-    let tail: Vec<&str> = segments[3..].to_vec();
-    let verb = method.to_ascii_uppercase();
+    let tail: Vec<&str> = segments.get(3..).unwrap_or(&[]).to_vec();
     let hit = match tail.first().copied() {
         // File contents and every git object/ref write.
         Some("contents" | "git") => true,
@@ -2293,9 +3070,8 @@ fn publication_surface(method: &str, path: &str) -> Option<String> {
         }
         // Releases and their assets, created or edited.
         Some("releases") => true,
-        // Commit statuses are the audit's attestation channel: a hand-posted
-        // `gitvault/audited` would forge the receipt the server-side check
-        // trusts. The audited path posts them through api::run internally.
+        // Commit statuses write to the repository's publication surface and
+        // can drive server-side checks; the broker refuses them outright.
         Some("statuses") => true,
         _ => false,
     };
@@ -2308,8 +3084,10 @@ fn cmd_pr(
     repo: Option<String>,
 ) -> anyhow::Result<ExitCode> {
     // Audit first, blessing after: the routing table is parsed without its
-    // signature so the registry can run; the gate asks for certification only
-    // after the evidence is produced, and credentials flow only once it holds.
+    // signature so the audit can run. A metadata read that spends the vault
+    // token re-checks the signature in api::authorize before issuance, so an
+    // uncertified table cannot borrow a credential while it waits for the
+    // report; the publication verdict itself is still decided after the audit.
     let (cfg, cfg_path, cfg_sig) = config::Config::load_unverified(config)?;
     let vault = vault::Vault::open()?;
 
@@ -2320,7 +3098,7 @@ fn cmd_pr(
             .ok_or_else(|| anyhow::anyhow!("no origin remote; pass --repo OWNER/NAME"))?,
     };
 
-    let (method, path, fields, jq) = match command {
+    let (method, path, fields, raw_fields, jq, expected_head) = match command {
         PrCommand::Create {
             title,
             body,
@@ -2338,69 +3116,98 @@ fn cmd_pr(
             // The publication boundary. A branch pushed through GitVault already
             // passed the same audit at pre-push -- a range that did is reused, not
             // paid for twice; content that reached the remote from elsewhere is
-            // reviewed here before the request proposes it. The checker resolves
+            // reviewed here before the request proposes it. The engine resolves
             // base/head in the local repository, the only place the content exists.
             let mut ctx =
-                context_for(&cfg, "pr", &PathBuf::from("."), None, &[]).map_err(|err| {
+                context_for(&cfg, "pr", &PathBuf::from("."), None, &[], None).map_err(|err| {
                     anyhow::anyhow!(
                         "reviewing a pull request needs a checkout of the repository\n  \
                      {err:#}\n  \
                      push the branch through GitVault, or run this from its working tree"
                     )
                 })?;
-            ctx.pr_base = Some(base.clone());
-            ctx.pr_head = Some(head.clone());
+            // Cross-repository naming splits two spellings apart: the API
+            // wants `owner:branch` for a fork head and the bare branch for
+            // the base, while the local audit resolves an immutable commit
+            // fetched from the remote that owns the head. Resolve both from
+            // that remote now; a head that cannot be fetched refuses the
+            // boundary instead of blessing a stale tracking ref. The base is
+            // fetched from the target's own remote and staged in the
+            // namespace Probator reads; the guard restores it after the audit.
+            let repo_root = ctx.repo_root.clone();
+            let audited_head = fetch_pr_branch_head(&repo_root, &head, &slug)?;
+            ctx.pr_head = Some(audited_head.clone());
+            let (resolved_base, base_sha, base_guard) = local_pr_base(&repo_root, &base, &slug)?;
+            ctx.pr_base = resolved_base.clone();
+            ctx.pr_base_sha = Some(base_sha);
             let (policy, _policy_path, policy_sig) = config::Policy::load_state(&cfg_path, &cfg)?;
             run_publication_gate(&cfg, &cfg_sig, &policy, &policy_sig, &ctx, "pull request")?;
-            let mut f = vec![
-                ("title".to_string(), title),
-                ("head".to_string(), head),
-                ("draft".to_string(), draft.to_string()),
-            ];
+            drop(base_guard);
+            // A branch that advances between the fetch and the POST would
+            // create a request containing a commit the audit never saw. Read
+            // the branch again now; a moved head refuses before anything is
+            // sent.
+            let latest = fetch_pr_branch_head(&repo_root, &head, &slug)?;
+            anyhow::ensure!(
+                latest.eq_ignore_ascii_case(&audited_head),
+                "pull request head '{head}' moved from {audited_head} to {latest} \
+                 while the audit ran; nothing was sent - rerun the request"
+            );
+            let mut f = vec![("title".to_string(), title), ("head".to_string(), head)];
             if let Some(b) = body {
                 f.push(("body".to_string(), b));
             }
-            if !base.is_empty() {
-                f.push(("base".to_string(), base));
+            if let Some(b) = resolved_base {
+                f.push(("base".to_string(), b));
             }
             (
                 "POST",
                 format!("/repos/{slug}/pulls"),
                 f,
+                vec![("draft".to_string(), draft.to_string())],
                 Some(".html_url".to_string()),
+                Some(audited_head),
             )
         }
         PrCommand::List { state, limit, json } => (
             "GET",
             format!("/repos/{slug}/pulls?state={state}&per_page={limit}"),
             vec![],
+            vec![],
             if json {
                 None
             } else {
                 Some(".[].html_url".to_string())
             },
+            None,
         ),
         PrCommand::View { number, json } => (
             "GET",
             format!("/repos/{slug}/pulls/{number}"),
+            vec![],
             vec![],
             if json {
                 None
             } else {
                 Some(".html_url".to_string())
             },
+            None,
         ),
         PrCommand::Merge {
             number,
             method,
             subject,
+            base,
         } => {
             // Merging publishes into the base branch -- the same class of
             // permanent record as creating. The head may not be checked out
-            // here, so the checker is told the request number and fetches the
-            // head itself; nothing reaches GitHub until it passes.
+            // here, so it is fetched now, at the gate boundary, and frozen
+            // into the context: a fetch inside the audit would ask for
+            // credentials in the middle of the run, where the prompt reads
+            // as the audit demanding them. Nothing reaches GitHub until the
+            // audit passes.
             let mut ctx =
-                context_for(&cfg, "pr", &PathBuf::from("."), None, &[]).map_err(|err| {
+                context_for(&cfg, "pr", &PathBuf::from("."), None, &[], None).map_err(|err| {
                     anyhow::anyhow!(
                         "reviewing a merge request needs a checkout of the repository\n  \
                      {err:#}\n  \
@@ -2408,46 +3215,168 @@ fn cmd_pr(
                     )
                 })?;
             ctx.pr_number = Some(number.to_string());
+            // The request's target branch, not the checkout's default: the
+            // audit range must be the one the merge will create. Without an
+            // explicit --base, read it from the request itself. A supplied
+            // --base drives the audit only as a cross-check: once the audit
+            // has passed, the request's real base is read again and a
+            // mismatch refuses before anything is merged. The same read gives
+            // the head the API currently reports, so a branch that moves
+            // between that read and the fetch is refused rather than silently
+            // audited at a different commit.
+            let mut requested_base = base.filter(|base| !base.trim().is_empty());
+            let metadata = if requested_base.is_none() {
+                // The first credential-bearing read in a merge.
+                // api::authorize re-checks the routing certificate before the
+                // token is issued, so an unsigned table refuses here instead
+                // of reading private request data and only failing at the gate.
+                let (api_base, api_head) = pull_request_metadata(&cfg, &vault, &slug, number)?;
+                requested_base = Some(api_base.clone());
+                Some((api_base, api_head))
+            } else {
+                None
+            };
+            let audited_head = fetch_pr_head(&ctx.repo_root, number, &slug)?;
+            if let Some((_, expected)) = &metadata {
+                anyhow::ensure!(
+                    audited_head.eq_ignore_ascii_case(expected),
+                    "pull request #{number} head moved from {expected} to {audited_head} \
+                     while the review was starting; rerun the merge"
+                );
+            }
+            let repo_root = ctx.repo_root.clone();
+            ctx.pr_head = Some(audited_head.clone());
+            let (resolved_base, base_sha, base_guard) =
+                local_pr_base(&repo_root, requested_base.as_deref().unwrap_or(""), &slug)?;
+            ctx.pr_base = resolved_base;
+            ctx.pr_base_sha = Some(base_sha);
             let (policy, _policy_path, policy_sig) = config::Policy::load_state(&cfg_path, &cfg)?;
             run_publication_gate(&cfg, &cfg_sig, &policy, &policy_sig, &ctx, "merge")?;
+            drop(base_guard);
+            // The audit can take minutes, and the request's base and head are
+            // mutable during it. Re-read the request after the audit and
+            // immediately before the merge PUT, whether --base was supplied or
+            // read from the request: a retarget or a moved head between that
+            // read and the merge must refuse rather than land on content the
+            // engine did not review.
+            let (api_base, api_head) = pull_request_metadata(&cfg, &vault, &slug, number)?;
+            let audited_branch = match &metadata {
+                // A caller-supplied --base drove the audit; compare the
+                // request's current target against the branch actually
+                // audited (the API name, after any remote-prefix stripping).
+                None => branch_for_api(&repo_root, requested_base.as_deref().unwrap_or("")),
+                // The request's own base drove the audit; it must still be
+                // that base.
+                Some(_) => requested_base.clone().unwrap_or_default(),
+            };
+            anyhow::ensure!(
+                audited_branch == api_base,
+                "pull request #{number} targets '{api_base}', not \
+                 '{audited_branch}'; rerun with the request's base or without --base"
+            );
+            anyhow::ensure!(
+                audited_head.eq_ignore_ascii_case(&api_head),
+                "pull request #{number} head moved from {api_head} to {audited_head} \
+                 while the audit ran; rerun the merge"
+            );
             let mut f = vec![("merge_method".to_string(), method)];
             if let Some(s) = subject {
                 f.push(("commit_title".to_string(), s));
             }
+            // GitHub merges the head it holds now. Naming the audited commit
+            // makes a moved head a 409 refusal instead of an unaudited merge.
+            f.push(("sha".to_string(), audited_head));
             (
                 "PUT",
                 format!("/repos/{slug}/pulls/{number}/merge"),
                 f,
+                vec![],
                 Some(".message".to_string()),
+                None,
             )
         }
         PrCommand::Close { number } => (
             "PATCH",
             format!("/repos/{slug}/pulls/{number}"),
             vec![("state".to_string(), "closed".to_string())],
+            vec![],
             Some(".state".to_string()),
+            None,
         ),
         PrCommand::Comment { number, body } => (
             "POST",
             format!("/repos/{slug}/issues/{number}/comments"),
             vec![("body".to_string(), body)],
+            vec![],
             Some(".html_url".to_string()),
+            None,
         ),
     };
 
-    let req = api::Request {
+    let mut req = api::Request {
         method: method.to_string(),
         path,
-        target: api::Target::Repo(slug),
+        target: api::Target::Repo(slug.clone()),
         fields,
-        raw_fields: vec![],
+        raw_fields,
         headers: vec![],
         body: None,
         jq,
         silent: false,
     };
+    // A created pull request carries the head the API actually used. If it
+    // advanced between the last read and the POST, the request contains a
+    // commit the audit never saw: close it and refuse rather than report a
+    // passing publication. The response is read instead of printed so the
+    // head can be judged before the command calls the request open.
+    if let Some(expected) = expected_head {
+        req.jq = Some(".html_url, .head.sha, .number".to_string());
+        let body = api::run_value(&cfg, &vault, &req)?;
+        let mut lines = body.lines();
+        let url = lines.next().unwrap_or_default().trim().to_string();
+        let created_head = lines.next().unwrap_or_default().trim().to_string();
+        let number = lines.next().unwrap_or_default().trim().to_string();
+        if !created_head.eq_ignore_ascii_case(&expected) {
+            close_pull_request(&cfg, &vault, &slug, &number);
+            anyhow::bail!(
+                "the pull request was created at {created_head}, but the audit reviewed \
+                 {expected}; it has been closed rather than propose unaudited content"
+            );
+        }
+        if !url.is_empty() {
+            println!("{url}");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let code = api::run(&cfg, &vault, &req)?;
     Ok(ExitCode::from(code as u8))
+}
+
+/// Close a pull request whose head moved past the audited commit. This is a
+/// containment action, not a publication: it only changes request metadata.
+fn close_pull_request(cfg: &config::Config, vault: &vault::Vault, slug: &str, number: &str) {
+    if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+        return;
+    }
+    let mut request = get(
+        format!("/repos/{slug}/pulls/{number}"),
+        slug.to_string(),
+        None,
+    );
+    request.method = "PATCH".into();
+    request.fields.push(("state".into(), "closed".into()));
+    request.silent = true;
+    match api::run(cfg, vault, &request) {
+        Ok(0) => eprintln!(
+            "gitvault: closed pull request #{number} because its head moved past the audit"
+        ),
+        Ok(code) => eprintln!(
+            "gitvault: could not close pull request #{number} (HTTP {code}); close it manually"
+        ),
+        Err(err) => eprintln!(
+            "gitvault: could not close pull request #{number}: {err:#}; close it manually"
+        ),
+    }
 }
 
 // ------------------------------------------------- gh-style convenience layer
@@ -2626,6 +3555,68 @@ fn cmd_repo(config: Option<&PathBuf>, command: RepoCommand) -> anyhow::Result<Ex
     emit(&cfg, &vault, req)
 }
 
+/// Refuse a release whose tag already exists at a different commit. For a new
+/// tag, `target_commitish` will create it at the audited commit. The remote is
+/// consulted at the boundary, after the audit produced its verdict and before
+/// the release request can publish anything.
+fn verify_remote_tag(
+    repo_root: &std::path::Path,
+    slug: &str,
+    tag: &str,
+    audited: &str,
+) -> anyhow::Result<()> {
+    let remote = remote_for_slug(repo_root, slug).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no remote in this checkout points at {slug}; \
+             add it before creating a release"
+        )
+    })?;
+    eprintln!(
+        "gitvault: checking remote tag {tag} so the release names the audited commit \
+         (the only credential use this release needs before creating it)"
+    );
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args([
+            "ls-remote",
+            "--tags",
+            "--",
+            &remote,
+            &format!("refs/tags/{tag}"),
+            &format!("refs/tags/{tag}^{{}}"),
+        ])
+        .output()
+        .context("failed to run git ls-remote")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "cannot resolve remote tag {tag} before creating the release"
+    );
+    let mut tag_oid = None;
+    let mut peeled = None;
+    let peeled_name = format!("refs/tags/{tag}^{{}}");
+    let tag_name = format!("refs/tags/{tag}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let Some((oid, name)) = line.split_once('\t') else {
+            continue;
+        };
+        if name == peeled_name {
+            peeled = Some(oid.trim());
+        } else if name == tag_name {
+            tag_oid = Some(oid.trim());
+        }
+    }
+    if let Some(actual) = peeled.or(tag_oid) {
+        anyhow::ensure!(
+            actual.eq_ignore_ascii_case(audited),
+            "remote tag {tag} points at {actual}, but the audit reviewed {audited}; \
+             refusing to create a release that describes unaudited content"
+        );
+    }
+    Ok(())
+}
+
 fn cmd_release(
     config: Option<&PathBuf>,
     command: ReleaseCommand,
@@ -2635,17 +3626,31 @@ fn cmd_release(
     // The release boundary runs before any credential is touched: the verdict
     // does not depend on the vault, and a refusal must be possible even where
     // the vault is locked. Nothing reaches GitHub until the registry passes.
+    let mut release_audit: Option<(PathBuf, String)> = None;
     if let ReleaseCommand::Create { tag, .. } = &command {
-        let (policy, _policy_path, policy_sig) = config::Policy::load_state(&cfg_path, &cfg)?;
-        let ctx = context_for(&cfg, "release", &PathBuf::from("."), Some(tag.clone()), &[])
-            .map_err(|err| {
-                anyhow::anyhow!(
-                    "reviewing a release needs a checkout with the tagged commit\n  \
+        let ctx = context_for(
+            &cfg,
+            "release",
+            &PathBuf::from("."),
+            Some(tag.clone()),
+            &[],
+            None,
+        )
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "reviewing a release needs a checkout with the tagged commit\n  \
                      {err:#}\n  \
                      run this from the tagged working tree"
-                )
-            })?;
+            )
+        })?;
+        let repo_root = ctx.repo_root.clone();
+        let audited = ctx
+            .release_commit
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("the release audit has no commit"))?;
+        let (policy, _policy_path, policy_sig) = config::Policy::load_state(&cfg_path, &cfg)?;
         run_publication_gate(&cfg, &cfg_sig, &policy, &policy_sig, &ctx, "release")?;
+        release_audit = Some((repo_root, audited));
     }
     let vault = vault::Vault::open()?;
     let slug = resolve_slug(repo)?;
@@ -2672,6 +3677,10 @@ fn cmd_release(
             draft,
             prerelease,
         } => {
+            let (repo_root, audited) = release_audit
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("the release audit did not run"))?;
+            verify_remote_tag(repo_root, &slug, &tag, audited)?;
             let mut r = get(
                 format!("/repos/{slug}/releases"),
                 slug.clone(),
@@ -2679,8 +3688,12 @@ fn cmd_release(
             );
             r.method = "POST".into();
             r.fields.push(("tag_name".into(), tag.clone()));
-            r.fields.push(("draft".into(), draft.to_string()));
-            r.fields.push(("prerelease".into(), prerelease.to_string()));
+            // A new tag is created at the commit the audit reviewed, not at
+            // whatever the target repository's default branch happens to be.
+            r.fields.push(("target_commitish".into(), audited.clone()));
+            r.raw_fields.push(("draft".into(), draft.to_string()));
+            r.raw_fields
+                .push(("prerelease".into(), prerelease.to_string()));
             if let Some(n) = name {
                 r.fields.push(("name".into(), n));
             }
@@ -3031,9 +4044,11 @@ fn cmd_objection(command: ObjectionCommand) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// A checker's newest report.json under its profile run history.
+/// A checker's newest report.json under the engine's profile run history.
+/// The root comes from the same armed-aware resolver as the engine child's
+/// data root, so an objection always binds the report the engine wrote.
 fn latest_report(checker: &str) -> Option<serde_json::Value> {
-    let runs = profiles_root()
+    let runs = crate::probator::profiles_root()
         .join(checker)
         .join(format!("{checker}-runs"));
     let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
@@ -3054,16 +4069,24 @@ fn latest_report(checker: &str) -> Option<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        admissible_proposed_row, audit_gate, drain_pending_attestations, outgoing_push_stdin,
-        pending_attested, profiles_root, proposed_contract_path_at, publication_surface,
-        read_pending, record_pending_attestation,
+        branch_for_api, fetch_remote_ref, local_pr_base, outgoing_push_stdin, parse_push_args,
+        publication_surface, push_plan, remote_mirrors, verify_remote_tag,
     };
-    use crate::checkers::Context;
-    use crate::config::{Config, Policy};
-    use crate::configsig::SigState;
-    use crate::records;
-    use std::path::PathBuf;
     use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "gv-main-{tag}-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     fn git(dir: &std::path::Path, args: &[&str]) -> String {
         let out = Command::new("git")
@@ -3086,146 +4109,287 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     }
 
-    fn ctx(event: &str) -> Context {
-        Context {
-            event: event.to_string(),
-            repo_root: PathBuf::from("/synthetic/repo"),
-            repo_slug: Some("Owner/Repo".into()),
-            identity: "personal".into(),
-            account: None,
-            via_default: true,
-            expected_email: None,
-            actual_email: None,
-            stdin: None,
-            push_remote: None,
-            pr_base: None,
-            pr_head: None,
-            pr_number: None,
-            release_tag: None,
-            release_commit: None,
-            commit_message_file: None,
-            commit_message_source: None,
-        }
-    }
-
-    /// A `checkers.toml` that exists but registers no checkers used to skip
-    /// both signature refusals: one local write disarmed the publication
-    /// boundary with zero audits and zero signature checks. The refusal is
-    /// now unconditional at the events that publish or spend credentials.
+    /// A remote-prefixed base keeps the slashes that belong to the branch:
+    /// `origin/release/1.0` is `release/1.0`, not a branch named `origin`.
     #[test]
-    fn boundary_events_refuse_an_uncertified_policy_even_when_empty() {
-        let cfg = Config::default();
-        let policy = Policy::default();
-        for event in ["pre-push", "pr", "release"] {
-            let err = match audit_gate(
-                &cfg,
-                &SigState::Inactive,
-                &policy,
-                &SigState::Invalid("checkers.toml is unsigned".into()),
-                &ctx(event),
-                "test",
-                None,
-                false,
-            ) {
-                Err(err) => err,
-                Ok(_) => panic!("{event} must refuse an uncertified audit policy"),
-            };
-            assert!(
-                err.to_string().contains("uncertified audit policy"),
-                "{err}"
-            );
-        }
-        // An event the policy gates nothing for still passes: nothing would
-        // execute, so local work is not held hostage to a blessing.
-        assert!(
-            audit_gate(
-                &cfg,
-                &SigState::Inactive,
-                &policy,
-                &SigState::Invalid("checkers.toml is unsigned".into()),
-                &ctx("pre-commit"),
-                "test",
-                None,
-                false,
-            )
-            .is_ok()
+    fn a_remote_prefixed_base_keeps_slashes_after_the_remote() {
+        let dir = scratch("base-slash");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(
+            &dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/repo.git",
+            ],
         );
+        git(
+            &dir,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "https://github.com/up/repo.git",
+            ],
+        );
+        assert_eq!(branch_for_api(&dir, "origin/release/1.0"), "release/1.0");
+        assert_eq!(branch_for_api(&dir, "upstream/feature/x"), "feature/x");
+        assert_eq!(branch_for_api(&dir, "main"), "main");
+        assert_eq!(branch_for_api(&dir, "feature/x"), "feature/x");
+        assert_eq!(
+            branch_for_api(&dir, "other/release/1.0"),
+            "other/release/1.0"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `check` is the audit-before-blessing tool: a proposed policy change
-    /// must be exercisable *before* it is signed, or signing would always
-    /// come first. Enforcement paths keep refusing the same file. A boundary
-    /// the proposal registers nothing for still refuses: no audit ran, so
-    /// there is no evidence to bless.
+    /// A fetched head is captured through a private ref, so a concurrent fetch
+    /// cannot move the object id this review binds, and the shared FETCH_HEAD
+    /// is not read or rewritten.
     #[test]
-    fn check_audits_a_proposed_policy_the_enforcer_would_refuse() {
-        let cfg = Config::default();
-        let policy = Policy::default();
-        let err = audit_gate(
-            &cfg,
-            &SigState::Inactive,
-            &policy,
-            &SigState::Invalid("checkers.toml is unsigned".into()),
-            &ctx("pre-push"),
-            "check",
-            None,
-            true,
+    fn a_private_fetch_captures_the_object_without_touching_fetch_head() {
+        let root = scratch("private-fetch");
+        let remote = root.join("remote.git");
+        git(&root, &["init", "--bare", "-q", remote.to_str().unwrap()]);
+        let source = root.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        git(&source, &["init", "-q", "-b", "main"]);
+        std::fs::write(source.join("one"), "base\n").unwrap();
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-qm", "base"]);
+        git(
+            &source,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&source, &["push", "-q", "origin", "main"]);
+        let expected = git(&source, &["rev-parse", "HEAD"]);
+
+        let local = root.join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        git(&local, &["init", "-q", "-b", "main"]);
+        git(
+            &local,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        let fetch_head = local.join(".git").join("FETCH_HEAD");
+        std::fs::write(&fetch_head, "deadbeef\t\tbranch 'main' of fixture\n").unwrap();
+        let before = std::fs::read_to_string(&fetch_head).unwrap();
+
+        let captured = fetch_remote_ref(&local, "origin", "refs/heads/main", "fixture").unwrap();
+        assert_eq!(captured, expected);
+        assert_eq!(
+            std::fs::read_to_string(&fetch_head).unwrap(),
+            before,
+            "the shared FETCH_HEAD must not be written or read as the capture"
+        );
+        assert!(
+            git(&local, &["for-each-ref", "refs/gitvault/fetch"]).is_empty(),
+            "the private fetch ref must be deleted"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A PR base is fetched from the remote that owns the target repository,
+    /// refreshed even when a tracking ref already exists, and a fork
+    /// checkout's origin namespace is restored after the audit.
+    #[test]
+    fn a_pr_base_is_fetched_from_the_target_remote_and_refreshed() {
+        let root = scratch("pr-base");
+        let target = root.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        git(&target, &["init", "--bare", "-q"]);
+        let fork = root.join("fork");
+        std::fs::create_dir_all(&fork).unwrap();
+        git(&fork, &["init", "--bare", "-q"]);
+
+        let dir = root.join("work");
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(
+            &dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/fork.git",
+            ],
+        );
+        git(
+            &dir,
+            &[
+                "remote",
+                "add",
+                "upstream",
+                "https://github.com/acme/repo.git",
+            ],
+        );
+        // The URL rewrite keeps the configured remote identity (`acme/repo`)
+        // while the fetch itself resolves to a local bare repository.
+        git(
+            &dir,
+            &[
+                "config",
+                &format!("url.file://{}.insteadOf", target.display()),
+                "https://github.com/acme/repo.git",
+            ],
+        );
+        git(
+            &dir,
+            &[
+                "config",
+                &format!("url.file://{}.insteadOf", fork.display()),
+                "https://github.com/acme/fork.git",
+            ],
+        );
+
+        std::fs::write(dir.join("one"), "one\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "one"]);
+        let target_head = git(&dir, &["rev-parse", "HEAD"]);
+        git(
+            &dir,
+            &[
+                "push",
+                "-q",
+                target.to_str().unwrap(),
+                &format!("{target_head}:refs/heads/release/1.0"),
+                &format!("{target_head}:refs/heads/main"),
+            ],
+        );
+        git(&target, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        // A stale local origin ref must not be the audited base.
+        std::fs::write(dir.join("two"), "two\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-qm", "two"]);
+        let stale = git(&dir, &["rev-parse", "HEAD"]);
+        git(
+            &dir,
+            &["update-ref", "refs/remotes/origin/release/1.0", &stale],
+        );
+
+        let (base, base_sha, guard) =
+            local_pr_base(&dir, "origin/release/1.0", "acme/repo").unwrap();
+        assert_eq!(base, Some("release/1.0".to_string()));
+        assert_eq!(
+            base_sha, target_head,
+            "the attribution base and the audit base must be the same commit"
+        );
+        assert_eq!(
+            branch_for_api(&dir, "origin/release/1.0"),
+            "release/1.0",
+            "a remote name is a prefix, not part of a slashed branch"
+        );
+        let guard = guard.expect("a non-origin target needs a borrowed origin ref");
+        assert_eq!(
+            git(&dir, &["rev-parse", "refs/remotes/origin/release/1.0"]),
+            target_head,
+            "the audit base must be the target's refreshed commit, not the stale mirror"
+        );
+        assert_eq!(
+            git(&dir, &["rev-parse", "refs/remotes/upstream/release/1.0"]),
+            target_head
+        );
+        drop(guard);
+        assert_eq!(
+            git(&dir, &["rev-parse", "refs/remotes/origin/release/1.0"]),
+            stale,
+            "the checkout's own origin ref is restored after the audit"
+        );
+
+        // An omitted base follows the target's default, not origin's.
+        let (base, base_sha, guard) = local_pr_base(&dir, "", "acme/repo").unwrap();
+        assert_eq!(base, Some("main".to_string()));
+        assert_eq!(base_sha, target_head);
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An existing remote tag must point at the audited commit; a new tag is
+    /// allowed (the release request will create it at `target_commitish`).
+    #[test]
+    fn a_release_tag_must_match_the_audited_commit() {
+        let root = scratch("release-tag");
+        let remote = root.join("remote.git");
+        git(&root, &["init", "--bare", "-q", remote.to_str().unwrap()]);
+        let source = root.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        git(&source, &["init", "-q", "-b", "main"]);
+        std::fs::write(source.join("one"), "base\n").unwrap();
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "-qm", "base"]);
+        git(&source, &["tag", "v1"]);
+        git(
+            &source,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&source, &["push", "-q", "origin", "main", "v1"]);
+        let audited = git(&source, &["rev-parse", "HEAD"]);
+
+        let local = root.join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        git(&local, &["init", "-q", "-b", "main"]);
+        git(
+            &local,
+            &[
+                "config",
+                &format!("url.{}.insteadOf", remote.display()),
+                "https://github.com/acme/repo.git",
+            ],
+        );
+        git(
+            &local,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/repo.git",
+            ],
+        );
+        verify_remote_tag(&local, "acme/repo", "v1", &audited).expect("matching tag");
+        verify_remote_tag(&local, "acme/repo", "v2", &audited).expect("new tag");
+        let err = verify_remote_tag(
+            &local,
+            "acme/repo",
+            "v1",
+            "0000000000000000000000000000000000000000",
         )
-        .expect_err("an empty policy cannot bless a boundary, proposed or not");
-        assert!(err.to_string().contains("audit evidence"), "{err}");
-        // A non-boundary event stays free of the blessing: nothing would run,
-        // so local work is not held hostage to a signature.
-        assert!(
-            audit_gate(
-                &cfg,
-                &SigState::Inactive,
-                &policy,
-                &SigState::Invalid("checkers.toml is unsigned".into()),
-                &ctx("pre-commit"),
-                "check",
-                None,
-                true,
-            )
-            .is_ok()
-        );
+        .expect_err("a tag at another commit must refuse");
+        assert!(err.to_string().contains("points at"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The routing-table refusal is unconditional at the same boundaries: a
-    /// certified-but-empty policy must not skip it either.
+    /// git treats a valueless `mirror` key as true, while `git config --get`
+    /// answers an empty string. The plan must not read that as "not a mirror":
+    /// the real push would still mirror the whole namespace.
     #[test]
-    fn boundary_events_refuse_an_uncertified_routing_table() {
-        let cfg = Config::default();
-        let policy = Policy::default();
-        for event in ["pre-push", "pr", "release"] {
-            let err = match audit_gate(
-                &cfg,
-                &SigState::Invalid("config.toml is unsigned".into()),
-                &policy,
-                &SigState::Inactive,
-                &ctx(event),
-                "check",
-                None,
-                false,
-            ) {
-                Err(err) => err,
-                Ok(_) => panic!("{event} must refuse an uncertified routing table"),
-            };
-            assert!(err.to_string().contains("uncertified"), "{err}");
-        }
-        // Non-boundary events keep the checker-registration criterion.
-        assert!(
-            audit_gate(
-                &cfg,
-                &SigState::Invalid("config.toml is unsigned".into()),
-                &policy,
-                &SigState::Inactive,
-                &ctx("pre-commit"),
-                "check",
-                None,
-                false,
-            )
-            .is_ok()
+    fn a_valueless_remote_mirror_key_is_refused() {
+        let dir = scratch("mirror-bool");
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(
+            &dir,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/repo.git",
+            ],
         );
+        let repo = crate::git::Repo::for_test(
+            &dir.to_string_lossy(),
+            Some("https://github.com/acme/repo.git"),
+        );
+        assert!(!remote_mirrors(&repo, "origin"));
+        let config = dir.join(".git").join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("\n[remote \"origin\"]\n\tmirror\n");
+        std::fs::write(&config, text).unwrap();
+        assert!(
+            remote_mirrors(&repo, "origin"),
+            "a valueless mirror key is true to git and must be refused"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The publication surface refuses every write that lands content or moves
@@ -3248,9 +4412,35 @@ mod tests {
             ("POST", "/repos/o/r/releases"),
             ("PATCH", "/repos/o/r/releases/9"),
             ("POST", "/repos/o/r/statuses/deadbeef"),
-            // The audited channel is safe only if absolute URLs still
+            // The publication surface is safe only if absolute URLs still
             // normalize onto the path the match runs against.
             ("POST", "https://api.github.com/repos/o/r/statuses/deadbeef"),
+            // A dot segment is resolved by curl/the server after matching, so
+            // every spelling of it is refused instead of matched raw.
+            ("POST", "/repos/o/r/../r/statuses/deadbeef"),
+            ("PUT", "/repos/o/r/contents/../../r/contents/src/lib.rs"),
+            ("POST", "/repos/o/r/./git/refs"),
+            ("POST", "/repos/o/r/%2e%2e/r/statuses/deadbeef"),
+            ("POST", "/repos/o/r/%2E%2E/r/git/refs"),
+            ("POST", "/repos/o/r/.%2e/r/releases"),
+            ("POST", "/repos/o/r/%2e%2e%2fr/statuses/deadbeef"),
+            ("POST", "/repos/o/r/..%5Cr/statuses/deadbeef"),
+            // A percent-encoded route name must match the route the server
+            // will decode, not slip past as an unknown segment.
+            ("POST", "/repos/o/r/%63ontents/src/lib.rs"),
+            ("PUT", "/repos/o/r/%63%6f%6e%74%65%6e%74%73/src/lib.rs"),
+            ("POST", "/repos/o/r/%67it/refs"),
+            ("PUT", "/repos/o/r/pulls/7/%6derge"),
+            ("POST", "/repos/o/r/%72eleases"),
+            // An encoded separator changes the segment boundaries after the
+            // check; a doubly encoded one still carries a percent escape.
+            // The doubled form is refused across the whole path, including
+            // owner/repo, so it cannot shift where the surface starts.
+            ("POST", "/repos/o/r/contents%2Fsrc%2Flib.rs"),
+            ("POST", "/repos/o/r/statuses%2Fdeadbeef"),
+            ("POST", "/repos/o/r/releases%252F9"),
+            ("POST", "/repos/o%252fr/r/contents/x"),
+            ("POST", "/repos/o/r%252f..%252fstatuses/deadbeef"),
         ] {
             assert!(
                 publication_surface(method, path).is_some(),
@@ -3260,9 +4450,11 @@ mod tests {
         for (method, path) in [
             ("GET", "/repos/o/r/contents/src/lib.rs"),
             ("GET", "/repos/o/r/pulls/7"),
+            ("GET", "/repos/o/r/%63ontents/src/lib.rs"), // a read stays a read
             ("POST", "/repos/o/r/issues"),
             ("POST", "/repos/o/r/issues/3/comments"),
-            ("PATCH", "/repos/o/r/pulls/7"), // metadata edit, not publication
+            ("POST", "/repos/o/r/issues/%31"), // encoded digit, not a surface
+            ("PATCH", "/repos/o/r/pulls/7"),   // metadata edit, not publication
             ("POST", "/repos/o/r/labels"),
             ("POST", "/repos/o/r/pulls/7/merge-ish"), // not the merge endpoint
         ] {
@@ -3323,404 +4515,455 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The pending-file contract is the drain's only input: a deferred
-    /// attestation must land where the drain looks and read back the slug
-    /// and sha it was recorded with, or key drift silently disables the
-    /// whole mechanism.
+    /// Push arguments keep flags out of the positionals: the remote is the
+    /// first bare word, refspecs the rest, and value-flags consume their
+    /// token so `-o ci.skip` never reads as a ref name.
     #[test]
-    fn a_pending_attestation_round_trips_through_its_file() {
-        let dir = std::env::temp_dir().join(format!(
-            "gv-pending-{}-{:04x}",
-            std::process::id(),
-            rand::random::<u16>()
-        ));
-        let cfg = Config {
-            record_dir: Some(dir.join("runs")),
-            ..Default::default()
-        };
-        let sha = "a".repeat(40);
-        record_pending_attestation(&cfg, "Owner/Repo", &sha, &dir);
-        let file = dir.join("pending").join(format!("Owner_Repo__{sha}.json"));
-        assert!(file.is_file(), "pending file missing at {}", file.display());
-        assert_eq!(
-            read_pending(&file),
-            Some(("Owner/Repo".to_string(), sha.clone(), dir.clone()))
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A pending file is same-user writable, so a planted one must not earn
-    /// a posting: without a sealed passed run pushing that sha, the drain
-    /// refuses and keeps the file - before the vault is ever opened.
-    #[test]
-    fn a_planted_pending_attestation_is_not_posted() {
-        let dir = std::env::temp_dir().join(format!(
-            "gv-pending-{}-{:04x}",
-            std::process::id(),
-            rand::random::<u16>()
-        ));
-        let cfg = Config {
-            record_dir: Some(dir.join("runs")),
-            ..Default::default()
-        };
-        // Write a real commit in a real repo so the peel check cannot be the
-        // reason the entry is skipped: only the missing evidence may refuse.
-        let repo = dir.join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        git(&repo, &["init"]);
-        std::fs::write(repo.join("a"), "a").unwrap();
-        git(&repo, &["add", "a"]);
-        git(&repo, &["commit", "-m", "a"]);
-        let sha = git(&repo, &["rev-parse", "HEAD"]);
-        record_pending_attestation(&cfg, "Owner/Repo", &sha, &repo);
-        let file = dir.join("pending").join(format!("Owner_Repo__{sha}.json"));
-
-        // No run records exist: the claim is forged, the drain must hold.
-        drain_pending_attestations(&cfg).unwrap();
-        assert!(file.is_file(), "forged pending was posted or dropped");
-        // And a pushed sha that does appear in a sealed passing record is
-        // the only shape that may post - assert the predicate sees the gap.
-        assert!(!pending_attested(&cfg, "Owner/Repo", &sha));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The positive half of the binding: a sealed, passed pre-push record
-    /// whose refs pushed the sha is accepted as evidence; rewriting it
-    /// breaks the seal and the evidence with it.
-    #[test]
-    fn only_a_sealed_passed_push_record_attests_a_pending_sha() {
-        let dir = std::env::temp_dir().join(format!(
-            "gv-attest-{}-{:04x}",
-            std::process::id(),
-            rand::random::<u16>()
-        ));
-        let run_dir = dir.join("runs");
-        let cfg = Config {
-            record_dir: Some(run_dir.clone()),
-            ..Default::default()
-        };
-        let sha = "b".repeat(40);
-        let record_dir = run_dir.join("0000000001-a1a1");
-        std::fs::create_dir_all(&record_dir).unwrap();
-        let mut record = records::Record {
-            id: "0000000001-a1a1".to_string(),
-            created_at: 1,
-            duration_ms: 0,
-            event: "pre-push".to_string(),
-            repository: "Owner/Repo".to_string(),
-            identity: "synthetic".to_string(),
-            account: "Fixture-Acct".to_string(),
-            range: records::Range {
-                refs: format!("refs/heads/main {sha} refs/heads/main {}", "0".repeat(40)),
-                pr_base: None,
-                pr_head: None,
-                pr_number: None,
-                release_tag: None,
-                release_commit: None,
-            },
-            routing_signature: "valid".to_string(),
-            policy_signature: "valid".to_string(),
-            passed: true,
-            blocking_failures: 0,
-            outcomes: Vec::new(),
-            seal: String::new(),
-            seal_prev: String::new(),
-        };
-        record.seal = crate::seal::seal("", &serde_json::to_value(&record).unwrap());
-        let file = record_dir.join("engine.json");
-        let write = |r: &records::Record| {
-            std::fs::write(&file, serde_json::to_string_pretty(r).unwrap()).unwrap();
-        };
-        write(&record);
-        assert!(pending_attested(&cfg, "Owner/Repo", &sha));
-
-        // A different sha - one the recorded push never carried - has no
-        // evidence, and tampering with the refs breaks the seal either way.
-        assert!(!pending_attested(&cfg, "Owner/Repo", &"c".repeat(40)));
-        record.range.refs = format!(
-            "refs/heads/main {} refs/heads/main {}",
-            "c".repeat(40),
-            "0".repeat(40)
-        );
-        write(&record); // stale seal: rewritten after sealing
-        assert!(!pending_attested(&cfg, "Owner/Repo", &sha));
-        assert!(!pending_attested(&cfg, "Owner/Repo", &"c".repeat(40)));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_proposal_never_executes_arbitrary_commands() {
-        // The signature boundary exists because checker rows are code: a
-        // proposed policy that names anything but the trusted audit runner
-        // is refused, not executed.
-        let shell_row = crate::config::Checker {
-            name: "evil".into(),
-            on: vec!["pre-push".into()],
-            kind: crate::config::Kind::Exec,
-            severity: crate::config::Severity::Blocking,
-            timeout_secs: 0,
-            phase: 0,
-            command: vec!["/bin/sh".into(), "-c".into(), "touch /tmp/x".into()],
-            env: Default::default(),
-            repos: vec![],
-        };
-        let repo = std::env::temp_dir().join(format!("gv-prop-{:04x}", rand::random::<u16>()));
-        std::fs::create_dir_all(&repo).unwrap();
-        assert!(admissible_proposed_row(&shell_row, &repo).is_err());
-        let _ = std::fs::remove_dir_all(&repo);
-    }
-
-    #[test]
-    fn a_proposal_row_is_bound_to_the_reviewed_repository() {
-        let runner = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("gitvault-review");
-        // Any installed contract supplies the in-root path the shape needs;
-        // both fixtures only exist where the toolchain is deployed.
-        let contract = std::fs::read_dir(profiles_root())
-            .ok()
-            .into_iter()
-            .flatten()
-            .flatten()
-            .flat_map(|dir| {
-                std::fs::read_dir(dir.path().join("plugins"))
-                    .ok()
-                    .into_iter()
-                    .flatten()
-                    .flatten()
-                    .collect::<Vec<_>>()
-            })
-            .map(|entry| entry.path().join("contract.json"))
-            .find(|path| path.is_file());
-        let (Some(contract), true) = (contract, runner.exists()) else {
-            return;
-        };
-        let repo = std::env::temp_dir().join(format!("gv-prop-{:04x}", rand::random::<u16>()));
-        std::fs::create_dir_all(&repo).unwrap();
-        let row = |tail: &[String]| crate::config::Checker {
-            name: "probe".into(),
-            on: vec!["pre-push".into()],
-            kind: crate::config::Kind::Exec,
-            severity: crate::config::Severity::Blocking,
-            timeout_secs: 0,
-            phase: 0,
-            command: std::iter::once(runner.display().to_string())
-                .chain(tail.iter().cloned())
-                .collect(),
-            env: Default::default(),
-            repos: vec![],
-        };
-        let contract = contract.display().to_string();
-        // The canonical installed shape passes; a literal path bound to the
-        // same repository does too.
-        for tail in [
-            vec!["run", "--contract", &contract, "--repo", "{repo}"],
-            vec![
-                "run",
-                "--contract",
-                &contract,
-                "--repo",
-                &repo.display().to_string(),
-            ],
-            vec!["baseline", "--repo", "{repo}"],
-        ] {
-            let good = row(&tail.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-            assert!(
-                admissible_proposed_row(&good, &repo).is_ok(),
-                "canonical row {tail:?} refused"
-            );
-        }
-        // A different repository, extra arguments, help flags and a
-        // contract-less run all refuse.
-        for tail in [
-            vec!["run", "--contract", &contract, "--repo", "/"],
-            vec![
-                "run",
-                "--contract",
-                &contract,
-                "--repo",
-                "{repo}",
-                "--verbose",
-            ],
-            vec!["run", "--help"],
-            vec!["run", "--contract", &contract],
-            vec!["baseline", "--repo", "/"],
-        ] {
-            let bad = row(&tail.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-            assert!(
-                admissible_proposed_row(&bad, &repo).is_err(),
-                "tail {tail:?} passed"
-            );
-        }
-        // Reserved context variables cannot be overridden by a proposal.
-        let mut poisoned = row(&[
-            "run".into(),
-            "--contract".into(),
-            contract.clone(),
-            "--repo".into(),
-            "{repo}".into(),
+    fn push_args_split_flags_from_the_remote_and_refspecs() {
+        let parsed = parse_push_args(&[
+            "-u".into(),
+            "--force".into(),
+            "origin".into(),
+            "main".into(),
+            "dev:stable".into(),
         ]);
-        poisoned.env.insert("GITVAULT_PUSH_REFS".into(), "x".into());
-        assert!(admissible_proposed_row(&poisoned, &repo).is_err());
-        let _ = std::fs::remove_dir_all(&repo);
+        assert_eq!(parsed.remote.as_deref(), Some("origin"));
+        assert_eq!(parsed.refspecs, ["main", "dev:stable"]);
+
+        let parsed = parse_push_args(&[
+            "-o".into(),
+            "ci.skip".into(),
+            "--delete".into(),
+            "origin".into(),
+            "old".into(),
+        ]);
+        assert!(parsed.delete);
+        assert_eq!(parsed.remote.as_deref(), Some("origin"));
+        assert_eq!(parsed.refspecs, ["old"]);
+
+        let parsed = parse_push_args(&["--tags".into(), "origin".into()]);
+        assert!(parsed.tags);
+        assert_eq!(parsed.remote.as_deref(), Some("origin"));
+        assert!(parsed.refspecs.is_empty());
+
+        // With --repo the first positional is a refspec, not the remote.
+        let parsed = parse_push_args(&[
+            "--repo".into(),
+            "origin".into(),
+            "main".into(),
+            "dev".into(),
+        ]);
+        assert_eq!(parsed.remote.as_deref(), Some("origin"));
+        assert_eq!(parsed.refspecs, ["main", "dev"]);
+
+        // Ref-selection options that bypass the pre-audit's enumeration are
+        // recognised, including git's unambiguous long-option abbreviations.
+        for spelling in ["--no-verify", "--no-verif", "--no-v"] {
+            let parsed = parse_push_args(&[spelling.into(), "origin".into()]);
+            assert!(parsed.no_verify, "{spelling}");
+            assert!(parsed.unmodelled().is_some(), "{spelling}");
+        }
+        for spelling in ["--stdin", "--stdi", "--std"] {
+            let parsed = parse_push_args(&[spelling.into(), "origin".into()]);
+            assert!(parsed.read_stdin, "{spelling}");
+            assert!(parsed.unmodelled().is_some(), "{spelling}");
+        }
+        for spelling in ["--follow-tags", "--follow-tag", "--follow"] {
+            let parsed = parse_push_args(&[spelling.into(), "origin".into()]);
+            assert!(parsed.follow_tags, "{spelling}");
+            assert!(parsed.unmodelled().is_some(), "{spelling}");
+        }
+        // A push-option value is not a flag, even when it names one.
+        let parsed = parse_push_args(&["-o".into(), "--no-verify".into(), "origin".into()]);
+        assert!(!parsed.no_verify);
+        assert!(parsed.unmodelled().is_none());
     }
 
-    /// A boundary proposal audited under `--only` produces evidence from a
-    /// single row, yet the completeness check sees the configured set - the
-    /// partial pass could then be signed as if every reviewer ran.
+    /// `gitvault push` audits what this push actually carries: the refspec
+    /// arguments and the local mirror decide the ref lines, so a partial
+    /// push never pays for branches that stay home and never skips the ones
+    /// that move.
     #[test]
-    fn a_boundary_proposal_refuses_a_partial_audit() {
-        let cfg = Config::default();
-        let mut policy = Policy::default();
-        policy.checkers.push(crate::config::Checker {
-            name: "anything".into(),
-            on: vec!["pre-push".into()],
-            kind: crate::config::Kind::Exec,
-            severity: crate::config::Severity::Blocking,
-            timeout_secs: 0,
-            phase: 0,
-            command: vec!["/bin/true".into()],
-            env: Default::default(),
-            repos: vec![],
-        });
-        let err = audit_gate(
-            &cfg,
-            &SigState::Inactive,
-            &policy,
-            &SigState::Invalid("checkers.toml is unsigned".into()),
-            &ctx("pre-push"),
-            "check",
-            Some("anything"),
-            true,
-        )
-        .expect_err("--only must refuse a boundary proposal");
-        assert!(err.to_string().contains("partially"), "{err}");
-        // A signed policy keeps `--only` as the operator's debug tool; the
-        // refusal belongs to the proposal path alone.
-        let outcome = audit_gate(
-            &cfg,
-            &SigState::Inactive,
-            &policy,
-            &SigState::Valid,
-            &ctx("pre-push"),
-            "check",
-            Some("anything"),
-            true,
+    fn a_push_plan_maps_the_refs_the_push_carries() {
+        let dir = std::env::temp_dir().join(format!(
+            "gv-push-plan-{}-{:04x}",
+            std::process::id(),
+            rand::random::<u16>()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-b", "main"]);
+        std::fs::write(dir.join("a"), "a").unwrap();
+        git(&dir, &["add", "a"]);
+        git(&dir, &["commit", "-m", "a"]);
+        let first = git(&dir, &["rev-parse", "HEAD"]);
+        git(
+            &dir,
+            &["remote", "add", "origin", "git@github.com:Owner/Repo.git"],
         );
+        git(&dir, &["update-ref", "refs/remotes/origin/main", &first]);
+        git(&dir, &["config", "branch.main.remote", "origin"]);
+        git(&dir, &["config", "branch.main.merge", "refs/heads/main"]);
+        std::fs::write(dir.join("b"), "b").unwrap();
+        git(&dir, &["add", "b"]);
+        git(&dir, &["commit", "-m", "b"]);
+        let head = git(&dir, &["rev-parse", "HEAD"]);
+        git(&dir, &["checkout", "-b", "feature"]);
+        git(&dir, &["tag", "v1"]);
+        let zeros = "0".repeat(40);
+        let repo = crate::git::Repo::for_test(
+            &dir.to_string_lossy(),
+            Some("git@github.com:Owner/Repo.git"),
+        );
+
+        // A bare push follows push.default simple. `feature` has no upstream
+        // yet, so git would refuse; the wrapper must not synthesize one.
+        let error = push_plan(&repo, &[]).unwrap_err();
+        assert!(error.to_string().contains("no upstream branch"), "{error}");
+        git(&dir, &["config", "branch.feature.remote", "origin"]);
+        git(
+            &dir,
+            &["config", "branch.feature.merge", "refs/heads/feature"],
+        );
+        let plan = push_plan(&repo, &[]).unwrap();
+        assert_eq!(
+            plan.stdin,
+            format!("refs/heads/feature {head} refs/heads/feature {zeros}\n")
+        );
+        assert_eq!(plan.refs[0].git_refspec(), "refs/heads/feature");
+        for required in ["--no-follow-tags", "--no-recurse-submodules", "--no-prune"] {
+            assert!(
+                plan.args.iter().any(|arg| arg == required),
+                "{required}: {:?}",
+                plan.args
+            );
+        }
+
+        // A differently named upstream is the other `simple` refusal: git
+        // will not silently push the branch to the upstream's name.
+        git(
+            &dir,
+            &["config", "branch.feature.merge", "refs/heads/release"],
+        );
+        let error = push_plan(&repo, &[]).unwrap_err();
+        assert!(error.to_string().contains("does not match"), "{error}");
+        git(
+            &dir,
+            &["config", "branch.feature.merge", "refs/heads/feature"],
+        );
+
+        // `upstream` pushes to the upstream name; it refuses a push remote
+        // that is not the branch's upstream remote, exactly as git does.
+        git(&dir, &["config", "push.default", "upstream"]);
+        let plan = push_plan(&repo, &[]).unwrap();
+        assert_eq!(
+            plan.stdin,
+            format!("refs/heads/feature {head} refs/heads/feature {zeros}\n")
+        );
+        git(
+            &dir,
+            &["remote", "add", "fork", "git@github.com:Owner/Fork.git"],
+        );
+        git(&dir, &["config", "branch.feature.pushRemote", "fork"]);
         assert!(
-            !outcome
-                .err()
-                .map(|err| err.to_string())
-                .unwrap_or_default()
-                .contains("partially"),
-            "the partial-audit refusal must not reach a certified policy"
+            push_plan(&repo, &[])
+                .unwrap_err()
+                .to_string()
+                .contains("not the upstream"),
+            "an upstream push to another remote must refuse"
         );
-    }
+        git(&dir, &["config", "--unset", "branch.feature.pushRemote"]);
 
-    /// The deterministic baseline is part of the audit a boundary policy must
-    /// produce: a proposal whose semantic reviewers all pass while the sweep
-    /// is absent would certify away the script-layer gate.
-    #[test]
-    fn a_boundary_proposal_keeps_the_baseline_sweep() {
-        let runner = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("gitvault-review");
-        let contract = std::fs::read_dir(profiles_root())
-            .ok()
-            .into_iter()
-            .flatten()
-            .flatten()
-            .flat_map(|dir| {
-                std::fs::read_dir(dir.path().join("plugins"))
-                    .ok()
-                    .into_iter()
-                    .flatten()
-                    .flatten()
-                    .collect::<Vec<_>>()
-            })
-            .map(|entry| entry.path().join("contract.json"))
-            .find(|path| path.is_file());
-        let (Some(contract), true) = (contract, runner.exists()) else {
-            return;
+        // `simple` treats another push remote as `current`: no upstream is
+        // required and the branch keeps its own name.
+        git(&dir, &["config", "push.default", "simple"]);
+        git(&dir, &["config", "--unset", "branch.feature.merge"]);
+        git(&dir, &["config", "--unset", "branch.feature.remote"]);
+        git(&dir, &["config", "branch.feature.pushRemote", "fork"]);
+        git(&dir, &["update-ref", "refs/remotes/fork/feature", &head]);
+        let plan = push_plan(&repo, &[]).unwrap();
+        assert_eq!(plan.remote.as_deref(), Some("fork"));
+        assert_eq!(
+            plan.stdin,
+            format!("refs/heads/feature {head} refs/heads/feature {head}\n")
+        );
+
+        // `remote.pushDefault` is the next step of git's precedence; the
+        // mirror lookup and the reconstructed push use the same name.
+        git(&dir, &["config", "--unset", "branch.feature.pushRemote"]);
+        git(&dir, &["config", "remote.pushDefault", "fork"]);
+        let plan = push_plan(&repo, &[]).unwrap();
+        assert_eq!(plan.remote.as_deref(), Some("fork"));
+        assert_eq!(plan.refs[0].remote_sha, head);
+        // An explicit remote still wins over every configured default.
+        let plan = push_plan(&repo, &["origin".into(), "feature".into()]).unwrap();
+        assert_eq!(plan.remote.as_deref(), Some("origin"));
+        git(&dir, &["config", "--unset", "remote.pushDefault"]);
+
+        // `matching` is defined by the remote's advertised heads, not by the
+        // local mirror. Seed a real remote with main+feature and prove a head
+        // the remote does not advertise is neither audited nor sent.
+        let advertised = dir.join("advertised.git");
+        git(
+            &dir,
+            &["init", "--bare", "-q", advertised.to_str().unwrap()],
+        );
+        // Push the objects the bare remote will advertise; the test's local
+        // commits do not otherwise exist in its object store.
+        git(
+            &dir,
+            &["remote", "add", "advertised", advertised.to_str().unwrap()],
+        );
+        git(
+            &dir,
+            &["push", "-q", "advertised", "feature:refs/heads/feature"],
+        );
+        // The remote's main is the earlier commit, deliberately different
+        // from the local mirror the old selection would have consulted.
+        git(&advertised, &["update-ref", "refs/heads/main", &first]);
+        git(&dir, &["branch", "local-only"]);
+        // A stale mirror must not select a head the remote does not have.
+        git(
+            &dir,
+            &["update-ref", "refs/remotes/advertised/local-only", &head],
+        );
+        git(&dir, &["config", "branch.feature.pushRemote", "advertised"]);
+        git(&dir, &["config", "push.default", "matching"]);
+        let plan = push_plan(&repo, &[]).unwrap();
+        let matching: Vec<&str> = plan.refs.iter().map(|r| r.remote_ref.as_str()).collect();
+        assert_eq!(
+            matching,
+            vec!["refs/heads/feature", "refs/heads/main"],
+            "{matching:?}"
+        );
+        let by_ref = |name: &str| {
+            plan.refs
+                .iter()
+                .find(|r| r.remote_ref == name)
+                .map(|r| r.remote_sha.clone())
         };
-        let cfg = Config::default();
-        let mut policy = Policy::default();
-        policy.checkers.push(crate::config::Checker {
-            name: "reviewer".into(),
-            on: vec!["pre-push".into()],
-            kind: crate::config::Kind::Exec,
-            severity: crate::config::Severity::Blocking,
-            timeout_secs: 0,
-            phase: 0,
-            command: vec![
-                runner.display().to_string(),
-                "run".into(),
-                "--contract".into(),
-                contract.display().to_string(),
-                "--repo".into(),
-                "{repo}".into(),
-            ],
-            env: Default::default(),
-            repos: vec![],
-        });
-        let err = audit_gate(
-            &cfg,
-            &SigState::Inactive,
-            &policy,
-            &SigState::Invalid("checkers.toml is unsigned".into()),
-            &ctx("pre-push"),
-            "check",
-            None,
-            true,
-        )
-        .expect_err("a proposal with no baseline row must refuse");
-        assert!(err.to_string().contains("baseline"), "{err}");
-    }
-
-    #[test]
-    fn a_proposed_contract_must_live_under_the_profiles_root() {
-        let err = proposed_contract_path_at("/etc/passwd").unwrap_err();
-        assert!(err.contains("profiles root"), "{err}");
-        assert!(proposed_contract_path_at("/nonexistent/contract.json").is_err());
-    }
-
-    /// Rows scoped to another repository satisfy `checkers_for` but never
-    /// execute under `run_all`'s `applies_to` filter. A boundary whose whole
-    /// event set is scoped elsewhere must refuse - the review surface is
-    /// the rows that would actually run, not the rows that exist.
-    #[test]
-    fn a_boundary_refuses_a_policy_scoped_away_from_this_repository() {
-        let cfg = Config::default();
-        let mut policy = Policy::default();
-        policy.checkers.push(crate::config::Checker {
-            name: "elsewhere".into(),
-            on: vec!["pre-push".into()],
-            kind: crate::config::Kind::Exec,
-            severity: crate::config::Severity::Blocking,
-            timeout_secs: 0,
-            phase: 0,
-            command: vec!["/bin/true".into()],
-            env: Default::default(),
-            repos: vec!["someone/other-repo".into()],
-        });
-        let err = audit_gate(
-            &cfg,
-            &SigState::Inactive,
-            &policy,
-            &SigState::Valid,
-            &ctx("pre-push"),
-            "check",
-            None,
-            true,
-        )
-        .expect_err("a boundary with zero applicable checkers must refuse");
-        assert!(
-            err.to_string().contains("apply to this repository"),
-            "{err}"
+        assert_eq!(
+            by_ref("refs/heads/main"),
+            Some(first.clone()),
+            "the advertised object id, not the mirror, is the review base"
         );
+        assert_eq!(by_ref("refs/heads/feature"), Some(head.clone()));
+        // A matching push whose remote cannot be read refuses: git would
+        // select from refs this wrapper never saw.
+        git(
+            &dir,
+            &[
+                "remote",
+                "add",
+                "offline",
+                "/nonexistent/gitvault-matching-remote",
+            ],
+        );
+        git(&dir, &["config", "branch.feature.pushRemote", "offline"]);
+        let error = push_plan(&repo, &[]).unwrap_err();
+        assert!(
+            error.to_string().contains("advertised heads"),
+            "an unreadable matching remote must refuse: {error}"
+        );
+        git(&dir, &["config", "--unset", "branch.feature.pushRemote"]);
+        git(&dir, &["config", "--unset", "push.default"]);
+
+        // An unknown mode is a refusal, not a guess at what git meant.
+        git(&dir, &["config", "push.default", "sideways"]);
+        assert!(push_plan(&repo, &[]).is_err());
+        git(&dir, &["config", "--unset", "push.default"]);
+
+        // An explicit refspec audits that ref alone, against its mirror.
+        git(&dir, &["update-ref", "refs/remotes/origin/feature", &head]);
+        let plan = push_plan(&repo, &["origin".into(), "main".into()]).unwrap();
+        assert_eq!(
+            plan.stdin,
+            format!("refs/heads/main {head} refs/heads/main {first}\n")
+        );
+        assert_eq!(plan.refs[0].git_refspec(), "refs/heads/main");
+
+        // `git push origin HEAD` publishes the current branch, not a branch
+        // literally named HEAD. The hook line keeps the source spelling.
+        let plan = push_plan(&repo, &["origin".into(), "HEAD".into()]).unwrap();
+        assert_eq!(
+            plan.stdin,
+            format!("HEAD {head} refs/heads/feature {head}\n")
+        );
+        assert_eq!(plan.refs[0].git_refspec(), "HEAD:refs/heads/feature");
+        let plan = push_plan(&repo, &["origin".into(), "HEAD:release".into()]).unwrap();
+        assert_eq!(
+            plan.stdin,
+            format!("HEAD {head} refs/heads/release {zeros}\n")
+        );
+
+        // src:dst names the destination; a delete carries the zero head.
+        let plan = push_plan(&repo, &["origin".into(), "main:release".into()]).unwrap();
+        assert_eq!(
+            plan.stdin,
+            format!("refs/heads/main {head} refs/heads/release {zeros}\n")
+        );
+        assert_eq!(
+            plan.refs[0].git_refspec(),
+            "refs/heads/main:refs/heads/release"
+        );
+        // A deletion resolves against the tag and branch namespaces, and both
+        // the audit line and the refspec name the same remote ref.
+        git(&dir, &["branch", "old", &first]);
+        let plan = push_plan(&repo, &["origin".into(), "--delete".into(), "v1".into()]).unwrap();
+        assert_eq!(
+            plan.stdin,
+            format!("(delete) {zeros} refs/tags/v1 {zeros}\n")
+        );
+        assert_eq!(plan.refs[0].git_refspec(), ":refs/tags/v1");
+        let plan = push_plan(&repo, &["origin".into(), "--delete".into(), "old".into()]).unwrap();
+        assert_eq!(plan.refs[0].remote_ref, "refs/heads/old");
+        assert_eq!(plan.refs[0].git_refspec(), ":refs/heads/old");
+        let plan = push_plan(&repo, &["origin".into(), ":v1".into()]).unwrap();
+        assert_eq!(plan.refs[0].git_refspec(), ":refs/tags/v1");
+        // A name in both namespaces is ambiguous: refusing is the only way
+        // the audit and git cannot disagree about what is deleted.
+        git(&dir, &["tag", "dup", &first]);
+        git(&dir, &["branch", "dup", &first]);
+        let error =
+            push_plan(&repo, &["origin".into(), "--delete".into(), "dup".into()]).unwrap_err();
+        assert!(error.to_string().contains("ambiguous"), "{error}");
+        git(&dir, &["tag", "-d", "dup"]);
+        git(&dir, &["branch", "-D", "dup"]);
+        // A name in neither namespace needs the full ref.
+        let error =
+            push_plan(&repo, &["origin".into(), "--delete".into(), "ghost".into()]).unwrap_err();
+        assert!(
+            error.to_string().contains("no local branch or tag"),
+            "{error}"
+        );
+        // A fully qualified deletion is carried through unchanged.
+        let plan = push_plan(
+            &repo,
+            &["origin".into(), "--delete".into(), "refs/heads/old".into()],
+        )
+        .unwrap();
+        assert_eq!(plan.refs[0].git_refspec(), ":refs/heads/old");
+
+        // A forced source keeps its plus so git is told the same thing the
+        // audit was told.
+        let plan = push_plan(&repo, &["origin".into(), "+main:release".into()]).unwrap();
+        assert_eq!(
+            plan.refs[0].git_refspec(),
+            "+refs/heads/main:refs/heads/release"
+        );
+
+        // --tags enumerates tags; a missing source refuses like git would.
+        let plan = push_plan(&repo, &["origin".into(), "--tags".into()]).unwrap();
+        assert_eq!(
+            plan.stdin,
+            format!("refs/tags/v1 {head} refs/tags/v1 {zeros}\n")
+        );
+        assert_eq!(plan.refs[0].git_refspec(), "refs/tags/v1");
+        // With the tag gone, `--tags` selects nothing; it must not fall back
+        // to push.default and send the current branch.
+        git(&dir, &["tag", "-d", "v1"]);
+        let plan = push_plan(&repo, &["origin".into(), "--tags".into()]).unwrap();
+        assert!(
+            plan.refs.is_empty(),
+            "--tags with no tags selected {}",
+            plan.refs.len()
+        );
+        assert!(push_plan(&repo, &["origin".into(), "nosuch".into()]).is_err());
+
+        // The wrapper refuses what its pre-audit cannot enumerate. In
+        // particular --no-verify would skip the hook that re-checks the refs
+        // git actually advertises, so the pre-audit could not be the last
+        // word either.
+        for option in [
+            "--no-verify",
+            "--no-v",
+            "--stdin",
+            "--follow-tags",
+            "--prune",
+            "--prun",
+            "--mirror",
+            "--branches=release*",
+            "--recurse-submodules=on-demand",
+            "--unknown-option",
+        ] {
+            let error = push_plan(&repo, &["origin".into(), option.into()]).unwrap_err();
+            assert!(
+                error.to_string().contains("refuses this option")
+                    || error.to_string().contains("refuses --delete"),
+                "{option}: {error}"
+            );
+        }
+        assert!(
+            push_plan(
+                &repo,
+                &["origin".into(), "--delete".into(), "--tags".into()]
+            )
+            .is_err()
+        );
+
+        // `remote.<name>.mirror=true` makes git push the whole ref namespace;
+        // `--no-mirror` does not override it, so the row must refuse before
+        // the audit is spent on a set the plan cannot enumerate.
+        git(&dir, &["config", "remote.origin.mirror", "true"]);
+        let error = push_plan(&repo, &["origin".into(), "main".into()]).unwrap_err();
+        assert!(
+            error.to_string().contains("mirror=true"),
+            "a mirror-configured remote must refuse: {error}"
+        );
+        git(&dir, &["config", "--unset", "remote.origin.mirror"]);
+        assert!(push_plan(&repo, &["origin".into(), "main".into()]).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `remote.<name>.push` outranks `push.default` for a bare push. Its
+    /// configured refspecs can rename, force or delete refs, so following
+    /// push.default would audit a different set than git would publish. The
+    /// bare push refuses; an explicit refspec or selector overrides the
+    /// configured list exactly as it does in git.
+    #[test]
+    fn a_configured_remote_push_refspec_refuses_a_bare_push() {
+        let dir = std::env::temp_dir().join(format!(
+            "gv-configured-push-{}-{:04x}",
+            std::process::id(),
+            rand::random::<u16>()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-b", "main"]);
+        std::fs::write(dir.join("a"), "a").unwrap();
+        git(&dir, &["add", "a"]);
+        git(&dir, &["commit", "-m", "a"]);
+        git(
+            &dir,
+            &["remote", "add", "origin", "git@github.com:Owner/Repo.git"],
+        );
+        git(&dir, &["config", "branch.main.remote", "origin"]);
+        git(&dir, &["config", "branch.main.merge", "refs/heads/main"]);
+        let repo = crate::git::Repo::for_test(
+            &dir.to_string_lossy(),
+            Some("git@github.com:Owner/Repo.git"),
+        );
+        assert!(push_plan(&repo, &[]).is_ok());
+
+        git(
+            &dir,
+            &[
+                "config",
+                "remote.origin.push",
+                "refs/heads/main:refs/heads/release",
+            ],
+        );
+        let error = push_plan(&repo, &[]).unwrap_err();
+        assert!(
+            error.to_string().contains("remote.origin.push"),
+            "a configured refspec must refuse a bare push: {error}"
+        );
+        // An explicit refspec bypasses the configured list and is audited as
+        // written.
+        let plan = push_plan(&repo, &["origin".into(), "main".into()]).unwrap();
+        assert_eq!(plan.refs[0].remote_ref, "refs/heads/main");
+        // A selector is the other override git honors.
+        assert!(push_plan(&repo, &["origin".into(), "--tags".into()]).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

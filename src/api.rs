@@ -26,23 +26,123 @@ use crate::vault::Vault;
 
 pub const API_ROOT: &str = "https://api.github.com";
 
+/// The path part of a request with the API origin removed and the query and
+/// fragment dropped. Absolute URLs are accepted only on the API origin: the
+/// account token rides in the Authorization header of whatever the request
+/// resolves to, so a caller-chosen host is refused before a credential is read.
+fn relative_api_path(path: &str) -> Result<&str> {
+    let rest = if let Some(rest) = path.strip_prefix(API_ROOT) {
+        if !(rest.is_empty() || rest.starts_with('/')) {
+            // api.github.com.evil.example and similar prefix look-alikes.
+            bail!("refusing an absolute URL outside the API origin: {path}");
+        }
+        rest
+    } else {
+        if path.contains("://") {
+            bail!("refusing an absolute URL outside the API origin: {path}");
+        }
+        path
+    };
+    Ok(rest
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_start_matches('/'))
+}
+
+/// Decode percent escapes in a path. A malformed escape is not a path this
+/// broker will send: the caller gets a refusal rather than a guess.
+fn percent_decode_path(path: &str) -> Option<String> {
+    fn hex(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hi = hex(*bytes.get(i + 1)?)?;
+            let lo = hex(*bytes.get(i + 2)?)?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Decode the path portion of an API request after removing the origin, query
+/// and fragment. `None` means the parser cannot produce the path the transport
+/// will send, so a caller that authorizes writes refuses rather than matching
+/// the raw spelling.
+pub fn decoded_api_path(path: &str) -> Option<String> {
+    let relative = relative_api_path(path).ok()?;
+    percent_decode_path(relative)
+}
+
+/// Whether the raw path spells a separator with a percent escape. A decoded
+/// `%2f` or `%5c` changes which segment a later check sees; the publication
+/// surface refuses the whole request rather than guessing how the server will
+/// split it.
+pub fn has_encoded_separator(path: &str) -> bool {
+    let Ok(relative) = relative_api_path(path) else {
+        return true;
+    };
+    let lower = relative.to_ascii_lowercase();
+    lower.contains("%2f") || lower.contains("%5c")
+}
+
+/// Whether a request path is unsafe to resolve onto the API origin: a `.` or
+/// `..` segment (including a percent-encoded spelling such as `%2e%2e`), an
+/// encoded path separator, a backslash, a control character, or a percent
+/// escape that survives one decode. `curl` and the API server normalize these
+/// after the caller has chosen the path, so matching the raw text would let a
+/// write reach a different route while the publication check saw a harmless
+/// segment. A path this parser cannot decode is refused for the same reason.
+pub fn path_has_traversal(path: &str) -> bool {
+    // A single-encoded separator already changes the segment boundaries; a
+    // doubled one leaves a `%2f` that a second decode would turn into one.
+    if has_encoded_separator(path) {
+        return true;
+    }
+    let Some(decoded) = decoded_api_path(path) else {
+        return true;
+    };
+    // A decoded backslash is a path separator on some servers and a control
+    // character has no business in a URL path; both are refused rather than
+    // matched against a different spelling than the transport will use. A
+    // remaining percent sign means the server's second decode could still
+    // change the path, so the whole relative path is refused, not just the
+    // surface tail.
+    decoded.contains('%')
+        || decoded.contains('\\')
+        || decoded.chars().any(char::is_control)
+        || decoded
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
+}
+
 /// Resolve a request path to the URL the token will be sent to.
 ///
 /// A relative path always lands under API_ROOT. An absolute URL is accepted
 /// only when its origin is API_ROOT exactly - `https://api.github.com/...` -
 /// because the account token rides in the Authorization header of whatever
-/// this returns. Any other absolute URL is refused before a credential is
-/// read: passing one through would hand the token to a host the caller picked.
+/// this returns. Any other absolute URL, and any path with an unsafe segment,
+/// is refused before a credential is read.
 pub fn request_url(path: &str) -> Result<String> {
-    if let Some(rest) = path.strip_prefix(API_ROOT) {
-        if rest.is_empty() || rest.starts_with('/') {
-            return Ok(path.to_string());
-        }
-        // api.github.com.evil.example and similar prefix look-alikes.
-        bail!("refusing an absolute URL outside the API origin: {path}");
+    let relative = relative_api_path(path)?;
+    if path_has_traversal(relative) {
+        bail!("refusing a path with an unsafe segment: {path}");
     }
-    if path.contains("://") {
-        bail!("refusing an absolute URL outside the API origin: {path}");
+    if path.strip_prefix(API_ROOT).is_some() {
+        return Ok(path.to_string());
     }
     Ok(format!("{API_ROOT}/{}", path.trim_start_matches('/')))
 }
@@ -74,7 +174,21 @@ pub struct Request {
 /// allowlist and the explicit-rule requirement say who *may*. A read of a public
 /// resource still goes through this, because the account used is part of the
 /// permanent record either way.
+///
+/// A token is a credential, so the routing table's certificate is re-checked
+/// here, immediately before issuance. Audit surfaces deliberately parse the
+/// table without its signature so the audit can run first; that must not let an
+/// unsigned or tampered table spend the vault on a metadata read before the
+/// gate refuses.
 fn authorize(cfg: &Config, target: &Target, vault: &Vault) -> Result<String> {
+    if let Some(path) = cfg.path.as_deref()
+        && let crate::configsig::SigState::Invalid(reason) = crate::configsig::signature_state(path)
+    {
+        bail!(
+            "refusing to spend a credential for an uncertified routing table\n  \
+             {reason}\n  bless it: gitvault config sign"
+        );
+    }
     let token = match target {
         Target::Repo(slug) => {
             let repo = Repo::for_slug(slug);
@@ -107,8 +221,10 @@ fn authorize(cfg: &Config, target: &Target, vault: &Vault) -> Result<String> {
             // there is no free path through it.
             //
             // The window is asked for here, at the moment credentials are used -
-            // never before. Checkers run first and cost the time they cost; a
-            // window opened before them would expire during the audit.
+            // never at command start. A publication's semantic audit runs before
+            // its publishing request; read-only boundary lookups (a merge's head
+            // and base) happen earlier at the gate boundary, and a window opened
+            // before a long audit would expire during it.
             unlock::ensure_open(
                 vault,
                 &format!("GitVault: confirm to authenticate {account} to the GitHub API"),
@@ -514,6 +630,60 @@ mod tests {
     }
 
     #[test]
+    fn request_url_refuses_dot_segment_traversal() {
+        for hostile in [
+            "repos/o/r/../r/statuses/deadbeef",
+            "repos/o/r/./statuses/deadbeef",
+            "repos/o/r/%2e%2e/r/statuses/deadbeef",
+            "repos/o/r/%2E%2E/r/git/refs",
+            "repos/o/r/.%2e/r/releases",
+            "repos/o/r/%2e%2e%2fr/statuses/deadbeef",
+            "https://api.github.com/repos/o/r/../r/statuses/deadbeef",
+            "repos/o/r/..%5Cr/statuses/deadbeef",
+            "repos/o/r/%2/statuses/deadbeef",
+        ] {
+            assert!(request_url(hostile).is_err(), "must refuse {hostile}");
+            assert!(path_has_traversal(hostile), "must detect {hostile}");
+        }
+        assert!(!path_has_traversal("repos/o/r/statuses/deadbeef"));
+        assert!(!path_has_traversal("repos/o/r/contents/docs%20one/file.md"));
+        assert_eq!(
+            request_url("repos/o/r/contents/docs%20one/file.md").unwrap(),
+            "https://api.github.com/repos/o/r/contents/docs%20one/file.md"
+        );
+    }
+
+    #[test]
+    fn decoded_paths_name_the_route_the_server_will_see() {
+        assert_eq!(
+            decoded_api_path("repos/o/r/%63ontents/src/lib.rs").as_deref(),
+            Some("repos/o/r/contents/src/lib.rs")
+        );
+        assert_eq!(
+            decoded_api_path("https://api.github.com/repos/o/r/%72eleases").as_deref(),
+            Some("repos/o/r/releases")
+        );
+        assert_eq!(decoded_api_path("repos/o/r/%2"), None);
+        assert!(has_encoded_separator("repos/o/r/contents%2Fsrc"));
+        assert!(has_encoded_separator("repos/o/r/contents%5Csrc"));
+        assert!(!has_encoded_separator(
+            "repos/o/r/contents/docs%20one/file.md"
+        ));
+        // A single-encoded separator changes the route, and a doubled one
+        // leaves `%2f` after one decode. Both are refused across the whole
+        // path, not only in the surface tail: an owner/repo segment must not
+        // be able to shift the /repos/{owner}/{repo} boundary.
+        assert!(path_has_traversal("repos/o/r/contents%2Fsrc"));
+        assert!(request_url("repos/o/r/contents%2Fsrc").is_err());
+        assert!(path_has_traversal("repos/o%252fr/r/statuses/deadbeef"));
+        assert!(path_has_traversal("repos/o/r%252fextra/statuses/deadbeef"));
+        assert!(request_url("repos/o%252fr/r/statuses/deadbeef").is_err());
+        assert!(request_url("repos/o/r%252fextra/statuses/deadbeef").is_err());
+        // An ordinary escaped value that decodes to no separator stays valid.
+        assert!(!path_has_traversal("repos/o/r/contents/docs%20one/file.md"));
+    }
+
+    #[test]
     fn jq_handles_the_shapes_agents_actually_write() {
         let body = r#"{"login":"x","n":{"deep":42},"items":[{"id":7},{"id":8}]}"#;
         assert_eq!(apply_jq(body, ".login").unwrap(), "x");
@@ -595,6 +765,7 @@ mod tests {
             },
             audit_policy: None,
             record_dir: None,
+            path: None,
         };
         let repo = Repo::for_test("/tmp/x", Some("git@github.com:Attacker/Repo.git"));
         let outcome = crate::identity::resolve(&cfg, &repo, false).unwrap();

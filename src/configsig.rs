@@ -36,6 +36,105 @@ use anyhow::{Context, Result, bail};
 pub const NAMESPACE: &str = "gitvault-config";
 pub const PRINCIPAL: &str = "gitvault-config";
 
+/// The user's real home, not the `HOME` environment variable. The anchor, the
+/// installed engine and the child environment are security-relevant, so
+/// `HOME=/tmp/attacker` must not move them. `libc` is already in the
+/// dependency graph through the TLS stack; this is the one direct use.
+#[cfg(unix)]
+pub fn real_home() -> Option<PathBuf> {
+    use std::ffi::{CStr, OsStr};
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut buffer = vec![0 as libc::c_char; 4096];
+    let mut passwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let status = unsafe {
+        libc::getpwuid_r(
+            libc::getuid(),
+            &mut passwd,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status != 0 || result.is_null() || passwd.pw_dir.is_null() {
+        return None;
+    }
+    let home = unsafe { CStr::from_ptr(passwd.pw_dir) };
+    let home = PathBuf::from(OsStr::from_bytes(home.to_bytes()));
+    (!home.as_os_str().is_empty()).then_some(home)
+}
+
+#[cfg(not(unix))]
+pub fn real_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// The account home, falling back to `HOME` only where the platform cannot
+/// answer. Every caller that needs an authoritative home uses this one
+/// function so the anchor, the engine and the installed files cannot drift.
+pub fn home_dir() -> PathBuf {
+    real_home()
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Like [`home_dir`], but refuses an unresolvable home instead of silently
+/// landing files in the current directory.
+pub fn account_home() -> Result<PathBuf> {
+    real_home()
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve the account home directory"))
+}
+
+/// Whether an executable may be trusted to answer a security question.
+///
+/// The property is root ownership or the *system* immutable flag (`schg`).
+/// The user immutable flag (`uchg`) is deliberately not enough: the same user
+/// who would replace the binary can clear that flag without a password. Both
+/// the audit engine and the biometric helper are separate executables that a
+/// same-user process could otherwise rewrite; `gitvault install` gives an
+/// existing one `schg`, and this check makes that lock a runtime requirement
+/// rather than an install-order convention.
+///
+/// The path itself is judged, never a target it links to: the lookup uses
+/// `symlink_metadata` and requires a regular, non-symlink file. Otherwise a
+/// same-user process could plant a link at the helper or engine path pointing
+/// at any root-owned executable that happens to succeed (`/usr/bin/true`),
+/// turning a root-ownership check into an answer it did not give.
+pub fn executable_is_trusted(path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::MetadataExt as _;
+        use std::os::unix::fs::MetadataExt as _;
+        trusted_executable_owner(meta.uid(), meta.st_flags())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        meta.uid() == 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// The trust decision with the metadata already read. Split out so the
+/// `schg`-but-not-root case is testable without invoking `sudo`.
+#[cfg(target_os = "macos")]
+fn trusted_executable_owner(uid: u32, flags: u32) -> bool {
+    const SF_IMMUTABLE: u32 = 0x0002_0000;
+    uid == 0 || flags & SF_IMMUTABLE != 0
+}
+
 /// The trusted public anchor. Only meaningful while root-owned: a file any
 /// same-user process can overwrite anchors nothing.
 ///
@@ -43,17 +142,16 @@ pub const PRINCIPAL: &str = "gitvault-config";
 /// with `XDG_CONFIG_HOME`, pointing that variable elsewhere would disarm
 /// enforcement - the trust root must not follow the file it protects.
 pub fn anchor_path() -> PathBuf {
-    // Test escape, debug builds only - the same convention as
-    // GITVAULT_UNSIGNED_OK below: an integration fixture cannot chown a file
-    // to root, so it points the anchor at a path it owns to arm enforcement.
+    // Test escape, debug builds only: an integration fixture cannot chown a
+    // file to root, so it points the anchor at a path it owns to arm
+    // enforcement.
     // A release binary never honours the variable.
     if cfg!(debug_assertions)
         && let Ok(explicit) = std::env::var("GITVAULT_ANCHOR")
     {
         return PathBuf::from(explicit);
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    Path::new(&home)
+    home_dir()
         .join(".config")
         .join("gitvault")
         .join("config.pub")
@@ -86,8 +184,13 @@ pub fn anchor_state(anchor: &Path) -> Anchor {
     }
     // The GITVAULT_ANCHOR escape also arms enforcement: the fixture's file
     // cannot be made root-owned. Arming is all the override can do - it can
-    // never weaken a check the real anchor would have run.
-    if cfg!(debug_assertions) && std::env::var_os("GITVAULT_ANCHOR").is_some() {
+    // never weaken a check the real anchor would have run. It arms only the
+    // exact path it names, so a caller that resolves a different path (for
+    // example from a redirected HOME) cannot borrow the fixture's authority.
+    if cfg!(debug_assertions)
+        && std::env::var_os("GITVAULT_ANCHOR")
+            .is_some_and(|explicit| Path::new(&explicit) == anchor)
+    {
         return Anchor::Anchored;
     }
     #[cfg(unix)]
@@ -127,12 +230,6 @@ pub enum SigState {
 /// Classify `path` without refusing it - the audit-first counterpart of
 /// [`verify`].
 pub fn signature_state(config_path: &Path) -> SigState {
-    // Test escape, debug builds only - the same convention as
-    // GITVAULT_UNLOCK_STATE and GITVAULT_TOUCHID. Integration fixtures pass an
-    // unsigned `--config`; a release binary never honours this variable.
-    if cfg!(debug_assertions) && std::env::var_os("GITVAULT_UNSIGNED_OK").is_some() {
-        return SigState::Inactive;
-    }
     let anchor = anchor_path();
     match anchor_state(&anchor) {
         Anchor::Absent | Anchor::Unanchored => SigState::Inactive,
@@ -326,6 +423,42 @@ mod tests {
     }
 
     #[test]
+    fn the_anchor_follows_the_account_home_not_home_env() {
+        let Some(account) = real_home() else {
+            return;
+        };
+        let redirected = dir("redirected-home");
+        let old_home = std::env::var_os("HOME");
+        let old_anchor = std::env::var_os("GITVAULT_ANCHOR");
+        // SAFETY: this unit test is the only one that mutates HOME here; the
+        // assertions use the account database, not the environment.
+        unsafe {
+            std::env::set_var("HOME", &redirected);
+            std::env::remove_var("GITVAULT_ANCHOR");
+        }
+        let expected = account.join(".config").join("gitvault").join("config.pub");
+        assert_eq!(anchor_path(), expected);
+        assert_ne!(
+            anchor_path(),
+            redirected
+                .join(".config")
+                .join("gitvault")
+                .join("config.pub"),
+            "HOME must not move the trust root"
+        );
+        unsafe {
+            match old_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            if let Some(value) = old_anchor {
+                std::env::set_var("GITVAULT_ANCHOR", value);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&redirected);
+    }
+
+    #[test]
     fn sign_verify_roundtrip_and_tamper_refusal() {
         if !have_ssh_keygen() {
             return;
@@ -349,5 +482,94 @@ mod tests {
         let _ = std::fs::remove_file(&sig);
         assert!(verify_signed(&cfg, &anchor).is_err());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_user_owned_mutable_file_is_not_a_trusted_executable() {
+        let d = dir("untrusted-exec");
+        let binary = d.join("helper");
+        std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+        assert!(
+            !executable_is_trusted(&binary),
+            "a same-user process could replace this file"
+        );
+        assert!(!executable_is_trusted(&d.join("missing")));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The path is judged, not a target it points at. A same-user process that
+    /// can create `~/.local/bin/gitvault-touchid` as a link to `/usr/bin/true`
+    /// would otherwise turn "root-owned" into an executable that answers yes
+    /// to every prompt without involving a human.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_root_owned_executable_is_not_trusted() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+
+        let target = std::fs::read_dir("/usr/bin")
+            .expect("this platform needs /usr/bin for the root-owned fixture")
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| {
+                std::fs::symlink_metadata(path)
+                    .map(|meta| {
+                        meta.is_file() && meta.uid() == 0 && meta.permissions().mode() & 0o111 != 0
+                    })
+                    .unwrap_or(false)
+            })
+            .expect("this platform needs a root-owned regular executable to test against");
+        assert!(
+            executable_is_trusted(&target),
+            "the regular root-owned target must itself be trusted: {}",
+            target.display()
+        );
+
+        let d = dir("symlink-exec");
+        let link = d.join("helper");
+        symlink(&target, &link).unwrap();
+        assert!(
+            !executable_is_trusted(&link),
+            "a planted link to a trusted target must not inherit its trust"
+        );
+
+        let dangling = d.join("dangling");
+        symlink(d.join("does-not-exist"), &dangling).unwrap();
+        assert!(
+            !executable_is_trusted(&dangling),
+            "a dangling link is not an executable"
+        );
+
+        // The installed helper is a regular `schg` file on this machine. A link
+        // to it must not inherit the flag either; the check is skipped where no
+        // such installation exists so the test stays portable.
+        let installed = home_dir()
+            .join(".local")
+            .join("bin")
+            .join("gitvault-touchid");
+        if executable_is_trusted(&installed) {
+            let mirrored = d.join("installed-helper");
+            symlink(&installed, &mirrored).unwrap();
+            assert!(
+                !executable_is_trusted(&mirrored),
+                "a link to a system-immutable helper must not be trusted"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Root ownership and *system* immutability are the only two properties
+    /// that survive the same-user attacker. A user immutable flag (`uchg`) can
+    /// be cleared by that user without a password, so it must not count.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_root_or_system_immutability_trusts_an_executable() {
+        const UF_IMMUTABLE: u32 = 0x0000_0002;
+        const SF_IMMUTABLE: u32 = 0x0002_0000;
+        assert!(!trusted_executable_owner(501, 0));
+        assert!(!trusted_executable_owner(501, UF_IMMUTABLE));
+        assert!(trusted_executable_owner(501, SF_IMMUTABLE));
+        assert!(trusted_executable_owner(501, SF_IMMUTABLE | UF_IMMUTABLE));
+        assert!(trusted_executable_owner(0, 0));
     }
 }

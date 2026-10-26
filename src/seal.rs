@@ -1,7 +1,6 @@
-//! The sha256 chain shared by run records (the main crate's records.rs) and
-//! review receipts (the review crate's engine.rs). Both sides must compute
-//! the same seal over the same canonical content or one side's verification
-//! means nothing to the other's writes - so there is one implementation.
+//! The sha256 chain run records use to seal each entry against its
+//! predecessor. The canonical content is the document itself minus the seal
+//! fields, so a rewrite, deletion or reordering is visible on inspection.
 
 use serde_json::Value;
 use std::path::Path;

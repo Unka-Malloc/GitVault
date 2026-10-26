@@ -1,12 +1,13 @@
-//! Configuration: identities, ownership rules, and the checker registry.
+//! Configuration: identities, ownership rules, and the signed engine policy.
 //!
-//! The registry is a *list*, deliberately. An audit is one entry; a formatter, a
-//! commit-message policy, a secret scanner or a build check are others. New
-//! capability is added by registering an entry, never by editing the engine.
+//! `config.toml` is the routing table. `checkers.toml` is a signed policy that
+//! authorizes the external audit engine; only rows naming probator are
+//! admitted at the gate, and GitVault never executes them. The
+//! event-to-checker selection belongs to Probator's own policy.
 //!
 //! Note what is NOT here: nothing in this file is read from the repository being
-//! inspected. Ownership rules and the checker list live outside any work tree so
-//! that a repository cannot redefine the terms under which it is judged.
+//! inspected. Ownership rules and the policy live outside any work tree so that
+//! a repository cannot redefine the terms under which it is judged.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -14,7 +15,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-/// Which git hook an entry answers to.
+/// Which gate event an entry answers to. Hook events, GitVault's `pr` and
+/// `release` operations, and the on-demand `working-tree` check share this
+/// vocabulary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Event {
     #[serde(rename = "pre-commit")]
@@ -36,6 +39,12 @@ pub enum Event {
     /// and the registry runs before GitHub is asked to do it.
     #[serde(rename = "release")]
     Release,
+    /// Not a git hook: an on-demand review of the uncommitted working tree.
+    /// `gitvault check --event working-tree` runs it through the same engine
+    /// boundary for a pre-publication look. It publishes nothing and spends no
+    /// credential, so it is not itself a publication boundary.
+    #[serde(rename = "working-tree")]
+    WorkingTree,
 }
 
 impl Event {
@@ -48,22 +57,10 @@ impl Event {
             "pre-applypatch" => Ok(Self::PreApplyPatch),
             "pr" => Ok(Self::Pr),
             "release" => Ok(Self::Release),
+            "working-tree" => Ok(Self::WorkingTree),
             other => bail!(
-                "unknown hook event '{other}' (expected pre-commit, prepare-commit-msg, pre-applypatch, pre-push, commit-msg, pr or release)"
+                "unknown event '{other}' (expected pre-commit, prepare-commit-msg, pre-applypatch, pre-push, commit-msg, pr, release or working-tree)"
             ),
-        }
-    }
-
-    /// The hook name this event is registered and invoked under.
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::PreCommit => "pre-commit",
-            Self::PrePush => "pre-push",
-            Self::CommitMsg => "commit-msg",
-            Self::PrepareCommitMsg => "prepare-commit-msg",
-            Self::PreApplyPatch => "pre-applypatch",
-            Self::Pr => "pr",
-            Self::Release => "release",
         }
     }
 }
@@ -131,7 +128,12 @@ impl std::fmt::Display for Severity {
     }
 }
 
-/// One entry in the registry.
+/// One row of the signed engine policy.
+///
+/// Rows are declarations, not commands: GitVault does not execute them -
+/// Probator owns the checker set, contracts and commands. The gate admits
+/// only rows naming probator; a stale review-engine row refuses the boundary.
+/// The fields are kept so the file can be displayed and migrated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Checker {
@@ -173,7 +175,9 @@ pub struct Checker {
 impl Checker {
     /// Whether the row is scoped to this repository: an empty `repos` applies
     /// everywhere, otherwise any entry equal to the origin slug or a path
-    /// prefix of the repository root selects it.
+    /// prefix of the repository root selects it. Used by the policy parser's
+    /// tests; selection itself belongs to Probator now.
+    #[cfg(test)]
     pub fn applies_to(&self, slug: Option<&str>, root: &Path) -> bool {
         self.repos.is_empty()
             || self
@@ -183,6 +187,8 @@ impl Checker {
     }
 }
 
+/// Legacy row kind, retained so the file can be displayed and migrated.
+/// GitVault never spawns a row; Probator owns checker execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
@@ -234,6 +240,12 @@ pub struct Config {
     /// `$XDG_STATE_HOME/gitvault/runs` (or `~/.local/state/...`).
     #[serde(default)]
     pub record_dir: Option<PathBuf>,
+    /// The file this routing table was parsed from. Kept out of the
+    /// serialized shape: it is process state used by the credential broker to
+    /// re-check the signature immediately before a token is read. A `Config`
+    /// built directly in a test has no path and skips that check.
+    #[serde(skip)]
+    pub(crate) path: Option<PathBuf>,
 }
 
 /// The single authority for GitVault's configuration directory:
@@ -249,6 +261,137 @@ pub fn config_dir() -> PathBuf {
             Path::new(&home).join(".config")
         })
         .join("gitvault")
+}
+
+/// The two machine-local lists the removed in-tree review engine read from
+/// GitVault's own config root. The configured engine reads the same lists from
+/// its config root; a second copy under GitVault is a stale policy source
+/// nobody reads.
+pub const LEGACY_POLICY_FILES: [&str; 2] = ["withheld-names.txt", "repo-deps.txt"];
+
+/// What the one-time hand-off did with a legacy file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LegacyPolicyMove {
+    /// The engine had no copy, so the file was moved into its config root.
+    Moved,
+    /// The engine's copy was byte-identical, so the redundant file was deleted.
+    DuplicateRemoved,
+}
+
+/// One-time hand-off of machine-local policy data to the engine's config
+/// root. `fixed_config_root` names the root the engine will use after this
+/// install: true for the account home's fixed configuration directory (an
+/// armed installation), false for the caller's XDG root (an unarmed
+/// development tree). The caller passes the post-install state because install
+/// migrates the lists before it hands the anchor to root.
+///
+/// Two sources can hold a list the engine is about to stop reading:
+/// GitVault's old config root, and - when this install arms - the engine's own
+/// unarmed root under `$XDG_CONFIG_HOME`. The second one matters because the
+/// engine itself may have written there while unarmed; moving only the GitVault
+/// copy would silently drop an operator's withheld names or dependency list at
+/// the moment the fixed root takes over.
+///
+/// A file the engine lacks is moved; a byte-identical duplicate is deleted; a
+/// conflicting pair refuses, because silently choosing one would discard a
+/// list the operator may still need. Every target is read back and compared
+/// with the source bytes before the source is removed. Idempotent: a second
+/// call finds nothing.
+pub fn migrate_legacy_policy_data(
+    fixed_config_root: bool,
+) -> Result<Vec<(PathBuf, LegacyPolicyMove)>> {
+    let probator_root = crate::probator::config_root_for(fixed_config_root);
+    let mut handled = migrate_policy_files(&config_dir(), &probator_root)?;
+    if fixed_config_root {
+        let unarmed_root = crate::probator::config_root_for(false);
+        if unarmed_root != probator_root {
+            handled.extend(migrate_policy_files(&unarmed_root, &probator_root)?);
+        }
+    }
+    Ok(handled)
+}
+
+fn migrate_policy_files(
+    source_root: &Path,
+    target_root: &Path,
+) -> Result<Vec<(PathBuf, LegacyPolicyMove)>> {
+    let mut handled = Vec::new();
+    for name in LEGACY_POLICY_FILES {
+        let source = source_root.join(name);
+        let target = target_root.join(name);
+        if let Some(action) = migrate_legacy_policy_file(&source, &target)? {
+            handled.push((source, action));
+        }
+    }
+    Ok(handled)
+}
+
+fn migrate_legacy_policy_file(legacy: &Path, target: &Path) -> Result<Option<LegacyPolicyMove>> {
+    let bytes = match std::fs::read(legacy) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot read {}", legacy.display()));
+        }
+    };
+    match std::fs::read(target) {
+        Ok(existing) => {
+            if existing != bytes {
+                bail!(
+                    "policy data {} differs from Probator's {}; \
+                     reconcile the two lists and remove the stale copy, then reinstall",
+                    legacy.display(),
+                    target.display()
+                );
+            }
+            verify_policy_target(target, &bytes)?;
+            std::fs::remove_file(legacy)
+                .with_context(|| format!("cannot remove {}", legacy.display()))?;
+            return Ok(Some(LegacyPolicyMove::DuplicateRemoved));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot read {}", target.display()));
+        }
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    match std::fs::rename(legacy, target) {
+        Ok(()) => {
+            verify_policy_target(target, &bytes)?;
+            Ok(Some(LegacyPolicyMove::Moved))
+        }
+        Err(_) => {
+            // A config root on another device cannot be renamed across. Copy
+            // the list, keep it private, then drop the GitVault copy.
+            std::fs::write(target, &bytes)
+                .with_context(|| format!("cannot write {}", target.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o600))
+                    .with_context(|| format!("cannot protect {}", target.display()))?;
+            }
+            verify_policy_target(target, &bytes)?;
+            std::fs::remove_file(legacy)
+                .with_context(|| format!("cannot remove {}", legacy.display()))?;
+            Ok(Some(LegacyPolicyMove::Moved))
+        }
+    }
+}
+
+fn verify_policy_target(target: &Path, expected: &[u8]) -> Result<()> {
+    let actual =
+        std::fs::read(target).with_context(|| format!("cannot read back {}", target.display()))?;
+    if actual != expected {
+        bail!(
+            "policy data at {} did not arrive intact; the source was not removed",
+            target.display()
+        );
+    }
+    Ok(())
 }
 
 impl Config {
@@ -278,7 +421,9 @@ impl Config {
             );
         }
         crate::configsig::verify(&path)?;
-        Self::load_path(&path)
+        let mut cfg = Self::load_path(&path)?;
+        cfg.path = Some(path);
+        Ok(cfg)
     }
 
     /// Parse and classify without consulting the signature anchor. Audit
@@ -300,7 +445,8 @@ impl Config {
             );
         }
         let signature = crate::configsig::signature_state(&path);
-        let cfg = Self::load_path(&path)?;
+        let mut cfg = Self::load_path(&path)?;
+        cfg.path = Some(path.clone());
         Ok((cfg, path, signature))
     }
 
@@ -334,16 +480,30 @@ impl Config {
     /// Move `[[checkers]]` sections out of `config_path` into the policy file.
     /// A same-named row in the policy wins over a stale row being migrated,
     /// so certifying newer policy can never resurrect an old command.
-    /// Returns true when the file changed.
-    pub fn migrate_checkers(config_path: &Path) -> Result<bool> {
+    /// Returns the policy path that changed, or `None` when there was nothing
+    /// to move.
+    pub fn migrate_checkers(config_path: &Path) -> Result<Option<PathBuf>> {
         let text = std::fs::read_to_string(config_path)
             .with_context(|| format!("cannot read {}", config_path.display()))?;
         if !text
             .lines()
             .any(|l| l.trim_start().starts_with("[[checkers]]"))
         {
-            return Ok(false);
+            return Ok(None);
         }
+        // The routing table cannot be parsed as `Config` while the stale rows
+        // are present, but its top-level declaration is still ordinary TOML.
+        // Respect it: signing or migrating into a different file would leave
+        // the declared policy unsigned and the gate reading the wrong file.
+        let declared_policy = match toml::from_str::<toml::Value>(&text) {
+            Ok(value) => match value.get("audit_policy") {
+                Some(toml::Value::String(path)) => Some(PathBuf::from(path)),
+                Some(_) => bail!("audit_policy must be a path string"),
+                None => None,
+            },
+            // The final parse below reports a malformed routing table.
+            Err(_) => None,
+        };
         // Split on table headers; a [[checkers]] segment runs until the next
         // header line, comments ahead of it staying with the previous section.
         let mut segments: Vec<String> = Vec::new();
@@ -366,7 +526,7 @@ impl Config {
                 kept.push_str(&segment);
             }
         }
-        let policy_path = Policy::path_for(config_path);
+        let policy_path = Policy::resolve_declared(config_path, declared_policy.as_deref());
         let existing = std::fs::read_to_string(&policy_path).unwrap_or_default();
         let mut policy = Policy::load_str(&existing)
             .with_context(|| format!("invalid audit policy in {}", policy_path.display()))?;
@@ -383,9 +543,9 @@ impl Config {
         }
         policy.validate()?;
         let mut policy_text = String::from(
-            "# Audit policy: the commands GitVault may execute as checks.\n\
-             # Signed independently of config.toml (checkers.toml.sig) so audits\n\
-             # run BEFORE the routing table is asked for a blessing.\n\n",
+            "# Signed engine authorization. The checker set belongs to Probator;\n\
+             # these rows are declarations and are never executed by GitVault.\n\
+             # Only rows naming probator are admitted at the gate.\n\n",
         );
         for row in &policy.checkers {
             policy_text.push_str(&toml::to_string(&Policy {
@@ -397,10 +557,11 @@ impl Config {
         // The moved rows only count as policy once the routing table declares
         // the file: without the signed declaration, deleting checkers.toml
         // would silently run no audit at all.
-        let declared = kept
-            .lines()
-            .take_while(|l| !l.trim_start().starts_with('['))
-            .any(|l| l.trim_start().starts_with("audit_policy"));
+        let declared = declared_policy.is_some()
+            || kept
+                .lines()
+                .take_while(|l| !l.trim_start().starts_with('['))
+                .any(|l| l.trim_start().starts_with("audit_policy"));
         if !declared {
             let declaration = "audit_policy = \"checkers.toml\"\n\n";
             let offset = kept
@@ -416,11 +577,15 @@ impl Config {
             kept.insert_str(offset, declaration);
         }
         toml::from_str::<toml::Value>(&kept).context("config without checkers is invalid TOML")?;
+        if let Some(parent) = policy_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create {}", parent.display()))?;
+        }
         std::fs::write(&policy_path, policy_text)
             .with_context(|| format!("cannot write {}", policy_path.display()))?;
         std::fs::write(config_path, kept)
             .with_context(|| format!("cannot write {}", config_path.display()))?;
-        Ok(true)
+        Ok(Some(policy_path))
     }
 
     fn validate(&self) -> Result<()> {
@@ -455,16 +620,14 @@ impl Config {
     }
 }
 
-/// The audit policy: the checker registry, kept in its own signed file
-/// (`checkers.toml` beside `config.toml`) so the audit can run BEFORE the
-/// operator is asked to bless the routing table.
+/// The signed engine policy, kept in its own file (`checkers.toml` beside
+/// `config.toml`).
 ///
-/// The split is what makes "audit first, sign after" sound. A signature on
-/// checkers.toml means "these are the commands audits may execute"; a
-/// signature on config.toml means "these identities may act". Audits never
-/// execute an uncertified command, and an uncertified routing table never
-/// reaches a credential - the two blessings are independent and each is asked
-/// only after the evidence it certifies has been produced.
+/// The signature is now the authorization that this machine may run the
+/// external audit engine. The rows no longer select or execute checkers -
+/// Probator's own policy does that - but an uncertified policy still refuses a
+/// publication boundary, and the two signatures remain independent so the
+/// routing table's blessing is judged separately from the engine's authority.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {
@@ -481,11 +644,11 @@ impl Policy {
             .join("checkers.toml")
     }
 
-    /// Where this routing table keeps its audit policy: the declared
-    /// `audit_policy` path, else the conventional `checkers.toml` sibling.
-    pub fn resolve(config_path: &Path, cfg: &Config) -> PathBuf {
-        match &cfg.audit_policy {
-            Some(p) if p.is_absolute() => p.clone(),
+    /// Resolve an explicitly declared `audit_policy` value against the
+    /// routing table's directory. `None` means the conventional sibling.
+    pub fn resolve_declared(config_path: &Path, declared: Option<&Path>) -> PathBuf {
+        match declared {
+            Some(p) if p.is_absolute() => p.to_path_buf(),
             Some(p) => config_path
                 .parent()
                 .unwrap_or_else(|| Path::new("."))
@@ -494,12 +657,17 @@ impl Policy {
         }
     }
 
+    /// Where this routing table keeps its audit policy: the declared
+    /// `audit_policy` path, else the conventional `checkers.toml` sibling.
+    pub fn resolve(config_path: &Path, cfg: &Config) -> PathBuf {
+        Self::resolve_declared(config_path, cfg.audit_policy.as_deref())
+    }
+
     /// Load the policy and its signature state WITHOUT gating on it. The
-    /// caller decides: a surface that is about to execute rows must refuse an
-    /// `Invalid` state (checker commands are arbitrary code), while an event
-    /// the policy says nothing about executes nothing and may proceed. The
-    /// declared rows are still readable for the refusal preview - showing a
-    /// command is not running it.
+    /// caller decides: a publication boundary refuses an `Invalid` state
+    /// before the engine runs, because the policy is the authorization for
+    /// that engine. The rows are still readable for display and migration;
+    /// GitVault does not execute them.
     pub fn load_state(
         config_path: &Path,
         cfg: &Config,
@@ -514,7 +682,13 @@ impl Policy {
                     path.display()
                 );
             }
-            return Ok((Self::default(), path, crate::configsig::SigState::Inactive));
+            // No declaration: the conventional sibling is simply absent.
+            // Its signature state still decides an armed boundary. Returning
+            // `Inactive` unconditionally would let the documented bootstrap
+            // (`config sign` with no `[[checkers]]` rows, then `install`)
+            // reach a publication boundary with no engine authorization.
+            let state = crate::configsig::signature_state(&path);
+            return Ok((Self::default(), path, state));
         }
         let policy = Self::load_path(&path)?;
         let state = crate::configsig::signature_state(&path);
@@ -549,7 +723,35 @@ impl Policy {
         Ok(())
     }
 
-    /// Checkers registered for an event, in declaration order.
+    /// The gate boundary's admission rule for the signed policy.
+    ///
+    /// GitVault executes no row, but a signed row that names another executor
+    /// is still a statement that some other program is the audit engine. The
+    /// only trusted executor is `probator`; a stale `gitvault-review` row -
+    /// or any other command - refuses the boundary rather than being ignored
+    /// as if it had never been signed.
+    pub fn admit_engine_rows(&self) -> Result<()> {
+        for checker in &self.checkers {
+            let declared = checker.command.first().map(String::as_str).unwrap_or("");
+            let name = Path::new(declared)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(declared);
+            if !name.eq_ignore_ascii_case("probator") && !name.eq_ignore_ascii_case("probator.exe")
+            {
+                bail!(
+                    "checker '{}' invokes '{declared}': the only trusted audit executor is \
+                     probator, so this signed row is refused",
+                    checker.name
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Checkers registered for an event, in declaration order. Used by the
+    /// parser's tests; the running gate does not select rows.
+    #[cfg(test)]
     pub fn checkers_for(&self, event: Event) -> Vec<&Checker> {
         self.checkers
             .iter()
@@ -560,7 +762,24 @@ impl Policy {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, Event, Policy, Severity};
+    use super::{
+        Config, Event, LegacyPolicyMove, Policy, Severity, migrate_legacy_policy_file,
+        migrate_policy_files,
+    };
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn scratch(tag: &str) -> PathBuf {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "gv-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     const BASE: &str = r#"
 [identities.acme]
@@ -623,6 +842,49 @@ command = ["/bin/true"]
         assert_eq!(policy.checkers_for(Event::Pr).len(), 0);
         assert_eq!(policy.checkers[0].severity, Severity::Blocking);
         assert_eq!(policy.checkers[1].severity, Severity::Advisory);
+    }
+
+    /// Rows are inert, but the signed file still names the audit executor.
+    /// Only probator may appear; a stale gitvault-review row is refused at
+    /// the gate boundary instead of being silently ignored.
+    #[test]
+    fn the_gate_admits_only_probator_policy_rows() {
+        let probator = r#"
+[[checkers]]
+name = "audit"
+on = ["pre-push"]
+command = ["/opt/probator", "baseline", "--repo", "{repo}"]
+"#;
+        parse_policy(probator)
+            .expect("a probator row parses")
+            .admit_engine_rows()
+            .expect("a probator row is admitted");
+
+        let legacy = r#"
+[[checkers]]
+name = "legacy"
+on = ["pre-push"]
+command = ["/opt/gitvault-review", "baseline", "--repo", "{repo}"]
+"#;
+        let err = parse_policy(legacy)
+            .expect("the stale row still parses")
+            .admit_engine_rows()
+            .expect_err("the removed review engine must not be admitted");
+        assert!(
+            err.to_string().contains("gitvault-review"),
+            "the refusal names the removed engine: {err}"
+        );
+
+        let foreign = r#"
+[[checkers]]
+name = "foreign"
+on = ["pre-push"]
+command = ["/bin/true"]
+"#;
+        assert!(
+            parse_policy(foreign).unwrap().admit_engine_rows().is_err(),
+            "a non-probator executor is not admitted"
+        );
     }
 
     #[test]
@@ -696,7 +958,11 @@ command = ["/bin/true"]
         let config = dir.join("config.toml");
         std::fs::write(&config, format!("{BASE}\n{POLICY}")).unwrap();
 
-        assert!(Config::migrate_checkers(&config).expect("migration runs"));
+        assert!(
+            Config::migrate_checkers(&config)
+                .expect("migration runs")
+                .is_some()
+        );
         let kept = std::fs::read_to_string(&config).unwrap();
         assert!(!kept.contains("[[checkers]]"), "rows left behind: {kept}");
         // The declaration binds the policy file's existence into the routing
@@ -712,7 +978,48 @@ command = ["/bin/true"]
         assert_eq!(policy.checkers.len(), 2);
         assert_eq!(policy.checkers[0].name, "audit");
         // Idempotent: nothing left to move.
-        assert!(!Config::migrate_checkers(&config).unwrap());
+        assert!(
+            Config::migrate_checkers(&config)
+                .expect("second migration")
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_honours_a_declared_non_default_policy_path() {
+        let dir = scratch("mig-custom");
+        let config = dir.join("config.toml");
+        std::fs::write(
+            &config,
+            format!("audit_policy = \"policy/audit.toml\"\n{BASE}\n{POLICY}"),
+        )
+        .unwrap();
+
+        let moved = Config::migrate_checkers(&config)
+            .expect("migration runs")
+            .expect("rows moved");
+        assert_eq!(moved, dir.join("policy").join("audit.toml"));
+        assert!(
+            !dir.join("checkers.toml").exists(),
+            "the conventional sibling must not be written when the table declares another path"
+        );
+        let kept = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(
+            kept.matches("audit_policy").count(),
+            1,
+            "the declaration must not be duplicated: {kept}"
+        );
+        let reloaded = Config::load_path(&config).expect("kept config parses");
+        assert_eq!(
+            Policy::resolve(&config, &reloaded),
+            dir.join("policy").join("audit.toml")
+        );
+        let policy =
+            Policy::load_str(&std::fs::read_to_string(dir.join("policy/audit.toml")).unwrap())
+                .expect("migrated policy parses");
+        assert_eq!(policy.checkers.len(), 2);
+        assert_eq!(policy.checkers[0].name, "audit");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -736,7 +1043,7 @@ command = ["/bin/true"]
         let bad = format!("{POLICY}\n[[checkers]]\nname = \"audit\"\ncommand = [\"/bin/true\"]\n");
         assert!(
             parse_policy(&bad).is_err(),
-            "duplicate names would make --only ambiguous"
+            "duplicate names would make the policy ambiguous"
         );
     }
 
@@ -791,12 +1098,117 @@ command = ["/bin/true"]
     }
 
     #[test]
+    fn accepts_the_on_demand_working_tree_event() {
+        // `check --event working-tree` reviews the uncommitted tree through
+        // the same engine boundary; it is a check event, not a git hook.
+        assert_eq!(Event::parse("working-tree").unwrap(), Event::WorkingTree);
+    }
+
+    #[test]
+    fn legacy_policy_data_moves_or_removes_duplicates_once() {
+        let dir = scratch("legacy-data");
+        let legacy_root = dir.join("gitvault");
+        let probator_root = dir.join("probator");
+        std::fs::create_dir_all(&legacy_root).unwrap();
+
+        // Probator has no copy: the list moves into its config root.
+        let names = legacy_root.join("withheld-names.txt");
+        let names_target = probator_root.join("withheld-names.txt");
+        std::fs::write(&names, "Acme\n").unwrap();
+        assert_eq!(
+            migrate_legacy_policy_file(&names, &names_target).unwrap(),
+            Some(LegacyPolicyMove::Moved)
+        );
+        assert!(!names.exists());
+        assert_eq!(std::fs::read_to_string(&names_target).unwrap(), "Acme\n");
+
+        // Probator's copy is identical: the redundant GitVault copy goes.
+        let deps = legacy_root.join("repo-deps.txt");
+        let deps_target = probator_root.join("repo-deps.txt");
+        std::fs::write(&deps, "Repo <- Upstream\n").unwrap();
+        std::fs::write(&deps_target, "Repo <- Upstream\n").unwrap();
+        assert_eq!(
+            migrate_legacy_policy_file(&deps, &deps_target).unwrap(),
+            Some(LegacyPolicyMove::DuplicateRemoved)
+        );
+        assert!(!deps.exists());
+        assert!(deps_target.exists());
+
+        // A conflicting pair refuses and deletes nothing: silently choosing
+        // one list would discard names the operator still needs withheld.
+        let conflict = legacy_root.join("withheld-names.txt");
+        std::fs::write(&conflict, "Other\n").unwrap();
+        let err = migrate_legacy_policy_file(&conflict, &names_target).unwrap_err();
+        assert!(err.to_string().contains("differs"), "{err}");
+        assert!(conflict.exists() && names_target.exists());
+
+        // Idempotent: nothing left to migrate is not an error.
+        assert_eq!(
+            migrate_legacy_policy_file(
+                &legacy_root.join("absent.txt"),
+                &probator_root.join("absent.txt")
+            )
+            .unwrap(),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An engine installed before GitVault was armed reads its lists from the
+    /// caller's XDG root. Arming moves the engine to the account home's fixed
+    /// root; both files must follow it, or the privacy and dependency checks
+    /// silently lose their local inputs at the moment the install arms.
+    #[test]
+    fn arming_moves_engine_side_policy_data_from_the_unarmed_root() {
+        let dir = scratch("engine-policy");
+        let unarmed = dir.join("xdg").join("probator");
+        let fixed = dir.join("home").join(".config").join("probator");
+        std::fs::create_dir_all(&unarmed).unwrap();
+        std::fs::write(unarmed.join("withheld-names.txt"), "Acme\n").unwrap();
+        std::fs::write(unarmed.join("repo-deps.txt"), "Repo <- Upstream\n").unwrap();
+
+        let handled = migrate_policy_files(&unarmed, &fixed).unwrap();
+        assert_eq!(handled.len(), 2, "both lists must move: {handled:?}");
+        assert!(!unarmed.join("withheld-names.txt").exists());
+        assert!(!unarmed.join("repo-deps.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(fixed.join("withheld-names.txt")).unwrap(),
+            "Acme\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fixed.join("repo-deps.txt")).unwrap(),
+            "Repo <- Upstream\n"
+        );
+
+        // Idempotent: the next install finds nothing left to move.
+        assert!(
+            migrate_policy_files(&unarmed, &fixed).unwrap().is_empty(),
+            "a second migration must be a no-op"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn rejects_an_unknown_hook_event() {
         let bad = POLICY.replace(
             "on = [\"pre-commit\", \"pre-push\"]",
             "on = [\"post-commit\"]",
         );
         assert!(parse_policy(&bad).is_err());
+    }
+
+    /// The credential broker re-checks the signature on the file the table
+    /// came from. A parsed table that forgot its path would silently skip that
+    /// check, so `load` and `load_unverified` both record it.
+    #[test]
+    fn loading_records_the_path_for_credential_time_checks() {
+        let dir = scratch("config-path");
+        let path = dir.join("config.toml");
+        std::fs::write(&path, BASE).unwrap();
+        let (cfg, returned, _) = Config::load_unverified(Some(&path)).unwrap();
+        assert_eq!(returned, path);
+        assert_eq!(cfg.path.as_deref(), Some(path.as_path()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

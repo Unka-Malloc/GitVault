@@ -98,9 +98,13 @@ fn now_secs() -> u64 {
 }
 
 /// The biometric helper's fixed location.
+///
+/// Resolved from the account database first, never from `HOME`: a caller who
+/// can redirect `HOME` could otherwise point the prompt at a stub that exits
+/// zero. `gitvault install` locks an existing helper; [`require_biometric`]
+/// refuses a user-writable one rather than trusting install order.
 fn default_helper() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    Path::new(&home)
+    crate::configsig::home_dir()
         .join(".local")
         .join("bin")
         .join("gitvault-touchid")
@@ -116,14 +120,21 @@ pub fn require_biometric(reason: &str) -> Result<()> {
     // caller could rewrite is a confirmation the caller can self-answer, which
     // would reduce "a human was present" to a timer. GITVAULT_TOUCHID remains a
     // test hook in debug builds only.
-    let helper = if cfg!(debug_assertions) {
-        std::env::var("GITVAULT_TOUCHID")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| default_helper())
+    let (helper, fixture) = if cfg!(debug_assertions) {
+        match std::env::var("GITVAULT_TOUCHID") {
+            Ok(explicit) => (PathBuf::from(explicit), true),
+            Err(_) => (default_helper(), false),
+        }
     } else {
-        default_helper()
+        (default_helper(), false)
     };
+    require_biometric_at(&helper, fixture, reason)
+}
 
+/// The trust decision and execution for one helper path. Split from
+/// [`require_biometric`] so a planted helper can be tested without touching the
+/// account's installed one.
+fn require_biometric_at(helper: &Path, fixture: bool, reason: &str) -> Result<()> {
     if !helper.exists() {
         bail!(
             "biometric helper not found at {}\n  \
@@ -131,8 +142,21 @@ pub fn require_biometric(reason: &str) -> Result<()> {
             helper.display()
         );
     }
+    // A user-writable helper is a prompt the same user can replace with
+    // `exit 0`. Root ownership or `schg` is the property `gitvault install`
+    // gives it; the debug fixture above is the only exception. The check judges
+    // the path itself, so a link planted at the helper location is refused even
+    // when it points at a trusted executable.
+    if !fixture && !crate::configsig::executable_is_trusted(helper) {
+        bail!(
+            "biometric helper at {} is not locked against this user\n  \
+             a same-user process could replace it and answer the prompt with success\n  \
+             run `gitvault install` after installing the helper to immobilise it",
+            helper.display()
+        );
+    }
 
-    let status = Command::new(&helper)
+    let status = Command::new(helper)
         .arg(reason)
         .status()
         .with_context(|| format!("failed to run {}", helper.display()))?;
@@ -168,6 +192,15 @@ pub fn ensure_open(
     let secs = ttl_secs.unwrap_or_else(default_ttl_secs);
     // Biometric first. It is the only step an automated process cannot satisfy, which
     // is what makes this a gate rather than a timer.
+    //
+    // Label the prompt on stderr before it appears: a log that only says
+    // "Touch ID was asked" attributes the prompt to whatever ran last - the
+    // audit agents' "the auditor wanted a fingerprint" misreport. No audit
+    // reaches this line; every call site is a credential use.
+    eprintln!(
+        "gitvault: {}",
+        reason.strip_prefix("GitVault: ").unwrap_or(reason)
+    );
     require_biometric(reason)?;
     // Then prove the key is readable, so a window never opens on a machine where every
     // later operation would fail somewhere less obvious.
@@ -465,5 +498,36 @@ mod tests {
             result.is_err(),
             "a missing helper must not read as approval"
         );
+    }
+
+    /// A same-user process can create the fixed helper path as a link to a
+    /// root-owned executable that exits zero. The trust check must judge the
+    /// path it was given, so the prompt is refused before that executable runs.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_biometric_helper_is_refused_before_it_runs() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let target = ["/usr/bin/true", "/bin/true"]
+            .into_iter()
+            .map(Path::new)
+            .find(|path| {
+                std::fs::symlink_metadata(path)
+                    .map(|meta| meta.is_file() && meta.uid() == 0)
+                    .unwrap_or(false)
+            })
+            .expect("a root-owned no-op executable is needed for the planted-link case");
+        let dir = std::env::temp_dir().join(format!("gv-unlock-symlink-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let helper = dir.join("gitvault-touchid");
+        std::os::unix::fs::symlink(target, &helper).unwrap();
+
+        let error = require_biometric_at(&helper, false, "test")
+            .expect_err("a planted link must not answer the biometric prompt");
+        assert!(
+            format!("{error:#}").contains("not locked against this user"),
+            "the refusal must name the trust property, got: {error:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

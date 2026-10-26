@@ -272,52 +272,62 @@ fn push_ranges(ctx: &Context) -> Result<Vec<RangeSpec>, String> {
     Ok(ranges)
 }
 
-fn merge_base(repo: &std::path::Path, a: &str, b: &str) -> Result<String, String> {
-    run_git(repo, &["merge-base".into(), a.into(), b.into()]).map(|s| s.trim().to_string())
-}
-
-/// `pr create` scans the commits the request would add to its base;
-/// `pr merge` fetches the request's head and scans what it carries into the
-/// checked-out branch. An event without either boundary has no defined range
-/// and is skipped by the caller before this is reached.
+/// `pr create` and `pr merge` scan exactly the commits the request adds to
+/// its target base: `base..head`. The base commit is resolved at the gate
+/// boundary (`pr_base_sha`) against the request's target branch, never
+/// against the checkout's `HEAD`: a merge publishes the request's base..head
+/// even when another branch is checked out. `check --event pr` may run
+/// without a fetch; it uses the base it was given, or the checkout's `HEAD`
+/// when none was named, and refuses when that base is not present. An event
+/// without either boundary has no defined range and is skipped by the caller
+/// before this is reached.
 fn pr_ranges(ctx: &Context) -> Result<Vec<RangeSpec>, String> {
-    if let Some(number) = &ctx.pr_number {
-        run_git(
-            &ctx.repo_root,
-            &[
-                "fetch".into(),
-                "-q".into(),
-                "origin".into(),
-                format!("pull/{number}/head"),
-            ],
-        )
-        .map_err(|e| format!("cannot fetch pull/{number}/head for review: {e}"))?;
-        let base = merge_base(&ctx.repo_root, "FETCH_HEAD", "HEAD")?;
-        return Ok(vec![vec![format!("{base}..FETCH_HEAD")]]);
-    }
-
-    let head = ctx.pr_head.clone().unwrap_or_default();
-    let base = ctx.pr_base.clone().unwrap_or_default();
-    // An empty base means the repository's default branch, which locally is
-    // what origin/HEAD points at.
-    let base_ref = if base.is_empty() {
-        run_git(
-            &ctx.repo_root,
-            &["rev-parse".into(), "--verify".into(), "origin/HEAD".into()],
-        )
-        .map(|_| "origin/HEAD".to_string())
-        .unwrap_or_else(|_| "HEAD".to_string())
-    } else {
-        base
+    let head = ctx
+        .pr_head
+        .as_deref()
+        .map(str::trim)
+        .filter(|head| !head.is_empty())
+        .ok_or("the pull request audit has no head commit")?;
+    let base = match ctx
+        .pr_base_sha
+        .as_deref()
+        .map(str::trim)
+        .filter(|sha| !sha.is_empty())
+    {
+        Some(sha) => sha.to_string(),
+        None => {
+            let reference = match ctx
+                .pr_base
+                .as_deref()
+                .map(str::trim)
+                .filter(|base| !base.is_empty())
+            {
+                Some(base) => base.to_string(),
+                // A merge always has the target base frozen at its gate
+                // boundary; reaching here means that boundary did not run,
+                // so refuse rather than fall back to the checkout.
+                None if ctx.pr_number.is_some() => {
+                    return Err("the merge audit has no resolved target base commit".into());
+                }
+                // `check --event pr` without --pr-base keeps its historical
+                // on-demand default: the checkout's HEAD.
+                None => "HEAD".to_string(),
+            };
+            run_git(
+                &ctx.repo_root,
+                &[
+                    "rev-parse".into(),
+                    "--verify".into(),
+                    format!("{reference}^{{commit}}"),
+                ],
+            )
+            .map(|sha| sha.trim().to_string())
+            .map_err(|why| {
+                format!("the pull request base '{reference}' does not resolve locally: {why}")
+            })?
+        }
     };
-    let base_sha = merge_base(&ctx.repo_root, &base_ref, &head).or_else(|_| {
-        run_git(
-            &ctx.repo_root,
-            &["rev-parse".into(), "--verify".into(), base_ref.clone()],
-        )
-        .map(|s| s.trim().to_string())
-    })?;
-    Ok(vec![vec![format!("{base_sha}..{head}")]])
+    Ok(vec![vec![format!("{base}..{head}")]])
 }
 
 /// A release publishes the commits on the tagged commit that no earlier tag
@@ -580,16 +590,10 @@ fn scrub_gate(ctx: &Context) -> Option<CheckerOutcome> {
         })
     };
 
-    let text = match std::fs::read(file)
+    let text = std::fs::read(file)
         .ok()
-        .and_then(|b| String::from_utf8(b).ok())
-    {
-        Some(t) => t,
-        None => return None,
-    };
-    let Some((cleaned, removed)) = strip_attribution(&text) else {
-        return None;
-    };
+        .and_then(|b| String::from_utf8(b).ok())?;
+    let (cleaned, removed) = strip_attribution(&text)?;
     if let Err(why) = rewrite_message_file(file, &cleaned) {
         eprintln!("gitvault: attribution scrub skipped (message unchanged): {why}");
         return None;
@@ -723,6 +727,56 @@ mod tests {
         assert_eq!(tag_of("\tGenerated with Claude Code"), None);
     }
 
+    /// A merge publishes the request's target-base..head, not a range derived
+    /// from whatever branch is checked out. A trailer in the PR head is
+    /// blocking even when HEAD sits on an unrelated branch (and even when the
+    /// checkout is the head itself, where a HEAD-relative base would be empty).
+    #[test]
+    fn a_pr_merge_scans_the_target_base_not_head() {
+        let dir = Dir::new("pr-merge-range");
+        dir.repo();
+        dir.git(&["config", "user.email", "test@example.invalid"]);
+        dir.git(&["config", "user.name", "Test"]);
+        std::fs::write(dir.0.join("base"), "base\n").unwrap();
+        dir.git(&["add", "base"]);
+        dir.git(&["commit", "-qm", "base"]);
+        let base = dir.git(&["rev-parse", "HEAD"]);
+
+        dir.git(&["checkout", "-qb", "feature"]);
+        std::fs::write(dir.0.join("head"), "head\n").unwrap();
+        dir.git(&["add", "head"]);
+        dir.git(&[
+            "commit",
+            "-qm",
+            "feature\n\nCo-authored-by: Claude Code <noreply@anthropic.com>",
+        ]);
+        let head = dir.git(&["rev-parse", "HEAD"]);
+
+        // The checkout is neither the PR head nor the target branch.
+        dir.git(&["checkout", "-q", "main"]);
+        dir.git(&["checkout", "-qb", "other"]);
+        std::fs::write(dir.0.join("other"), "other\n").unwrap();
+        dir.git(&["add", "other"]);
+        dir.git(&["commit", "-qm", "other"]);
+
+        let mut merge = ctx(&dir, "pr", None);
+        merge.pr_number = Some("7".into());
+        merge.pr_head = Some(head);
+        merge.pr_base = Some("main".into());
+        merge.pr_base_sha = Some(base);
+        let outcome = gate(&merge).expect("a PR merge must run the attribution gate");
+        match outcome.outcome {
+            OutcomeKind::Failed(_) => {}
+            other => panic!("the PR head carries a trailer; got {other:?}"),
+        }
+        assert!(
+            outcome.stdout.contains("co-authored-by trailer"),
+            "{}",
+            outcome.stdout
+        );
+        assert!(outcome.stdout.contains("1 of 1"), "{}", outcome.stdout);
+    }
+
     // ------------------------------------------------- compose-time scrub
 
     struct Dir(PathBuf);
@@ -748,6 +802,22 @@ mod tests {
                 .unwrap();
             self
         }
+        fn git(&self, args: &[&str]) -> String {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&self.0)
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        }
     }
     impl Drop for Dir {
         fn drop(&mut self) {
@@ -768,6 +838,7 @@ mod tests {
             stdin: None,
             push_remote: None,
             pr_base: None,
+            pr_base_sha: None,
             pr_head: None,
             pr_number: None,
             release_tag: None,

@@ -171,28 +171,6 @@ pub fn commit_at(dir: &Path, revision: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// Whether any ref under `refs` reaches `commit` - the shared "already
-/// published" probe. The audit range filter asks about every remote mirror
-/// (`refs/remotes`); the attestation skip asks only about the remote the
-/// push targets (`refs/remotes/<remote>`), since the status it would post
-/// lives on that repository, not on an unrelated one.
-pub fn refs_containing(dir: &Path, commit: &str, refs: &[&str]) -> bool {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args([
-            "for-each-ref",
-            "--count=1",
-            "--contains",
-            commit,
-            "--format=%(refname)",
-        ])
-        .args(refs)
-        .output()
-        .map(|out| !String::from_utf8_lossy(&out.stdout).trim().is_empty())
-        .unwrap_or(false)
-}
-
 fn git(directory: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .arg("-C")

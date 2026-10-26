@@ -279,6 +279,7 @@ mod tests {
             stdin: Some(stdin),
             push_remote: Some("origin".into()),
             pr_base: None,
+            pr_base_sha: None,
             pr_head: None,
             pr_number: None,
             release_tag: None,

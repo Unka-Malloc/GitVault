@@ -21,9 +21,9 @@
 //!   checker's own store: the record keeps what the engine saw on the pipes.
 //!   A receipt a checker sanitized for its own reasons stays its own.
 //!
-//! Runs that invoke no registered checker are not recorded. The identity gate
-//! alone runs on every local commit, and a record of "nothing was asked" would
-//! bury the runs that were.
+//! Runs that invoke no audit are not recorded. The identity gate alone runs on
+//! every local commit, and a record of "nothing was asked" would bury the runs
+//! that were.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -82,9 +82,6 @@ fn now_ms() -> u128 {
 /// from 0000-03-01 to 1970-01-01, then a 400-year era of 146097 days. Records
 /// store the epoch second; only the operator's view needs it readable.
 ///
-/// The `gitvault-review` crate shares the algorithm through
-/// `src/bin/review/date.rs` - the two binaries are separate crates, so a
-/// crate-boundary merge should converge the copies, not keep a third home.
 pub fn iso8601(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
     let rest = secs % 86_400;
@@ -208,11 +205,11 @@ pub struct Record {
     /// the blessing, so the record keeps the state the verdict was made under.
     #[serde(default)]
     pub routing_signature: String,
-    /// Whether the audit policy's signature held when the run happened. A
-    /// `check` may audit a proposed (uncertified) policy - the record must
-    /// not read as if a certified one ran. Absent on records sealed before
-    /// this field existed: an empty default must not materialize on a
-    /// round-trip, or their seals would break.
+    /// Whether the audit policy's signature held when the run happened. The
+    /// policy now authorizes the delegated engine rather than declaring rows,
+    /// but the record still carries the state the verdict was made under.
+    /// Absent on records sealed before this field existed: an empty default
+    /// must not materialize on a round-trip, or their seals would break.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub policy_signature: String,
     pub passed: bool,
@@ -220,8 +217,7 @@ pub struct Record {
     pub outcomes: Vec<Outcome>,
     /// `sha256(seal of the previous record + this record without the seal)`,
     /// chaining the log so a deleted or rewritten run is detectable on
-    /// inspection. Tamper-evidence, not tamper-proofing: the durable
-    /// attestation is the `gitvault/audited` status the hook posts.
+    /// inspection. Tamper-evidence, not tamper-proofing.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub seal: String,
     /// The seal this record chained to. Stored explicitly because the run id
@@ -269,8 +265,8 @@ pub struct Run {
     started_ms: u128,
 }
 
-/// Start a record for a run that will invoke at least one registered checker.
-/// Returns None when nothing will run, or when the store cannot be created.
+/// Start a record for a run that will invoke the audit engine. Returns None
+/// when nothing will run, or when the store cannot be created.
 pub fn begin(cfg: &Config, selected: usize) -> Option<Run> {
     if selected == 0 {
         return None;
@@ -588,6 +584,7 @@ mod tests {
             stdin: None,
             push_remote: None,
             pr_base: None,
+            pr_base_sha: None,
             pr_head: None,
             pr_number: None,
             release_tag: None,
