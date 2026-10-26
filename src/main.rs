@@ -25,7 +25,7 @@ mod unlock;
 mod vault;
 
 use std::io::{IsTerminal, Read};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -2648,7 +2648,11 @@ fn installed_digest(path: &Path) -> anyhow::Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
-fn install_atomic(src: &Path, target: &Path, mode: u32) -> anyhow::Result<()> {
+/// Install `src` at `target` atomically and answer the digest of the bytes
+/// that were read - the value the caller later expects at `target`, carried
+/// from the trusted source rather than re-derived from whatever the path
+/// holds when the immutable flag runs.
+fn install_atomic(src: &Path, target: &Path, mode: u32) -> anyhow::Result<[u8; 32]> {
     use std::io::Write as _;
     use std::os::unix::fs::MetadataExt as _;
     // An unpredictable name plus `create_new` keeps a planted entry from
@@ -2676,9 +2680,11 @@ fn install_atomic(src: &Path, target: &Path, mode: u32) -> anyhow::Result<()> {
             );
         }
     };
-    let result = (|| -> anyhow::Result<()> {
+    let result = (|| -> anyhow::Result<[u8; 32]> {
+        use sha2::Digest as _;
         let bytes = std::fs::read(src)
             .with_context(|| format!("cannot read {} for staging", src.display()))?;
+        let digest: [u8; 32] = sha2::Sha256::digest(&bytes).into();
         staged
             .write_all(&bytes)
             .with_context(|| format!("cannot stage {} for {}", src.display(), target.display()))?;
@@ -2712,7 +2718,7 @@ fn install_atomic(src: &Path, target: &Path, mode: u32) -> anyhow::Result<()> {
             "installed {} was replaced before verification - refusing",
             target.display()
         );
-        Ok(())
+        Ok(digest)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -2836,12 +2842,20 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
     //
     //    Reinstalling through the installed binary itself: exe and target are
     //    the same file, and copying it onto itself would only churn the inode.
+    // The bytes the immutable flag must land on: for every file this run
+    // installs or writes, the digest is carried from the trusted source -
+    // not re-derived from the path later, where a swap between install and
+    // flag would bless attacker bytes. Files locked but never written here
+    // (a separately installed engine, an existing sign wrapper) keep the
+    // self-consistent before/after comparison alone.
+    let mut expected: std::collections::HashMap<PathBuf, [u8; 32]> =
+        std::collections::HashMap::new();
     let self_install = target
         .canonicalize()
         .map(|resolved| resolved == exe)
         .unwrap_or(false);
     if !self_install {
-        install_atomic(&exe, &target, 0o755)?;
+        expected.insert(target.clone(), install_atomic(&exe, &target, 0o755)?);
     }
     // Warn, but do not install: the audit engine is installed and versioned on
     // its own. Its absence refuses every publication audit at run time; an
@@ -2854,10 +2868,10 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
         );
     }
     if !sign_wrapper.exists() {
-        std::fs::write(
-            &sign_wrapper,
-            "#!/bin/sh\n# git needs gpg.ssh.program to be one executable path.\nexec \"$HOME/.local/bin/gitvault\" sign \"$@\"\n",
-        )?;
+        const WRAPPER: &str = "#!/bin/sh\n# git needs gpg.ssh.program to be one executable path.\nexec \"$HOME/.local/bin/gitvault\" sign \"$@\"\n";
+        std::fs::write(&sign_wrapper, WRAPPER)?;
+        use sha2::Digest as _;
+        expected.insert(sign_wrapper.clone(), sha2::Sha256::digest(WRAPPER).into());
     }
     std::fs::set_permissions(&sign_wrapper, std::fs::Permissions::from_mode(0o755))
         .with_context(|| format!("cannot make {} executable", sign_wrapper.display()))?;
@@ -2868,7 +2882,7 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
             .metadata()
             .map(|m| m.permissions().mode() & 0o777)
             .unwrap_or(0o755);
-        install_atomic(&touchid, &touchid, mode)?;
+        expected.insert(touchid.clone(), install_atomic(&touchid, &touchid, mode)?);
     }
 
     // 2. Hook dispatchers, written only when missing: an existing dispatcher is
@@ -2939,19 +2953,31 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
     //      invoking user above, before the copies.
     //
     //    The bytes the immutable flag lands on must be the bytes this run
-    //    installed. A same-user process can rename over a target between the
-    //    copy and this privileged step, so each file is hashed here and the
-    //    flag is refused rather than applied to a swapped-in binary. The
-    //    second check after chflags closes the residual window: a swap that
-    //    slipped in is detected, unlocked and refused.
-    let mut staged_digests: Vec<(PathBuf, [u8; 32])> = Vec::new();
+    //    installed - proven by comparing each target against the digest
+    //    carried from its trusted source, not a fresh hash of whatever the
+    //    path holds now. A same-user process can rename over a target
+    //    between the copy and this privileged step, so files this run did
+    //    not install are hashed here and the flag is refused rather than
+    //    applied to a swapped-in binary. The second check after chflags
+    //    closes the residual window: a swap that slipped in is detected on
+    //    both inode and content, unlocked and refused.
+    let mut staged_digests: Vec<(PathBuf, u64, [u8; 32])> = Vec::new();
     for path in &immobilise {
         let Ok(meta) = std::fs::symlink_metadata(path) else {
             continue;
         };
-        if meta.is_file() && !meta.file_type().is_symlink() {
-            staged_digests.push((path.clone(), installed_digest(path)?));
+        if !meta.is_file() || meta.file_type().is_symlink() {
+            continue;
         }
+        let now = installed_digest(path)?;
+        if let Some(expected) = expected.get(path) {
+            anyhow::ensure!(
+                &now == expected,
+                "{} no longer holds the installed bytes before the immutable flag - refusing",
+                path.display()
+            );
+        }
+        staged_digests.push((path.clone(), meta.ino(), now));
     }
     let status = std::process::Command::new("sudo")
         .args(["chflags", "-R", "schg"])
@@ -2961,9 +2987,10 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
     if !status.success() {
         anyhow::bail!("sudo chflags failed; nothing below was applied");
     }
-    for (path, expected) in &staged_digests {
+    for (path, ino, digest) in &staged_digests {
+        let meta = std::fs::symlink_metadata(path);
         let now = installed_digest(path).unwrap_or_default();
-        if &now != expected {
+        if meta.ok().map(|m| m.ino()) != Some(*ino) || &now != digest {
             let _ = std::process::Command::new("sudo")
                 .args(["chflags", "noschg"])
                 .arg(path)
@@ -3843,6 +3870,39 @@ fn cmd_release(
     emit(&cfg, &vault, req)
 }
 
+/// A descriptor duplicated so a spawned curl inherits it: `--data-binary`
+/// reads `/dev/fd/N`, the same open file description the asset digest was
+/// computed on, so a path swap cannot change what is sent. `dup` clears
+/// close-on-exec, so the child sees it; the guard closes it after the
+/// request completes.
+#[cfg(unix)]
+struct InheritedFd {
+    fd: std::os::unix::io::RawFd,
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl InheritedFd {
+    fn share(file: &std::fs::File) -> anyhow::Result<Self> {
+        use std::os::unix::io::AsRawFd as _;
+        let fd = unsafe { libc::dup(file.as_raw_fd()) };
+        anyhow::ensure!(fd >= 0, "cannot share the asset descriptor with the upload");
+        Ok(Self {
+            fd,
+            path: PathBuf::from(format!("/dev/fd/{fd}")),
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for InheritedFd {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
 /// What a release audit settles before the create request is built: the
 /// checkout it ran in, the commit it judged, and the digest-bound asset files.
 struct ReleaseAudit {
@@ -3869,19 +3929,16 @@ struct ReleaseAsset {
 const MAX_RELEASE_ASSETS: usize = 1000;
 const MAX_ASSET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Stream a file's SHA-256 through a fixed buffer: hashing must stay
-/// constant-memory however large the audited asset is.
-fn sha256_file(path: &Path) -> anyhow::Result<String> {
+/// Stream a SHA-256 through a fixed buffer from any readable source:
+/// hashing must stay constant-memory however large the audited asset is.
+/// Reading through an already-open handle binds the digest to that inode,
+/// not to a path that could be swapped before the upload reads it again.
+fn sha256_reader(mut source: impl std::io::Read) -> anyhow::Result<String> {
     use sha2::Digest as _;
-    use std::io::Read as _;
-    let mut file =
-        std::fs::File::open(path).with_context(|| format!("cannot hash '{}'", path.display()))?;
     let mut hasher = sha2::Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
-        let read = file
-            .read(&mut buffer)
-            .with_context(|| format!("cannot hash '{}'", path.display()))?;
+        let read = source.read(&mut buffer)?;
         if read == 0 {
             break;
         }
@@ -3894,12 +3951,10 @@ fn sha256_file(path: &Path) -> anyhow::Result<String> {
         .collect())
 }
 
-impl ReleaseAsset {
-    /// The digest of the file right now, hex-encoded like the audited one.
-    fn current_digest(&self) -> anyhow::Result<String> {
-        sha256_file(&self.path)
-            .with_context(|| format!("cannot re-hash asset '{}'", self.path.display()))
-    }
+fn sha256_file(path: &Path) -> anyhow::Result<String> {
+    let file =
+        std::fs::File::open(path).with_context(|| format!("cannot hash '{}'", path.display()))?;
+    sha256_reader(file).with_context(|| format!("cannot hash '{}'", path.display()))
 }
 
 /// Pair each `--asset` file with the name GitHub will store - the file's
@@ -3982,17 +4037,30 @@ fn create_release_staged(
     let mut lines = created.lines();
     let id = lines.next().unwrap_or_default().trim().to_string();
     anyhow::ensure!(!id.is_empty(), "the created release reported no id");
-    let stage = (|| -> anyhow::Result<()> {
+    // The created draft binds the audited commit at once: an existing tag
+    // resolves to its live commit here, a new tag is created at
+    // `target_commitish`. If the tag already moved, the draft recorded
+    // unaudited content - it is deleted, not kept.
+    if let Err(why) = verify_remote_tag(staged.repo_root, slug, staged.tag, staged.audited) {
+        delete_release_quietly(cfg, vault, slug, &id);
+        return Err(why.context("the draft bound unaudited content and was deleted"));
+    }
+    let upload = (|| -> anyhow::Result<()> {
         for asset in staged.assets {
-            // The published bytes must be the audited digest: re-hash at
-            // upload time so a same-user swap cannot ride the release.
-            let now = asset.current_digest()?;
+            // The published bytes must be the audited digest - and they must
+            // be these exact bytes: the hash runs on the open handle and the
+            // upload hands curl that same descriptor, so a path swap between
+            // audit and upload cannot ride the release.
+            let mut file = std::fs::File::open(&asset.path)
+                .with_context(|| format!("cannot open asset '{}'", asset.path.display()))?;
+            let now = sha256_reader(&file)?;
             anyhow::ensure!(
                 now == asset.sha256,
                 "asset '{}' changed after the audit ({}) - refusing to publish it",
                 asset.name,
                 asset.path.display()
             );
+            std::io::Seek::rewind(&mut file)?;
             let mut up = get(
                 format!(
                     "{}/repos/{slug}/releases/{id}/assets?name={}",
@@ -4003,22 +4071,35 @@ fn create_release_staged(
                 Some(".browser_download_url".into()),
             );
             up.method = "POST".into();
-            up.data_file = Some(asset.path.clone());
+            #[cfg(unix)]
+            let _shared = {
+                let shared = InheritedFd::share(&file)?;
+                up.data_file = Some(shared.path.clone());
+                shared
+            };
+            #[cfg(not(unix))]
+            {
+                up.data_file = Some(asset.path.clone());
+            }
             up.headers
                 .push("Content-Type: application/octet-stream".into());
             let url = api::run_value(cfg, vault, &up)
                 .with_context(|| format!("uploading release asset '{}'", asset.name))?;
             println!("{}", url.trim());
         }
-        // The tag could have moved between the pre-create check and now; the
-        // publish is refused rather than attached to unaudited content.
-        verify_remote_tag(staged.repo_root, slug, staged.tag, staged.audited)?;
         Ok(())
     })();
-    if let Err(why) = stage {
+    if let Err(why) = upload {
         delete_release_quietly(cfg, vault, slug, &id);
         return Err(why.context("the draft release was deleted after the staged publish failed"));
     }
+    // A tag move past this point cannot retarget the bound draft, but it
+    // would publish a release naming a tag that now points at unaudited
+    // content. That is unrecoverable by this run: the draft stays put for
+    // the operator to inspect rather than being silently deleted or
+    // published on a stale binding.
+    verify_remote_tag(staged.repo_root, slug, staged.tag, staged.audited)
+        .context("the tag moved after the draft was bound; it stays unpublished for inspection")?;
     if staged.keep_draft {
         if let Some(url) = lines.next() {
             println!("{}", url.trim());
@@ -4706,7 +4787,6 @@ mod tests {
         assert_eq!(assets[0].name, "app-v1.0.zip");
         assert_eq!(assets[0].size, 3);
         assert_eq!(assets[0].sha256.len(), 64);
-        assert_eq!(assets[0].current_digest().unwrap(), assets[0].sha256);
         assert!(check_release_assets(&[root.join("missing.bin")]).is_err());
         assert!(check_release_assets(std::slice::from_ref(&root)).is_err());
         let _ = std::fs::remove_dir_all(&root);

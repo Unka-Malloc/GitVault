@@ -120,14 +120,19 @@ pub fn executable_is_trusted(path: &Path) -> bool {
         if trusted_executable_locked(meta.st_flags()) {
             return true;
         }
-        // Without schg the name itself must be protected: root-owned and no
-        // ancestor this user could rename through.
-        meta.uid() == 0 && !path_is_user_replaceable(path)
+        // Without schg the name itself must be protected, and the inode too:
+        // root-owned, no write access beyond the owner (group/other bits or
+        // an ACL entry would let a non-root principal edit the bytes in
+        // place), and no ancestor this user could rename through.
+        meta.uid() == 0
+            && !file_is_untrusted_writable(&meta)
+            && !has_extended_acl(path)
+            && !path_is_user_replaceable(path)
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         use std::os::unix::fs::MetadataExt as _;
-        meta.uid() == 0 && !path_is_user_replaceable(path)
+        meta.uid() == 0 && !file_is_untrusted_writable(&meta) && !path_is_user_replaceable(path)
     }
     #[cfg(not(unix))]
     {
@@ -141,6 +146,50 @@ pub fn executable_is_trusted(path: &Path) -> bool {
 fn trusted_executable_locked(flags: u32) -> bool {
     const SF_IMMUTABLE: u32 = 0x0002_0000;
     flags & SF_IMMUTABLE != 0
+}
+
+/// Group/other write bits on the inode itself: a same-user (or group-member)
+/// process could rewrite the bytes in place without ever renaming the path.
+/// Owner write stays permitted - a root-owned file's owner bit protects
+/// nothing additional, and removing it is root's own choice.
+#[cfg(unix)]
+fn file_is_untrusted_writable(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    meta.mode() & 0o022 != 0
+}
+
+/// macOS access-control entries on the file itself. An ACL can grant write to
+/// a principal the mode bits exclude, so any extended entry makes a non-`schg`
+/// executable untrusted. `acl_get_link_np` does not follow a final symlink -
+/// matching the `symlink_metadata` judgement - and an absent ACL reads as no
+/// entries rather than an error.
+#[cfg(target_os = "macos")]
+fn has_extended_acl(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    unsafe extern "C" {
+        fn acl_get_link_np(path: *const libc::c_char, kind: u32) -> *mut libc::c_void;
+        fn acl_get_entry(
+            acl: *const libc::c_void,
+            entry_id: i32,
+            entry: *mut *mut libc::c_void,
+        ) -> i32;
+        fn acl_free(obj: *mut libc::c_void) -> i32;
+    }
+    const ACL_TYPE_EXTENDED: u32 = 0x0000_0100;
+    const ACL_FIRST_ENTRY: i32 = 0;
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return true;
+    };
+    unsafe {
+        let acl = acl_get_link_np(path.as_ptr(), ACL_TYPE_EXTENDED);
+        if acl.is_null() {
+            return false;
+        }
+        let mut entry = std::ptr::null_mut();
+        let present = acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) == 0;
+        acl_free(acl);
+        present
+    }
 }
 
 /// Whether any ancestor of `path` lets a non-root user rename entries. A
