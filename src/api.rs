@@ -25,23 +25,36 @@ use crate::unlock;
 use crate::vault::Vault;
 
 pub const API_ROOT: &str = "https://api.github.com";
+/// Release assets are uploaded to a different host than the REST API; the
+/// release response names it in `upload_url`. It is the only other origin a
+/// token may be sent to.
+pub const UPLOAD_ROOT: &str = "https://uploads.github.com";
 
-/// The path part of a request with the API origin removed and the query and
-/// fragment dropped. Absolute URLs are accepted only on the API origin: the
-/// account token rides in the Authorization header of whatever the request
-/// resolves to, so a caller-chosen host is refused before a credential is read.
+/// The path part of a request with a sanctioned origin removed and the query
+/// and fragment dropped. Absolute URLs are accepted only on the API and upload
+/// origins: the account token rides in the Authorization header of whatever
+/// the request resolves to, so a caller-chosen host is refused before a
+/// credential is read.
 fn relative_api_path(path: &str) -> Result<&str> {
-    let rest = if let Some(rest) = path.strip_prefix(API_ROOT) {
-        if !(rest.is_empty() || rest.starts_with('/')) {
-            // api.github.com.evil.example and similar prefix look-alikes.
-            bail!("refusing an absolute URL outside the API origin: {path}");
+    let mut absolute = None;
+    for origin in [API_ROOT, UPLOAD_ROOT] {
+        if let Some(rest) = path.strip_prefix(origin) {
+            if !(rest.is_empty() || rest.starts_with('/')) {
+                // api.github.com.evil.example and similar prefix look-alikes.
+                bail!("refusing an absolute URL outside the sanctioned origins: {path}");
+            }
+            absolute = Some(rest);
+            break;
         }
-        rest
-    } else {
-        if path.contains("://") {
-            bail!("refusing an absolute URL outside the API origin: {path}");
+    }
+    let rest = match absolute {
+        Some(rest) => rest,
+        None => {
+            if path.contains("://") {
+                bail!("refusing an absolute URL outside the sanctioned origins: {path}");
+            }
+            path
         }
-        path
     };
     Ok(rest
         .split(['?', '#'])
@@ -132,16 +145,19 @@ pub fn path_has_traversal(path: &str) -> bool {
 /// Resolve a request path to the URL the token will be sent to.
 ///
 /// A relative path always lands under API_ROOT. An absolute URL is accepted
-/// only when its origin is API_ROOT exactly - `https://api.github.com/...` -
-/// because the account token rides in the Authorization header of whatever
-/// this returns. Any other absolute URL, and any path with an unsafe segment,
-/// is refused before a credential is read.
+/// only when its origin is a sanctioned one exactly - `https://api.github.com`
+/// or `https://uploads.github.com` - because the account token rides in the
+/// Authorization header of whatever this returns. Any other absolute URL, and
+/// any path with an unsafe segment, is refused before a credential is read.
 pub fn request_url(path: &str) -> Result<String> {
     let relative = relative_api_path(path)?;
     if path_has_traversal(relative) {
         bail!("refusing a path with an unsafe segment: {path}");
     }
-    if path.strip_prefix(API_ROOT).is_some() {
+    if [API_ROOT, UPLOAD_ROOT]
+        .iter()
+        .any(|origin| path.strip_prefix(origin).is_some())
+    {
         return Ok(path.to_string());
     }
     Ok(format!("{API_ROOT}/{}", path.trim_start_matches('/')))
@@ -164,6 +180,10 @@ pub struct Request {
     pub raw_fields: Vec<(String, String)>,
     pub headers: Vec<String>,
     pub body: Option<String>,
+    /// A file whose bytes become the request body (`curl --data-binary @path`).
+    /// Release assets ride this: they are binary, can be large, and the upload
+    /// endpoint wants the raw file rather than a JSON document.
+    pub data_file: Option<std::path::PathBuf>,
     pub jq: Option<String>,
     pub silent: bool,
 }
@@ -298,6 +318,21 @@ fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, String)> 
             let sep = if url.contains('?') { '&' } else { '?' };
             url.push_str(&format!("{sep}{}", query.join("&")));
         }
+    } else if req.body.is_some() && req.data_file.is_some() {
+        bail!("a request cannot carry both an inline body and a file body");
+    } else if let Some(file) = &req.data_file {
+        // curl reads the file itself, so an asset never enters argv or memory;
+        // octet-stream is the fallback when the caller names no content type.
+        let content_type_set = req.headers.iter().any(|h| {
+            h.split_once(':')
+                .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("content-type"))
+        });
+        if !content_type_set {
+            args.push("-H".into());
+            args.push("Content-Type: application/octet-stream".into());
+        }
+        args.push("--data-binary".into());
+        args.push(format!("@{}", file.display()));
     } else if let Some(body) = &req.body {
         // The API only accepts JSON bodies, so an --input payload gets the
         // type declared unless the caller already named one - a manual -H
@@ -404,7 +439,7 @@ pub fn run_value(cfg: &Config, vault: &Vault, req: &Request) -> Result<String> {
 
 /// Percent-encode one query component. Unreserved characters pass through;
 /// everything else is UTF-8 byte-escaped.
-fn percent_encode(s: &str) -> String {
+pub(crate) fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
@@ -619,14 +654,26 @@ mod tests {
             request_url("https://api.github.com/user").unwrap(),
             "https://api.github.com/user"
         );
+        // The release asset host is the one other origin a token may reach.
+        assert_eq!(
+            request_url("https://uploads.github.com/repos/o/r/releases/9/assets?name=a.zip")
+                .unwrap(),
+            "https://uploads.github.com/repos/o/r/releases/9/assets?name=a.zip"
+        );
         for hostile in [
             "https://evil.example/user",
             "http://api.github.com/user",
+            "http://uploads.github.com/repos/o/r/releases/9/assets",
             "https://api.github.com.evil.example/user",
+            "https://uploads.github.com.evil.example/assets",
             "https://api.github.com@evil.example/",
+            "https://uploads.github.com@evil.example/",
         ] {
             assert!(request_url(hostile).is_err(), "must refuse {hostile}");
         }
+        // The upload origin gets the same traversal judgement as the API origin.
+        assert!(request_url("https://uploads.github.com/repos/o/r/../releases/9/assets").is_err());
+        assert!(request_url("https://uploads.github.com/repos/o%2fr/releases/9/assets").is_err());
     }
 
     #[test]

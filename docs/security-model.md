@@ -66,6 +66,11 @@ window is a permission, not a possession:
   is decrypted inside the gitvault process and piped to `curl` on an anonymous
   stdin pipe as the `Authorization` header. It appears in no argv, no
   environment variable, no file. The caller receives the API response only.
+  The header may reach exactly two origins: `api.github.com`, and
+  `uploads.github.com` for the asset bodies `release create --asset` streams
+  from disk after the audited release exists; every other absolute URL is
+  refused before a credential is read, and the releases write surface stays
+  refused to `gitvault api` on both origins.
 - **SSH** (`gitvault ssh`, invoked by git via `core.sshCommand`): the private
   key is decrypted inside gitvault and fed to a throwaway `ssh-agent` on a
   private socket; the real `ssh` sees only `SSH_AUTH_SOCK`. The passphrase is

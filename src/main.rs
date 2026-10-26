@@ -446,6 +446,10 @@ enum ReleaseCommand {
         draft: bool,
         #[arg(long)]
         prerelease: bool,
+        /// Upload a file as a release asset (repeatable). The stored asset
+        /// name is the file's basename.
+        #[arg(long = "asset")]
+        assets: Vec<PathBuf>,
     },
     /// Delete a release by tag.
     Delete { tag: String },
@@ -2996,6 +3000,7 @@ fn cmd_api(
         raw_fields: split(raw_fields)?,
         headers,
         body,
+        data_file: None,
         jq,
         silent,
     };
@@ -3321,6 +3326,7 @@ fn cmd_pr(
         raw_fields,
         headers: vec![],
         body: None,
+        data_file: None,
         jq,
         silent: false,
     };
@@ -3418,6 +3424,7 @@ fn get(path: String, slug: String, jq: Option<String>) -> api::Request {
         raw_fields: vec![],
         headers: vec![],
         body: None,
+        data_file: None,
         jq,
         silent: false,
     }
@@ -3626,8 +3633,11 @@ fn cmd_release(
     // The release boundary runs before any credential is touched: the verdict
     // does not depend on the vault, and a refusal must be possible even where
     // the vault is locked. Nothing reaches GitHub until the registry passes.
-    let mut release_audit: Option<(PathBuf, String)> = None;
-    if let ReleaseCommand::Create { tag, .. } = &command {
+    let mut release_audit: Option<ReleaseAudit> = None;
+    if let ReleaseCommand::Create { tag, assets, .. } = &command {
+        // Asset files are judged before the audit: a bad path refuses before
+        // any review time or credential is spent.
+        let assets = check_release_assets(assets)?;
         let ctx = context_for(
             &cfg,
             "release",
@@ -3650,7 +3660,11 @@ fn cmd_release(
             .ok_or_else(|| anyhow::anyhow!("the release audit has no commit"))?;
         let (policy, _policy_path, policy_sig) = config::Policy::load_state(&cfg_path, &cfg)?;
         run_publication_gate(&cfg, &cfg_sig, &policy, &policy_sig, &ctx, "release")?;
-        release_audit = Some((repo_root, audited));
+        release_audit = Some(ReleaseAudit {
+            repo_root,
+            audited,
+            assets,
+        });
     }
     let vault = vault::Vault::open()?;
     let slug = resolve_slug(repo)?;
@@ -3676,8 +3690,13 @@ fn cmd_release(
             notes,
             draft,
             prerelease,
+            ..
         } => {
-            let (repo_root, audited) = release_audit
+            let ReleaseAudit {
+                repo_root,
+                audited,
+                assets,
+            } = release_audit
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("the release audit did not run"))?;
             verify_remote_tag(repo_root, &slug, &tag, audited)?;
@@ -3700,7 +3719,11 @@ fn cmd_release(
             if let Some(b) = notes {
                 r.fields.push(("body".into(), b));
             }
-            r
+            if assets.is_empty() {
+                r
+            } else {
+                return create_release_with_assets(&cfg, &vault, &slug, r, assets);
+            }
         }
         ReleaseCommand::Delete { tag } => {
             // Deleting a release needs its numeric id, so resolve it first. Two
@@ -3721,6 +3744,76 @@ fn cmd_release(
         }
     };
     emit(&cfg, &vault, req)
+}
+
+/// What a release audit settles before the create request is built: the
+/// checkout it ran in, the commit it judged, and the verified asset files.
+struct ReleaseAudit {
+    repo_root: PathBuf,
+    audited: String,
+    assets: Vec<(PathBuf, String)>,
+}
+
+/// Pair each `--asset` file with the name GitHub will store - the file's
+/// basename. Run before the release is created so a bad path refuses before
+/// anything is published.
+fn check_release_assets(paths: &[PathBuf]) -> anyhow::Result<Vec<(PathBuf, String)>> {
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("--asset '{}' has no usable file name", path.display())
+            })?;
+        anyhow::ensure!(
+            std::fs::metadata(path).is_ok_and(|m| m.is_file()),
+            "--asset '{}' is not a readable file",
+            path.display()
+        );
+        out.push((path.clone(), name.to_string()));
+    }
+    Ok(out)
+}
+
+/// Create the release, then upload each asset onto it. The asset endpoint
+/// lives on the upload origin and is addressed by the created release's id,
+/// so the create request runs for its value instead of being printed.
+fn create_release_with_assets(
+    cfg: &config::Config,
+    vault: &vault::Vault,
+    slug: &str,
+    mut req: api::Request,
+    assets: &[(PathBuf, String)],
+) -> anyhow::Result<ExitCode> {
+    req.jq = Some(".id, .html_url".into());
+    let created = api::run_value(cfg, vault, &req)?;
+    let mut lines = created.lines();
+    let id = lines.next().unwrap_or_default().trim();
+    anyhow::ensure!(!id.is_empty(), "the created release reported no id");
+    if let Some(url) = lines.next() {
+        println!("{}", url.trim());
+    }
+    for (path, name) in assets {
+        let mut up = get(
+            format!(
+                "{}/repos/{slug}/releases/{id}/assets?name={}",
+                api::UPLOAD_ROOT,
+                api::percent_encode(name)
+            ),
+            slug.to_string(),
+            Some(".browser_download_url".into()),
+        );
+        up.method = "POST".into();
+        up.data_file = Some(path.clone());
+        up.headers
+            .push("Content-Type: application/octet-stream".into());
+        let url = api::run_value(cfg, vault, &up)
+            .with_context(|| format!("uploading release asset '{name}'"))?;
+        println!("{}", url.trim());
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_run(
@@ -4069,8 +4162,8 @@ fn latest_report(checker: &str) -> Option<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        branch_for_api, fetch_remote_ref, local_pr_base, outgoing_push_stdin, parse_push_args,
-        publication_surface, push_plan, remote_mirrors, verify_remote_tag,
+        branch_for_api, check_release_assets, fetch_remote_ref, local_pr_base, outgoing_push_stdin,
+        parse_push_args, publication_surface, push_plan, remote_mirrors, verify_remote_tag,
     };
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4357,6 +4450,23 @@ mod tests {
         )
         .expect_err("a tag at another commit must refuse");
         assert!(err.to_string().contains("points at"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `--asset` files are paired with their basename before the release is
+    /// created, so a missing file or a directory refuses before anything is
+    /// published.
+    #[test]
+    fn release_assets_are_checked_before_the_create() {
+        let root = scratch("release-assets");
+        let file = root.join("app-v1.0.zip");
+        std::fs::write(&file, b"zip").unwrap();
+        assert_eq!(
+            check_release_assets(std::slice::from_ref(&file)).unwrap(),
+            vec![(file, "app-v1.0.zip".to_string())]
+        );
+        assert!(check_release_assets(&[root.join("missing.bin")]).is_err());
+        assert!(check_release_assets(std::slice::from_ref(&root)).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 

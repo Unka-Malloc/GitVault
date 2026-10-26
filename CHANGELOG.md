@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `release create` accepts a repeatable `--asset PATH` and uploads each file
+  onto the release it just created, naming the stored asset after the file's
+  basename. Every asset path is checked before the create request so an
+  unreadable file refuses before anything is published; the upload body
+  streams from disk via `curl --data-binary @path` and never enters argv or
+  memory. The token's origin set is now exactly two: `api.github.com` and
+  `uploads.github.com`, the host GitHub assigns for asset uploads, while
+  `gitvault api` still refuses the releases write surface on either origin.
 - Publication coverage reads the hardening contract's declared domain set from
   the contract file the inspected row names instead of copying the
   `security-enhancer` domain list into GitVault. The contract identity stays a
