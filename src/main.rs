@@ -3863,19 +3863,42 @@ struct ReleaseAsset {
     sha256: String,
 }
 
+/// GitHub's documented ceilings: a release carries at most 1000 assets and
+/// each asset must stay under 2 GiB. Both refuse before any byte is read,
+/// hashed or requested.
+const MAX_RELEASE_ASSETS: usize = 1000;
+const MAX_ASSET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Stream a file's SHA-256 through a fixed buffer: hashing must stay
+/// constant-memory however large the audited asset is.
+fn sha256_file(path: &Path) -> anyhow::Result<String> {
+    use sha2::Digest as _;
+    use std::io::Read as _;
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("cannot hash '{}'", path.display()))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("cannot hash '{}'", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
+}
+
 impl ReleaseAsset {
     /// The digest of the file right now, hex-encoded like the audited one.
     fn current_digest(&self) -> anyhow::Result<String> {
-        use sha2::Digest as _;
-        let bytes = std::fs::read(&self.path)
-            .with_context(|| format!("cannot re-hash asset '{}'", self.path.display()))?;
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(&bytes);
-        Ok(hasher
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect())
+        sha256_file(&self.path)
+            .with_context(|| format!("cannot re-hash asset '{}'", self.path.display()))
     }
 }
 
@@ -3884,7 +3907,11 @@ impl ReleaseAsset {
 /// Run before the release is created so a bad path or a duplicate upload
 /// name refuses before anything is published.
 fn check_release_assets(paths: &[PathBuf]) -> anyhow::Result<Vec<ReleaseAsset>> {
-    use sha2::Digest as _;
+    anyhow::ensure!(
+        paths.len() <= MAX_RELEASE_ASSETS,
+        "a release carries at most {MAX_RELEASE_ASSETS} assets; {} were given",
+        paths.len()
+    );
     let mut out: Vec<ReleaseAsset> = Vec::with_capacity(paths.len());
     for path in paths {
         let name = path
@@ -3898,25 +3925,26 @@ fn check_release_assets(paths: &[PathBuf]) -> anyhow::Result<Vec<ReleaseAsset>> 
             !out.iter().any(|a| a.name == name),
             "--asset names the upload '{name}' twice"
         );
-        let bytes = std::fs::read(path)
+        // Shape and size gate the read: a FIFO or an over-limit file is
+        // refused before a byte is consumed.
+        let meta = std::fs::symlink_metadata(path)
             .with_context(|| format!("--asset '{}' is not a readable file", path.display()))?;
         anyhow::ensure!(
-            std::fs::symlink_metadata(path)
-                .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink()),
+            meta.is_file() && !meta.file_type().is_symlink(),
             "--asset '{}' is not a regular file",
             path.display()
         );
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(&bytes);
+        anyhow::ensure!(
+            meta.len() < MAX_ASSET_BYTES,
+            "--asset '{}' exceeds the 2 GiB release-asset limit",
+            path.display()
+        );
         out.push(ReleaseAsset {
             path: path.clone(),
             name: name.to_string(),
-            size: bytes.len() as u64,
-            sha256: hasher
-                .finalize()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect(),
+            size: meta.len(),
+            sha256: sha256_file(path)
+                .with_context(|| format!("--asset '{}' is not a readable file", path.display()))?,
         });
     }
     Ok(out)
@@ -3926,6 +3954,11 @@ fn check_release_assets(paths: &[PathBuf]) -> anyhow::Result<Vec<ReleaseAsset>> 
 /// tag still names the audited commit, then publish - unless `--draft` asked
 /// the release to stay invisible. The draft keeps a half-uploaded or
 /// tag-moved release from ever becoming public: any failure deletes it.
+/// Deleting the draft also discards bytes already uploaded - a deliberate
+/// trade: a draft left behind would be unaudited server-side state, and the
+/// audited digest set binds the release as a whole rather than per asset,
+/// so a retry re-verifies and re-transmits rather than resuming under a
+/// draft the audit never saw.
 /// The verified release context a staged publish needs beyond the request:
 /// where the audit ran, the commit it judged, the tag being created and the
 /// digest-bound assets.
@@ -4367,9 +4400,11 @@ fn latest_report(checker: &str) -> Option<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        branch_for_api, check_release_assets, fetch_remote_ref, local_pr_base, outgoing_push_stdin,
-        parse_push_args, publication_surface, push_plan, remote_mirrors, verify_remote_tag,
+        MAX_ASSET_BYTES, MAX_RELEASE_ASSETS, branch_for_api, check_release_assets,
+        fetch_remote_ref, local_pr_base, outgoing_push_stdin, parse_push_args, publication_surface,
+        push_plan, remote_mirrors, sha256_file, verify_remote_tag,
     };
+    use std::path::PathBuf;
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -4674,6 +4709,46 @@ mod tests {
         assert_eq!(assets[0].current_digest().unwrap(), assets[0].sha256);
         assert!(check_release_assets(&[root.join("missing.bin")]).is_err());
         assert!(check_release_assets(std::slice::from_ref(&root)).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The documented ceilings refuse before a byte is read: 1001 paths -
+    /// none of which exist - are rejected by count alone, and a file at the
+    /// 2 GiB boundary is rejected by metadata. A FIFO is refused without a
+    /// read that could never end.
+    #[test]
+    fn release_asset_limits_refuse_before_reading() {
+        let many: Vec<PathBuf> = (0..=MAX_RELEASE_ASSETS)
+            .map(|i| PathBuf::from(format!("/definitely/missing/{i}.bin")))
+            .collect();
+        let err = check_release_assets(&many).unwrap_err().to_string();
+        assert!(err.contains("1000"), "{err}");
+
+        let root = scratch("release-asset-size");
+        // A sparse file reports the boundary size without holding the bytes:
+        // metadata alone must refuse it.
+        let big = root.join("big.bin");
+        let file = std::fs::File::create(&big).unwrap();
+        file.set_len(MAX_ASSET_BYTES).unwrap();
+        drop(file);
+        let err = check_release_assets(std::slice::from_ref(&big))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("2 GiB"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The streamed digest is the same SHA-256 a whole-buffer hash produces.
+    #[test]
+    fn release_asset_hash_is_streamed() {
+        let root = scratch("release-asset-hash");
+        let file = root.join("known.bin");
+        std::fs::write(&file, b"abc").unwrap();
+        // sha256("abc"), well-known.
+        assert_eq!(
+            sha256_file(&file).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
