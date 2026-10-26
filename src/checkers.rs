@@ -67,6 +67,10 @@ pub struct Context {
     /// For `release`: the tag being published and the commit it points at.
     pub release_tag: Option<String>,
     pub release_commit: Option<String>,
+    /// For `release`: the assets bound to this release as
+    /// `(name, size, sha256)` tuples, hashed before the audit so the evidence
+    /// names the exact bytes the publish may carry.
+    pub release_assets: Vec<(String, u64, String)>,
     /// For `commit-msg`/`prepare-commit-msg`: the message file git hands the
     /// hook (argv[0]) and its composition source (argv[1]: `message`,
     /// `template`, `merge`, `squash` or `commit` for `-c/-C` reuse).
@@ -321,6 +325,7 @@ mod tests {
             pr_number: Some("7".into()),
             release_tag: Some("v1.0.0".into()),
             release_commit: Some("c0ffee".into()),
+            release_assets: Vec::new(),
             commit_message_file: None,
             commit_message_source: None,
         }

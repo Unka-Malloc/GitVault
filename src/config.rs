@@ -246,6 +246,12 @@ pub struct Config {
     /// built directly in a test has no path and skips that check.
     #[serde(skip)]
     pub(crate) path: Option<PathBuf>,
+    /// The SHA-256 of the bytes this table was parsed from. The credential
+    /// broker verifies the signature against a buffer whose digest matches
+    /// this value, so a file swapped between parse and credential issuance
+    /// can never launder stale routing data through a fresh signature check.
+    #[serde(skip)]
+    pub(crate) source_digest: Option<[u8; 32]>,
 }
 
 /// The single authority for GitVault's configuration directory:
@@ -426,6 +432,14 @@ impl Config {
         Ok(cfg)
     }
 
+    /// The digest of the buffer `load_path` parsed, bound onto the config.
+    fn bind_digest(cfg: &mut Self, raw: &str) {
+        use sha2::Digest as _;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(raw.as_bytes());
+        cfg.source_digest = Some(hasher.finalize().into());
+    }
+
     /// Parse and classify without consulting the signature anchor. Audit
     /// surfaces take this so the audits can run and be shown BEFORE the
     /// operator is asked to bless the file; the returned signature state is
@@ -471,9 +485,10 @@ impl Config {
                 path.display()
             );
         }
-        let cfg: Config = toml::from_str(&raw)
+        let mut cfg: Config = toml::from_str(&raw)
             .with_context(|| format!("invalid configuration in {}", path.display()))?;
         cfg.validate()?;
+        Self::bind_digest(&mut cfg, &raw);
         Ok(cfg)
     }
 

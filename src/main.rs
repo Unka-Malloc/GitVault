@@ -850,6 +850,7 @@ fn context_for(
         pr_number: None,
         release_tag,
         release_commit,
+        release_assets: Vec::new(),
         commit_message_file: matches!(event, "commit-msg" | "prepare-commit-msg")
             .then(|| hook_args.first().map(PathBuf::from))
             .flatten(),
@@ -2637,25 +2638,63 @@ fn cmd_config_verify(config: Option<&PathBuf>) -> anyhow::Result<ExitCode> {
 /// - A file ever executed while root-owned is provenance-poisoned
 ///   permanently; only a fresh inode clears the record, so overwriting in
 ///   place can never cure it.
+// The SHA-256 of `path` as it stands, for the post-install verification the
+// privileged step demands.
+fn installed_digest(path: &Path) -> anyhow::Result<[u8; 32]> {
+    use sha2::Digest as _;
+    let bytes = std::fs::read(path).with_context(|| format!("cannot hash {}", path.display()))?;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&bytes);
+    Ok(hasher.finalize().into())
+}
+
 fn install_atomic(src: &Path, target: &Path, mode: u32) -> anyhow::Result<()> {
-    let tmp = target.with_extension(format!("staging-{}", std::process::id()));
-    // The staging file must not exist already: a planted symlink there would
-    // turn the copy into a write through it. `create_new` refuses any entry.
-    if std::fs::OpenOptions::new()
+    use std::io::Write as _;
+    use std::os::unix::fs::MetadataExt as _;
+    // An unpredictable name plus `create_new` keeps a planted entry from
+    // steering the write; the stamp makes a pre-created attacker file
+    // statistically impossible rather than merely refusing a stale one.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|e| e.as_nanos())
+        .unwrap_or(0);
+    let tmp = target.with_extension(format!("staging-{}-{stamp}", std::process::id()));
+    // The handle is held for the whole staging: a same-user process can
+    // rename over the path, but it cannot replace what this descriptor
+    // writes to, and the inode compare below catches the rename before the
+    // staged bytes are swapped into place.
+    let mut staged = match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&tmp)
-        .is_err()
     {
-        anyhow::bail!(
-            "staging path {} already exists - refusing to install over it",
+        Ok(file) => file,
+        Err(_) => {
+            anyhow::bail!(
+                "staging path {} already exists - refusing to install over it",
+                tmp.display()
+            );
+        }
+    };
+    let result = (|| -> anyhow::Result<()> {
+        let bytes = std::fs::read(src)
+            .with_context(|| format!("cannot read {} for staging", src.display()))?;
+        staged
+            .write_all(&bytes)
+            .with_context(|| format!("cannot stage {} for {}", src.display(), target.display()))?;
+        staged.sync_all()?;
+        staged.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        let created = staged.metadata()?;
+        drop(staged);
+        let on_disk = std::fs::symlink_metadata(&tmp)
+            .with_context(|| format!("staged file {} vanished before install", tmp.display()))?;
+        anyhow::ensure!(
+            on_disk.is_file()
+                && !on_disk.file_type().is_symlink()
+                && on_disk.ino() == created.ino(),
+            "staged file {} was replaced before install - refusing",
             tmp.display()
         );
-    }
-    let result = (|| -> anyhow::Result<()> {
-        std::fs::copy(src, &tmp)
-            .with_context(|| format!("cannot stage {} for {}", src.display(), target.display()))?;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
         std::fs::rename(&tmp, target).with_context(|| {
             format!(
                 "cannot move {} into place at {}",
@@ -2663,6 +2702,16 @@ fn install_atomic(src: &Path, target: &Path, mode: u32) -> anyhow::Result<()> {
                 target.display()
             )
         })?;
+        // The installed bytes must still be the staged bytes: a same-user
+        // rename between the swap and this read lands a foreign binary at
+        // the trusted path, which the schg step would then immobilise.
+        let installed = std::fs::read(target)
+            .with_context(|| format!("cannot verify installed {}", target.display()))?;
+        anyhow::ensure!(
+            installed == bytes,
+            "installed {} was replaced before verification - refusing",
+            target.display()
+        );
         Ok(())
     })();
     if result.is_err() {
@@ -2888,6 +2937,22 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
     //      trusts a root-owned public key, which is the property that makes the
     //      trust root un-repointable. Ownership was already restored to the
     //      invoking user above, before the copies.
+    //
+    //    The bytes the immutable flag lands on must be the bytes this run
+    //    installed. A same-user process can rename over a target between the
+    //    copy and this privileged step, so each file is hashed here and the
+    //    flag is refused rather than applied to a swapped-in binary. The
+    //    second check after chflags closes the residual window: a swap that
+    //    slipped in is detected, unlocked and refused.
+    let mut staged_digests: Vec<(PathBuf, [u8; 32])> = Vec::new();
+    for path in &immobilise {
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            continue;
+        };
+        if meta.is_file() && !meta.file_type().is_symlink() {
+            staged_digests.push((path.clone(), installed_digest(path)?));
+        }
+    }
     let status = std::process::Command::new("sudo")
         .args(["chflags", "-R", "schg"])
         .args(&immobilise)
@@ -2895,6 +2960,19 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
         .context("failed to invoke sudo - enter the login password when asked")?;
     if !status.success() {
         anyhow::bail!("sudo chflags failed; nothing below was applied");
+    }
+    for (path, expected) in &staged_digests {
+        let now = installed_digest(path).unwrap_or_default();
+        if &now != expected {
+            let _ = std::process::Command::new("sudo")
+                .args(["chflags", "noschg"])
+                .arg(path)
+                .status();
+            anyhow::bail!(
+                "{} changed between staging and the immutable flag - the install is refused",
+                path.display()
+            );
+        }
     }
     let mut anchor_ok = false;
     if anchor_armed {
@@ -3638,7 +3716,7 @@ fn cmd_release(
         // Asset files are judged before the audit: a bad path refuses before
         // any review time or credential is spent.
         let assets = check_release_assets(assets)?;
-        let ctx = context_for(
+        let mut ctx = context_for(
             &cfg,
             "release",
             &PathBuf::from("."),
@@ -3653,6 +3731,13 @@ fn cmd_release(
                      run this from the tagged working tree"
             )
         })?;
+        // The audit binds the exact asset bytes: name, size and digest go into
+        // the evidence, and the upload refuses a file whose digest no longer
+        // matches, so published bytes are the bytes the evidence named.
+        ctx.release_assets = assets
+            .iter()
+            .map(|a| (a.name.clone(), a.size, a.sha256.clone()))
+            .collect();
         let repo_root = ctx.repo_root.clone();
         let audited = ctx
             .release_commit
@@ -3710,7 +3795,11 @@ fn cmd_release(
             // A new tag is created at the commit the audit reviewed, not at
             // whatever the target repository's default branch happens to be.
             r.fields.push(("target_commitish".into(), audited.clone()));
-            r.raw_fields.push(("draft".into(), draft.to_string()));
+            // Every release is created as a draft: assets upload while it is
+            // invisible, the tag is re-verified against the audited commit,
+            // and only then is the release published. A failure deletes the
+            // draft rather than leaving a half-uploaded release public.
+            r.raw_fields.push(("draft".into(), "true".to_string()));
             r.raw_fields
                 .push(("prerelease".into(), prerelease.to_string()));
             if let Some(n) = name {
@@ -3719,11 +3808,19 @@ fn cmd_release(
             if let Some(b) = notes {
                 r.fields.push(("body".into(), b));
             }
-            if assets.is_empty() {
-                r
-            } else {
-                return create_release_with_assets(&cfg, &vault, &slug, r, assets);
-            }
+            return create_release_staged(
+                &cfg,
+                &vault,
+                &slug,
+                r,
+                &StagedRelease {
+                    repo_root: repo_root.as_path(),
+                    audited: audited.as_str(),
+                    tag: &tag,
+                    assets,
+                    keep_draft: draft,
+                },
+            );
         }
         ReleaseCommand::Delete { tag } => {
             // Deleting a release needs its numeric id, so resolve it first. Two
@@ -3747,18 +3844,48 @@ fn cmd_release(
 }
 
 /// What a release audit settles before the create request is built: the
-/// checkout it ran in, the commit it judged, and the verified asset files.
+/// checkout it ran in, the commit it judged, and the digest-bound asset files.
 struct ReleaseAudit {
     repo_root: PathBuf,
     audited: String,
-    assets: Vec<(PathBuf, String)>,
+    assets: Vec<ReleaseAsset>,
+}
+
+/// What the release audit binds: the asset's upload name, size and content
+/// digest, computed before the audit so the evidence names the exact bytes
+/// that may be published. The upload re-hashes each file and refuses a
+/// mismatch, so the published bytes are the audited digest.
+#[derive(Debug, Clone)]
+struct ReleaseAsset {
+    path: PathBuf,
+    name: String,
+    size: u64,
+    sha256: String,
+}
+
+impl ReleaseAsset {
+    /// The digest of the file right now, hex-encoded like the audited one.
+    fn current_digest(&self) -> anyhow::Result<String> {
+        use sha2::Digest as _;
+        let bytes = std::fs::read(&self.path)
+            .with_context(|| format!("cannot re-hash asset '{}'", self.path.display()))?;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(&bytes);
+        Ok(hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect())
+    }
 }
 
 /// Pair each `--asset` file with the name GitHub will store - the file's
-/// basename. Run before the release is created so a bad path refuses before
-/// anything is published.
-fn check_release_assets(paths: &[PathBuf]) -> anyhow::Result<Vec<(PathBuf, String)>> {
-    let mut out = Vec::with_capacity(paths.len());
+/// basename - plus the size and digest that bind its bytes to the audit.
+/// Run before the release is created so a bad path or a duplicate upload
+/// name refuses before anything is published.
+fn check_release_assets(paths: &[PathBuf]) -> anyhow::Result<Vec<ReleaseAsset>> {
+    use sha2::Digest as _;
+    let mut out: Vec<ReleaseAsset> = Vec::with_capacity(paths.len());
     for path in paths {
         let name = path
             .file_name()
@@ -3768,52 +3895,130 @@ fn check_release_assets(paths: &[PathBuf]) -> anyhow::Result<Vec<(PathBuf, Strin
                 anyhow::anyhow!("--asset '{}' has no usable file name", path.display())
             })?;
         anyhow::ensure!(
-            std::fs::metadata(path).is_ok_and(|m| m.is_file()),
-            "--asset '{}' is not a readable file",
+            !out.iter().any(|a| a.name == name),
+            "--asset names the upload '{name}' twice"
+        );
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("--asset '{}' is not a readable file", path.display()))?;
+        anyhow::ensure!(
+            std::fs::symlink_metadata(path)
+                .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink()),
+            "--asset '{}' is not a regular file",
             path.display()
         );
-        out.push((path.clone(), name.to_string()));
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(&bytes);
+        out.push(ReleaseAsset {
+            path: path.clone(),
+            name: name.to_string(),
+            size: bytes.len() as u64,
+            sha256: hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+        });
     }
     Ok(out)
 }
 
-/// Create the release, then upload each asset onto it. The asset endpoint
-/// lives on the upload origin and is addressed by the created release's id,
-/// so the create request runs for its value instead of being printed.
-fn create_release_with_assets(
+/// Create the release as a draft, upload each verified asset, re-verify the
+/// tag still names the audited commit, then publish - unless `--draft` asked
+/// the release to stay invisible. The draft keeps a half-uploaded or
+/// tag-moved release from ever becoming public: any failure deletes it.
+/// The verified release context a staged publish needs beyond the request:
+/// where the audit ran, the commit it judged, the tag being created and the
+/// digest-bound assets.
+struct StagedRelease<'a> {
+    repo_root: &'a Path,
+    audited: &'a str,
+    tag: &'a str,
+    assets: &'a [ReleaseAsset],
+    keep_draft: bool,
+}
+
+fn create_release_staged(
     cfg: &config::Config,
     vault: &vault::Vault,
     slug: &str,
     mut req: api::Request,
-    assets: &[(PathBuf, String)],
+    staged: &StagedRelease<'_>,
 ) -> anyhow::Result<ExitCode> {
     req.jq = Some(".id, .html_url".into());
     let created = api::run_value(cfg, vault, &req)?;
     let mut lines = created.lines();
-    let id = lines.next().unwrap_or_default().trim();
+    let id = lines.next().unwrap_or_default().trim().to_string();
     anyhow::ensure!(!id.is_empty(), "the created release reported no id");
-    if let Some(url) = lines.next() {
-        println!("{}", url.trim());
+    let stage = (|| -> anyhow::Result<()> {
+        for asset in staged.assets {
+            // The published bytes must be the audited digest: re-hash at
+            // upload time so a same-user swap cannot ride the release.
+            let now = asset.current_digest()?;
+            anyhow::ensure!(
+                now == asset.sha256,
+                "asset '{}' changed after the audit ({}) - refusing to publish it",
+                asset.name,
+                asset.path.display()
+            );
+            let mut up = get(
+                format!(
+                    "{}/repos/{slug}/releases/{id}/assets?name={}",
+                    api::UPLOAD_ROOT,
+                    api::percent_encode(&asset.name)
+                ),
+                slug.to_string(),
+                Some(".browser_download_url".into()),
+            );
+            up.method = "POST".into();
+            up.data_file = Some(asset.path.clone());
+            up.headers
+                .push("Content-Type: application/octet-stream".into());
+            let url = api::run_value(cfg, vault, &up)
+                .with_context(|| format!("uploading release asset '{}'", asset.name))?;
+            println!("{}", url.trim());
+        }
+        // The tag could have moved between the pre-create check and now; the
+        // publish is refused rather than attached to unaudited content.
+        verify_remote_tag(staged.repo_root, slug, staged.tag, staged.audited)?;
+        Ok(())
+    })();
+    if let Err(why) = stage {
+        delete_release_quietly(cfg, vault, slug, &id);
+        return Err(why.context("the draft release was deleted after the staged publish failed"));
     }
-    for (path, name) in assets {
-        let mut up = get(
-            format!(
-                "{}/repos/{slug}/releases/{id}/assets?name={}",
-                api::UPLOAD_ROOT,
-                api::percent_encode(name)
-            ),
-            slug.to_string(),
-            Some(".browser_download_url".into()),
+    if staged.keep_draft {
+        if let Some(url) = lines.next() {
+            println!("{}", url.trim());
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut publish = get(
+        format!("/repos/{slug}/releases/{id}"),
+        slug.to_string(),
+        Some(".html_url".into()),
+    );
+    publish.method = "PATCH".into();
+    publish
+        .raw_fields
+        .push(("draft".into(), "false".to_string()));
+    emit(cfg, vault, publish)
+}
+
+/// Best-effort cleanup of a draft that must not be published: a failure here
+/// is reported but cannot hide the original error.
+fn delete_release_quietly(cfg: &config::Config, vault: &vault::Vault, slug: &str, id: &str) {
+    let mut delete = get(
+        format!("/repos/{slug}/releases/{id}"),
+        slug.to_string(),
+        None,
+    );
+    delete.method = "DELETE".into();
+    delete.silent = true;
+    if let Err(why) = api::run(cfg, vault, &delete) {
+        eprintln!(
+            "gitvault: warning - the failed draft release {id} could not be deleted: {why:#}"
         );
-        up.method = "POST".into();
-        up.data_file = Some(path.clone());
-        up.headers
-            .push("Content-Type: application/octet-stream".into());
-        let url = api::run_value(cfg, vault, &up)
-            .with_context(|| format!("uploading release asset '{name}'"))?;
-        println!("{}", url.trim());
     }
-    Ok(ExitCode::SUCCESS)
 }
 
 fn cmd_run(
@@ -4455,16 +4660,18 @@ mod tests {
 
     /// `--asset` files are paired with their basename before the release is
     /// created, so a missing file or a directory refuses before anything is
-    /// published.
+    /// published. The digest is what binds the audited bytes to the upload.
     #[test]
     fn release_assets_are_checked_before_the_create() {
         let root = scratch("release-assets");
         let file = root.join("app-v1.0.zip");
         std::fs::write(&file, b"zip").unwrap();
-        assert_eq!(
-            check_release_assets(std::slice::from_ref(&file)).unwrap(),
-            vec![(file, "app-v1.0.zip".to_string())]
-        );
+        let assets = check_release_assets(std::slice::from_ref(&file)).unwrap();
+        assert_eq!(assets.len(), 1);
+        assert_eq!(assets[0].name, "app-v1.0.zip");
+        assert_eq!(assets[0].size, 3);
+        assert_eq!(assets[0].sha256.len(), 64);
+        assert_eq!(assets[0].current_digest().unwrap(), assets[0].sha256);
         assert!(check_release_assets(&[root.join("missing.bin")]).is_err());
         assert!(check_release_assets(std::slice::from_ref(&root)).is_err());
         let _ = std::fs::remove_dir_all(&root);

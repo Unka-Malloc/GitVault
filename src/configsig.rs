@@ -90,13 +90,16 @@ pub fn account_home() -> Result<PathBuf> {
 
 /// Whether an executable may be trusted to answer a security question.
 ///
-/// The property is root ownership or the *system* immutable flag (`schg`).
-/// The user immutable flag (`uchg`) is deliberately not enough: the same user
-/// who would replace the binary can clear that flag without a password. Both
-/// the audit engine and the biometric helper are separate executables that a
-/// same-user process could otherwise rewrite; `gitvault install` gives an
-/// existing one `schg`, and this check makes that lock a runtime requirement
-/// rather than an install-order convention.
+/// The property is the *system* immutable flag (`schg`), or root ownership on
+/// a path whose whole parent chain is protected from this user. The user
+/// immutable flag (`uchg`) is deliberately not enough: the same user who
+/// would replace the binary can clear that flag without a password. Root
+/// ownership alone is not enough either when the file sits in a directory this
+/// user can write: ownership of an inode does not pin a name, and a same-user
+/// process can rename a different binary over the path between this check and
+/// the exec that trusts it. `gitvault install` gives an existing binary
+/// `schg`; for a root-owned file in a root-owned, non-user-writable chain
+/// (`/usr/bin`) the name cannot be swapped without root.
 ///
 /// The path itself is judged, never a target it links to: the lookup uses
 /// `symlink_metadata` and requires a regular, non-symlink file. Otherwise a
@@ -114,12 +117,17 @@ pub fn executable_is_trusted(path: &Path) -> bool {
     {
         use std::os::macos::fs::MetadataExt as _;
         use std::os::unix::fs::MetadataExt as _;
-        trusted_executable_owner(meta.uid(), meta.st_flags())
+        if trusted_executable_locked(meta.st_flags()) {
+            return true;
+        }
+        // Without schg the name itself must be protected: root-owned and no
+        // ancestor this user could rename through.
+        meta.uid() == 0 && !path_is_user_replaceable(path)
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         use std::os::unix::fs::MetadataExt as _;
-        meta.uid() == 0
+        meta.uid() == 0 && !path_is_user_replaceable(path)
     }
     #[cfg(not(unix))]
     {
@@ -127,12 +135,35 @@ pub fn executable_is_trusted(path: &Path) -> bool {
     }
 }
 
-/// The trust decision with the metadata already read. Split out so the
-/// `schg`-but-not-root case is testable without invoking `sudo`.
+/// The `schg` half of the trust decision with the metadata already read. Split
+/// out so the flag check is testable without invoking `sudo`.
 #[cfg(target_os = "macos")]
-fn trusted_executable_owner(uid: u32, flags: u32) -> bool {
+fn trusted_executable_locked(flags: u32) -> bool {
     const SF_IMMUTABLE: u32 = 0x0002_0000;
-    uid == 0 || flags & SF_IMMUTABLE != 0
+    flags & SF_IMMUTABLE != 0
+}
+
+/// Whether any ancestor of `path` lets a non-root user rename entries. A
+/// root-owned file below such a directory can have its name swapped for
+/// another inode between a trust check and exec, so ownership of the file
+/// alone cannot be trusted there.
+#[cfg(unix)]
+fn path_is_user_replaceable(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut dir = path.parent();
+    while let Some(d) = dir {
+        let Ok(meta) = std::fs::metadata(d) else {
+            return true;
+        };
+        // Non-root ownership, or group/other write: someone other than root
+        // can rename the directory's entries. Root-owned 0755 chains are the
+        // trusted shape (`/usr`, `/usr/bin`).
+        if meta.uid() != 0 || meta.mode() & 0o022 != 0 {
+            return true;
+        }
+        dir = d.parent();
+    }
+    false
 }
 
 /// The trusted public anchor. Only meaningful while root-owned: a file any
@@ -237,7 +268,30 @@ pub fn signature_state(config_path: &Path) -> SigState {
             if !sig_path(config_path).exists() {
                 return SigState::Invalid(format!("{} is unsigned", config_path.display()));
             }
-            match verify_signed(config_path, &anchor) {
+            match verify_signed(config_path, None, &anchor) {
+                Ok(()) => SigState::Valid,
+                Err(e) => SigState::Invalid(format!(
+                    "{} failed signature verification: {e:#}",
+                    config_path.display()
+                )),
+            }
+        }
+    }
+}
+
+/// [`signature_state`] over caller-supplied bytes instead of a fresh read. The
+/// credential broker uses this so the buffer it authorized from is the buffer
+/// the signature was checked against - a file replaced between the parse and
+/// the credential moment cannot pass on a different signed copy.
+pub fn signature_state_for(config_path: &Path, data: &[u8]) -> SigState {
+    let anchor = anchor_path();
+    match anchor_state(&anchor) {
+        Anchor::Absent | Anchor::Unanchored => SigState::Inactive,
+        Anchor::Anchored => {
+            if !sig_path(config_path).exists() {
+                return SigState::Invalid(format!("{} is unsigned", config_path.display()));
+            }
+            match verify_signed(config_path, Some(data), &anchor) {
                 Ok(()) => SigState::Valid,
                 Err(e) => SigState::Invalid(format!(
                     "{} failed signature verification: {e:#}",
@@ -272,9 +326,10 @@ pub fn verify(config_path: &Path) -> Result<()> {
     }
 }
 
-/// Verify `config_path` against the signature sidecar under `anchor`. The root
+/// Verify `config_path` against its signature sidecar under `anchor`. The root
 /// -ownership gate lives in `verify`; this is the ssh-keygen step itself.
-fn verify_signed(config_path: &Path, anchor: &Path) -> Result<()> {
+/// `data` supplies the bytes to verify; `None` reads the file at this moment.
+fn verify_signed(config_path: &Path, data: Option<&[u8]>, anchor: &Path) -> Result<()> {
     let sig = sig_path(config_path);
     if !sig.exists() {
         bail!("no signature sidecar at {}", sig.display());
@@ -297,13 +352,20 @@ fn verify_signed(config_path: &Path, anchor: &Path) -> Result<()> {
         .context("failed to run ssh-keygen -Y verify")?;
     {
         use std::io::Write;
-        let data = std::fs::read(config_path)
-            .with_context(|| format!("cannot read {}", config_path.display()))?;
+        let owned;
+        let data = match data {
+            Some(data) => data,
+            None => {
+                owned = std::fs::read(config_path)
+                    .with_context(|| format!("cannot read {}", config_path.display()))?;
+                &owned
+            }
+        };
         child
             .stdin
             .as_mut()
             .expect("stdin was piped")
-            .write_all(&data)
+            .write_all(data)
             .context("could not feed the configuration to ssh-keygen")?;
     }
     let out = child
@@ -472,15 +534,15 @@ mod tests {
 
         let sig = sign(&cfg, &private).unwrap();
         assert!(sig.exists());
-        verify_signed(&cfg, &anchor).unwrap();
+        verify_signed(&cfg, None, &anchor).unwrap();
 
         // A single-byte edit must not verify.
         std::fs::write(&cfg, "[rules]\ndefault = \"attacker\"\n").unwrap();
-        assert!(verify_signed(&cfg, &anchor).is_err());
+        assert!(verify_signed(&cfg, None, &anchor).is_err());
 
         // Nor may a missing sidecar pass.
         let _ = std::fs::remove_file(&sig);
-        assert!(verify_signed(&cfg, &anchor).is_err());
+        assert!(verify_signed(&cfg, None, &anchor).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -558,18 +620,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// Root ownership and *system* immutability are the only two properties
-    /// that survive the same-user attacker. A user immutable flag (`uchg`) can
-    /// be cleared by that user without a password, so it must not count.
+    /// Root ownership protects a name only while the whole parent chain is
+    /// also protected; the *system* immutable flag protects it anywhere. A
+    /// user immutable flag (`uchg`) can be cleared by that user without a
+    /// password, so it must not count.
     #[cfg(target_os = "macos")]
     #[test]
     fn only_root_or_system_immutability_trusts_an_executable() {
         const UF_IMMUTABLE: u32 = 0x0000_0002;
         const SF_IMMUTABLE: u32 = 0x0002_0000;
-        assert!(!trusted_executable_owner(501, 0));
-        assert!(!trusted_executable_owner(501, UF_IMMUTABLE));
-        assert!(trusted_executable_owner(501, SF_IMMUTABLE));
-        assert!(trusted_executable_owner(501, SF_IMMUTABLE | UF_IMMUTABLE));
-        assert!(trusted_executable_owner(0, 0));
+        assert!(!trusted_executable_locked(0));
+        assert!(!trusted_executable_locked(UF_IMMUTABLE));
+        assert!(trusted_executable_locked(SF_IMMUTABLE));
+        assert!(trusted_executable_locked(SF_IMMUTABLE | UF_IMMUTABLE));
+    }
+
+    /// A root-owned file in a directory this user can write is still
+    /// replaceable through the name, so ownership alone cannot trust it.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_owned_file_in_a_user_writable_tree_is_not_trusted() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = dir("replaceable-exec");
+        let binary = d.join("helper");
+        std::fs::write(&binary, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The fixture dir is user-owned, so the chain is replaceable even if
+        // the file were chowned to root: ownership of an inode does not pin
+        // the name a same-user process can swap.
+        assert!(path_is_user_replaceable(&binary));
+        assert!(
+            !executable_is_trusted(&binary),
+            "a binary a same-user process can rename over must not be trusted"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

@@ -118,7 +118,11 @@ The engine boundary is deliberately thin and fail-closed:
   from that contract, not copied into GitVault, so an engine-side addition is
   required rather than silently treated as missing coverage. A generic,
   advisory, decorative or partial row is not boundary coverage. The rest of
-  the contract's vocabulary is the engine's published reference.
+  the contract's vocabulary is the engine's published reference. Consumers
+  migrating from GitVault's removed in-tree contract format should read the
+  authoritative schema in the Probator repository at
+  `docs/review-contract.schema.json` — the engine's document is the pinned
+  replacement, versioned with the engine release this GitVault couples to.
 - an armed installation finds the engine only at the installed path
   `~/.local/bin/probator`, which `gitvault install` immobilises with `schg`.
   `PATH` and a build-tree sibling are used only while enforcement is unarmed,

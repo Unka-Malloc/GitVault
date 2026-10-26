@@ -471,6 +471,22 @@ fn actions(ctx: &Context) -> Result<Vec<Value>, String> {
             if detail.is_empty() {
                 return Err("the release audit names neither a tag nor a commit".into());
             }
+            // The assets publish alongside the commit, so the evidence names
+            // their exact bytes: name, size and digest per file. The upload
+            // re-hashes each file against these values before it goes out.
+            if !ctx.release_assets.is_empty() {
+                detail.insert(
+                    "assets".into(),
+                    Value::Array(
+                        ctx.release_assets
+                            .iter()
+                            .map(|(name, size, sha256)| {
+                                json!({"name": name, "size": size, "sha256": sha256})
+                            })
+                            .collect(),
+                    ),
+                );
+            }
             Ok(vec![json!({
                 "kind": "release",
                 "target": target,
@@ -816,6 +832,13 @@ impl AuditLock {
                         let _ = std::fs::remove_dir_all(&path);
                         return Err(format!("cannot record the audit lock owner: {error}"));
                     }
+                    // The boot session is recorded alongside the pid: a lock
+                    // surviving a reboot can name a pid the new session has
+                    // already reused, which a liveness probe alone reads as
+                    // alive forever.
+                    if let Some(boot) = boot_session() {
+                        let _ = std::fs::write(path.join("boot"), boot);
+                    }
                     return Ok(Self { path });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -890,6 +913,38 @@ fn reclaim_stale(path: &Path) {
     }
 }
 
+/// The current boot session, from `kern.boottime`. A pid recorded under a
+/// different boot cannot name a process in this session: the number may have
+/// been reused, so the lock is reclaimable rather than waited on.
+#[cfg(target_os = "macos")]
+fn boot_session() -> Option<String> {
+    let mut tv = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
+    let mut len = std::mem::size_of::<libc::timeval>();
+    let name = std::ffi::CString::new("kern.boottime").ok()?;
+    let ok = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut tv as *mut _ as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (ok == 0).then(|| format!("{}:{}", tv.tv_sec, tv.tv_usec))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn boot_session() -> Option<String> {
+    // /proc uptime resets each boot and needs no platform API.
+    std::fs::read_to_string("/proc/stat").ok().and_then(|stat| {
+        stat.lines()
+            .find_map(|line| line.strip_prefix("btime ").map(str::to_string))
+    })
+}
+
 fn lock_is_stale(path: &Path) -> bool {
     // A live PID keeps its lock no matter how long the audit runs. Only a
     // dead or unreadable owner is reclaimable; a missing or half-written PID
@@ -898,6 +953,14 @@ fn lock_is_stale(path: &Path) -> bool {
         .and_then(|metadata| metadata.modified())
         .ok()
         .and_then(|modified| modified.elapsed().ok());
+    // A lock recorded under a different boot session can never own a live
+    // process now; its pid number may already belong to an unrelated program.
+    if let (Some(current), Ok(recorded)) =
+        (boot_session(), std::fs::read_to_string(path.join("boot")))
+        && recorded.trim() != current
+    {
+        return true;
+    }
     match std::fs::read_to_string(path.join("pid")) {
         Ok(raw) => match raw.trim().parse::<u32>() {
             // A pid outside the signed pid_t range cannot name a process; do
@@ -1212,7 +1275,59 @@ pub fn gates(ctx: &Context) -> Vec<CheckerOutcome> {
             Err(why) => return vec![blocking("probator", why, started)],
         }
     }
-    outcomes(&findings, started)
+    let mut outcomes = outcomes(&findings, started);
+    // The engine's sealed runs are the verifiable record of what the audit
+    // actually spent - invocations, retries, usage and kept receipts live in
+    // those report directories. Naming them in the outcome makes that cost
+    // evidence reachable instead of leaving it unverifiable.
+    let sealed = sealed_runs_since(&profiles_root(), started);
+    if !sealed.is_empty() {
+        let note = format!(
+            "audit evidence sealed under {}: {}",
+            profiles_root().display(),
+            sealed.join(", ")
+        );
+        for outcome in &mut outcomes {
+            if outcome.stdout.is_empty() {
+                outcome.stdout = note.clone();
+            } else {
+                outcome.stdout = format!("{}\n{note}", outcome.stdout);
+            }
+        }
+    }
+    outcomes
+}
+
+/// The engine runs sealed since `started`, as `<checker>/<run>` names. These
+/// are the receipts a cost review verifies the external audit against.
+fn sealed_runs_since(profiles: &Path, started: Instant) -> Vec<String> {
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(started.elapsed())
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    let mut sealed = Vec::new();
+    let Ok(profiles_dir) = std::fs::read_dir(profiles) else {
+        return sealed;
+    };
+    for profile in profiles_dir.flatten() {
+        let Ok(runs) = std::fs::read_dir(profile.path().join("runs")) else {
+            continue;
+        };
+        for run in runs.flatten() {
+            let fresh = std::fs::metadata(run.path())
+                .and_then(|meta| meta.modified())
+                .map(|modified| modified >= cutoff)
+                .unwrap_or(false);
+            if fresh {
+                sealed.push(format!(
+                    "{}/{}",
+                    profile.file_name().to_string_lossy(),
+                    run.file_name().to_string_lossy()
+                ));
+            }
+        }
+    }
+    sealed.sort();
+    sealed
 }
 
 #[cfg(test)]
@@ -1239,6 +1354,7 @@ mod tests {
             pr_number: None,
             release_tag: None,
             release_commit: None,
+            release_assets: Vec::new(),
             commit_message_file: None,
             commit_message_source: None,
         }

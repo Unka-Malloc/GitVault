@@ -137,6 +137,13 @@ pub fn path_has_traversal(path: &str) -> bool {
     decoded.contains('%')
         || decoded.contains('\\')
         || decoded.chars().any(char::is_control)
+        // curl glob metacharacters would let one classified path expand into
+        // requests to other routes at the transport layer. The transport also
+        // runs with --globoff; this keeps the ambiguity out of the path itself.
+        || decoded.contains('{')
+        || decoded.contains('}')
+        || decoded.contains('[')
+        || decoded.contains(']')
         || decoded
             .split('/')
             .any(|segment| segment == "." || segment == "..")
@@ -201,13 +208,38 @@ pub struct Request {
 /// unsigned or tampered table spend the vault on a metadata read before the
 /// gate refuses.
 fn authorize(cfg: &Config, target: &Target, vault: &Vault) -> Result<String> {
-    if let Some(path) = cfg.path.as_deref()
-        && let crate::configsig::SigState::Invalid(reason) = crate::configsig::signature_state(path)
-    {
-        bail!(
-            "refusing to spend a credential for an uncertified routing table\n  \
-             {reason}\n  bless it: gitvault config sign"
+    if let Some(path) = cfg.path.as_deref() {
+        // The signature is checked against the bytes this `Config` was parsed
+        // from, not a fresh read of the path: a file swapped between the gate
+        // boundary and this credential moment must not launder stale routing
+        // through a different signed copy. `data` is that same buffer, so a
+        // current-file read that happens to verify is never what authorizes.
+        let data =
+            std::fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+        let same_source = cfg
+            .source_digest
+            .map(|expected| {
+                use sha2::Digest as _;
+                let mut hasher = sha2::Sha256::new();
+                hasher.update(&data);
+                expected == <[u8; 32]>::from(hasher.finalize())
+            })
+            // A `Config` without a bound digest (a test fixture) cannot bind
+            // a snapshot; fall back to the file check.
+            .unwrap_or(true);
+        anyhow::ensure!(
+            same_source,
+            "the routing table changed since it was parsed; refusing to spend \
+             a credential on stale routing data - reload and retry"
         );
+        if let crate::configsig::SigState::Invalid(reason) =
+            crate::configsig::signature_state_for(path, &data)
+        {
+            bail!(
+                "refusing to spend a credential for an uncertified routing table\n  \
+                 {reason}\n  bless it: gitvault config sign"
+            );
+        }
     }
     let token = match target {
         Target::Repo(slug) => {
@@ -290,6 +322,10 @@ fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, String)> 
 
     let mut args: Vec<String> = vec![
         "-sS".into(),
+        // One request carries one URL: curl's `{}`/`[]` globbing could expand
+        // a single classified path into requests to routes the publication
+        // check never saw (e.g. a `releases` write riding inside a read).
+        "--globoff".into(),
         "-X".into(),
         req.method.to_ascii_uppercase(),
         // The token arrives on stdin, never in argv.
@@ -813,6 +849,7 @@ mod tests {
             audit_policy: None,
             record_dir: None,
             path: None,
+            source_digest: None,
         };
         let repo = Repo::for_test("/tmp/x", Some("git@github.com:Attacker/Repo.git"));
         let outcome = crate::identity::resolve(&cfg, &repo, false).unwrap();

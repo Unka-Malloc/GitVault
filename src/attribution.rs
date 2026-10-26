@@ -548,20 +548,62 @@ fn strip_attribution(text: &str) -> Option<(String, Vec<String>)> {
     Some((format!("{}\n", joined.trim_end_matches('\n')), removed))
 }
 
-/// Replace `file` with `contents` atomically: a temp file in the same
-/// directory, the original's mode copied over, then a rename. Errors leave
-/// the message untouched — a scrub the hook cannot complete never refuses.
+/// Replace `file` with `contents` atomically: an unpredictable, exclusive,
+/// no-follow temp file in the same directory, the original's mode copied
+/// over, then a rename onto the verified same inode. Errors leave the
+/// message untouched — a scrub the hook cannot complete never refuses.
+///
+/// The temp name carries the pid and a nanosecond stamp so a planted symlink
+/// cannot aim the write at another user-writable file, `create_new` refuses
+/// any pre-existing entry (a link included), and the staged inode is checked
+/// for symlinks before it is swapped in. `.git` is attacker-writable to a
+/// same-user process, so the rewrite must not trust names it did not create.
 fn rewrite_message_file(file: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
     let dir = file.parent().unwrap_or_else(|| std::path::Path::new("."));
     let stem = file
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "COMMIT_EDITMSG".to_string());
-    let tmp = dir.join(format!(".ai-attribution-{stem}-{}", std::process::id()));
-    std::fs::write(&tmp, contents)?;
-    let result = std::fs::metadata(file)
-        .and_then(|meta| std::fs::set_permissions(&tmp, meta.permissions()))
-        .and_then(|()| std::fs::rename(&tmp, file));
+    // The message file itself must be a regular file: rewriting a symlink's
+    // target through the rename is harmless, but `metadata` below must copy
+    // the mode of the real file, not follow a planted link.
+    let target_meta = std::fs::symlink_metadata(file)?;
+    if target_meta.file_type().is_symlink() || !target_meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "commit message file is not a regular file",
+        ));
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|e| e.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(
+        ".ai-attribution-{stem}-{}-{stamp}",
+        std::process::id()
+    ));
+    let mut staged = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    let result = (|| -> std::io::Result<()> {
+        staged.write_all(contents.as_bytes())?;
+        staged.sync_all()?;
+        staged.set_permissions(target_meta.permissions())?;
+        drop(staged);
+        // The staged inode is the one checked: regular, non-symlink, created
+        // by this process. Re-verify at rename time so a swap between the
+        // write and the rename cannot land a foreign file.
+        let staged_meta = std::fs::symlink_metadata(&tmp)?;
+        if staged_meta.file_type().is_symlink() || !staged_meta.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "staged message file was replaced",
+            ));
+        }
+        std::fs::rename(&tmp, file)
+    })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -843,6 +885,7 @@ mod tests {
             pr_number: None,
             release_tag: None,
             release_commit: None,
+            release_assets: Vec::new(),
             commit_message_file: Some(dir.0.join("MSG")),
             commit_message_source: source.map(str::to_string),
         }
