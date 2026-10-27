@@ -216,9 +216,9 @@ so that bypass is outside what this tool can observe. It does not remove a
 server-side protection it cannot replace: if an existing GitHub ruleset
 requires the removed `gitvault/audited` status, keep it until an equivalent
 required check exists, then replace it deliberately; do not drop the
-requirement first. `GIT_IDENTITY_GUARD_CHAINED=1`
-skips the gateway call entirely (it exists as the chain's own recursion guard);
-it is the same class: a bypass the local gate does not observe. The boundaries
+requirement first. A repository-local hook runs only after the gate, and it
+cannot suppress a nested invocation: the dispatcher always calls the gate, so a
+local hook that starts `git push` is audited like any other push. The boundaries
 GitVault controls outright — `pr create`, `pr merge` and `release create` —
 run the audit before the publishing request and refuse without publishing.
 A merge fetches the request's head and, when `--base` is omitted, reads the
@@ -240,7 +240,10 @@ The remaining commands — `api`, `repo`, `issue` and `ssh` — do **not** reach
 the audit engine, and `api` additionally *refuses* every request that
 would publish: content writes (`contents`, `git/*`), ref-moving endpoints
 (`merges`, `merge-upstream`, `pulls` create/merge/update-branch), releases,
-and commit statuses, so the broker cannot publish around the gate. The path is
+commit statuses, workflow dispatches (`dispatches`,
+`actions/workflows/*/dispatches`), and the GraphQL endpoint outright —
+mutations there cannot be told from queries without parsing the body, so
+`/graphql` is refused rather than classified. The path is
 percent-decoded and matched on the route the server will see; an encoded
 separator, an encoded route name, or a percent escape that survives one decode
 refuses anywhere in the path, including owner/repo. A token

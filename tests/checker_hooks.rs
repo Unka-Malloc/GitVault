@@ -12,9 +12,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 struct Fixture(PathBuf);
+
+/// Audit records live next to the repo, never inside it: the gate refuses a
+/// record directory that resolves inside the reviewed tree, so the fixture
+/// points `record_dir` at this sibling.
+fn record_dir(root: &Path) -> PathBuf {
+    PathBuf::from(format!("{}-runs", root.display()))
+}
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+        let _ = std::fs::remove_dir_all(record_dir(&self.0));
     }
 }
 
@@ -82,7 +90,7 @@ fn write_config(root: &Path, expected_email: &str) {
             "record_dir = '{}'\n\
              [identities.fixture]\nname = 'Synthetic'\nemail = '{expected_email}'\n\
              [[rules.paths]]\nprefix = '{}'\nidentity = 'fixture'\n",
-            root.join("runs").display(),
+            record_dir(root).display(),
             root.display()
         ),
     )
@@ -696,7 +704,7 @@ fn a_run_is_recorded_without_this_machines_paths() {
         String::from_utf8_lossy(&result.stderr)
     );
 
-    let runs: Vec<_> = std::fs::read_dir(root.join("runs"))
+    let runs: Vec<_> = std::fs::read_dir(record_dir(&root))
         .unwrap()
         .flatten()
         .collect();

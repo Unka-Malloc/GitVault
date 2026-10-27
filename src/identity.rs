@@ -193,6 +193,7 @@ mod tests {
                     .collect(),
                 paths: Vec::<PathRule>::new(),
                 default: default.map(str::to_string),
+                release_asset_budget: None,
             },
             audit_policy: None,
             record_dir: None,

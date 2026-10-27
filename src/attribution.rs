@@ -230,9 +230,25 @@ fn outgoing_ranges(ctx: &Context) -> Result<Vec<RangeSpec>, String> {
 }
 
 /// pre-push stdin lines are `<local ref> <local sha> <remote ref> <remote sha>`.
-/// A new remote ref scans everything the local sha has that no remote-tracking
-/// ref does (first push included); a deletion contributes nothing.
+/// A new remote ref scans everything the local sha has that the DESTINATION
+/// remote does not already hold. Scoping matters: excluding commits reachable
+/// from any remote-tracking ref would omit content some other remote holds
+/// while the destination does not - a push could then publish it without the
+/// scan. When no destination remote is known, nothing is excluded: the scan
+/// covers the commit's whole ancestry rather than guess.
 fn push_ranges(ctx: &Context) -> Result<Vec<RangeSpec>, String> {
+    // The exclusion set for a ref the destination does not have yet: only the
+    // tracking refs of the remote actually being pushed to.
+    let exclusion = |local_sha: &str| -> Vec<String> {
+        match ctx.push_remote.as_deref() {
+            Some(remote) => vec![
+                local_sha.to_string(),
+                "--not".into(),
+                format!("--remotes={remote}"),
+            ],
+            None => vec![local_sha.to_string()],
+        }
+    };
     let mut ranges = vec![];
     for line in ctx.stdin.as_deref().unwrap_or("").lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
@@ -244,15 +260,12 @@ fn push_ranges(ctx: &Context) -> Result<Vec<RangeSpec>, String> {
             continue;
         }
         if all_zeros(remote_sha) {
-            ranges.push(vec![
-                local_sha.to_string(),
-                "--not".into(),
-                "--remotes".into(),
-            ]);
+            ranges.push(exclusion(local_sha));
         } else {
             // The remote sha normally resolves locally. When it does not (a
             // remote this checkout never fetched, or a tip the remote moved
-            // since), fall back to the wider set.
+            // since), fall back to the wider set - still scoped to the
+            // destination remote, not every tracking ref this checkout knows.
             let mut spec = vec![format!("{remote_sha}..{local_sha}")];
             if run_git(
                 &ctx.repo_root,
@@ -264,7 +277,7 @@ fn push_ranges(ctx: &Context) -> Result<Vec<RangeSpec>, String> {
             )
             .is_err()
             {
-                spec = vec![local_sha.to_string(), "--not".into(), "--remotes".into()];
+                spec = exclusion(local_sha);
             }
             ranges.push(spec);
         }
@@ -848,6 +861,48 @@ mod tests {
             outcome.stdout
         );
         assert!(outcome.stdout.contains("1 of 1"), "{}", outcome.stdout);
+    }
+
+    /// The exclusion set for a first-push ref covers only the DESTINATION
+    /// remote's tracking refs. A commit some other remote already holds is
+    /// still outgoing toward the destination and must be scanned; excluding
+    /// it would let a push publish a tainted message unaudited.
+    #[test]
+    fn a_push_scans_commits_only_another_remote_holds() {
+        let dir = Dir::new("push-remote-scope");
+        dir.repo();
+        dir.git(&["config", "user.email", "test@example.invalid"]);
+        dir.git(&["config", "user.name", "Test"]);
+        std::fs::write(dir.0.join("base"), "base\n").unwrap();
+        dir.git(&["add", "base"]);
+        dir.git(&["commit", "-qm", "base"]);
+        let base = dir.git(&["rev-parse", "HEAD"]);
+        std::fs::write(dir.0.join("tainted"), "tainted\n").unwrap();
+        dir.git(&["add", "tainted"]);
+        dir.git(&[
+            "commit",
+            "-qm",
+            "feature\n\nCo-authored-by: Claude Code <noreply@anthropic.com>",
+        ]);
+        let head = dir.git(&["rev-parse", "HEAD"]);
+
+        // `other` already tracks the tainted tip; the push goes to `origin`,
+        // which holds only the base. The commit is still outgoing to origin.
+        dir.git(&["update-ref", "refs/remotes/other/main", &head]);
+        dir.git(&["update-ref", "refs/remotes/origin/main", &base]);
+
+        let zeros = "0".repeat(40);
+        let mut push = ctx(&dir, "pre-push", None);
+        push.push_remote = Some("origin".into());
+        push.stdin = Some(format!("refs/heads/main {head} refs/heads/main {zeros}"));
+        let outcome = gate(&push).expect("pre-push runs the attribution gate");
+        match outcome.outcome {
+            OutcomeKind::Failed(_) => {}
+            other => {
+                panic!("a commit another remote holds is still outgoing to origin; got {other:?}")
+            }
+        }
+        assert!(outcome.stdout.contains("co-authored-by trailer"));
     }
 
     // ------------------------------------------------- compose-time scrub

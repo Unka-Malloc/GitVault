@@ -162,13 +162,17 @@ pub fn gates(ctx: &Context) -> Vec<CheckerOutcome> {
         if is_zero(remote_sha) {
             continue; // a new ref publishes new content; nothing is rewritten
         }
-        // A tag never re-points: forward or divergent, the verdict names the
-        // real offense rather than advice to rebase a ref that cannot.
-        if local_ref.starts_with("refs/tags/") {
+        // A tag never re-points, judged by the DESTINATION ref: pushing a
+        // branch ref over an existing remote tag moves the tag even though
+        // the local source is a branch, and a tag source pushed at a branch
+        // destination is an ordinary branch update. Forward or divergent,
+        // the verdict names the real offense rather than advice to rebase a
+        // ref that cannot.
+        if remote_ref.starts_with("refs/tags/") {
             outcomes.push(hit(
                 "history-tag-repoint",
                 format!(
-                    "{remote_ref} re-points tag {local_ref} (remote {remote_sha} → {local_sha}); \
+                    "{local_ref} re-points tag {remote_ref} (remote {remote_sha} → {local_sha}); \
                      tags do not move - push a new tag instead"
                 ),
             ));
@@ -361,6 +365,32 @@ mod tests {
         let c = repo.commit("c");
         let out = gates(&ctx(&repo, format!("refs/tags/v1 {b} refs/tags/v1 {c}")));
         assert_eq!(names(&out), ["history-tag-repoint"]);
+    }
+
+    /// The offense is judged on the destination, not the source: pushing a
+    /// branch ref over an existing remote tag still moves a tag, while a tag
+    /// source pushed at a branch destination is an ordinary branch update.
+    #[test]
+    fn a_tag_repoint_is_judged_by_the_destination_ref() {
+        let repo = Repo::new();
+        let a = repo.commit("a");
+        let b = repo.commit("b");
+        // refs/heads/side -> refs/tags/v1: the remote's tag moves to the
+        // branch tip. A source-side check would read the local ref as a
+        // branch and miss the repoint entirely.
+        let out = gates(&ctx(&repo, format!("refs/heads/side {b} refs/tags/v1 {a}")));
+        assert_eq!(names(&out), ["history-tag-repoint"]);
+        // refs/tags/v2 -> refs/heads/topic: a branch gains tag content. The
+        // branch already exists remotely, so the update is judged on fast
+        // -forward rules, not named a tag move.
+        let out = gates(&ctx(
+            &repo,
+            format!("refs/tags/v2 {b} refs/heads/topic {a}"),
+        ));
+        assert!(
+            !names(&out).contains(&"history-tag-repoint"),
+            "a branch destination is never a tag repoint: {out:?}"
+        );
     }
 
     #[test]

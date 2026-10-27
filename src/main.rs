@@ -694,7 +694,10 @@ fn cmd_resolve(
         println!("{}", serde_json::to_string_pretty(&outcome.to_json())?);
     } else {
         println!("repository : {}", repo.root.display());
-        println!("remote     : {}", repo.remote().unwrap_or("(none)"));
+        println!(
+            "remote     : {}",
+            repo.remote_display().unwrap_or("(none)".to_string())
+        );
         println!(
             "owner      : {}",
             repo.owner().unwrap_or_else(|| "(unparsed)".into())
@@ -2738,6 +2741,43 @@ fn install_atomic(src: &Path, target: &Path, mode: u32) -> anyhow::Result<[u8; 3
 /// (rewritten by every `gitvault config sign`). Probator is installed
 /// separately: GitVault never ships or copies it, but a `probator` and
 /// `probator-agent` already beside the binary join the locked set.
+/// The dispatcher every event stub execs. Two rules it enforces:
+/// - The gateway binary is the fixed install path below, never an
+///   environment override: `GITVAULT_BIN=/bin/true git push` would otherwise
+///   run no gate at all.
+/// - Every dispatcher invocation runs the gate. An inheritable "already
+///   chained" marker used to let repository-controlled hook code suppress
+///   it: a local pre-push hook could start a nested `git push` that then
+///   published without an audit. Nested hooks are simply gated again - the
+///   gate never invokes git operations that would recurse back into a
+///   dispatcher.
+fn dispatcher_script(target: &Path) -> String {
+    format!(
+        "#!/usr/bin/env bash\n\
+         set -u\n\
+         HOOK=\"${{1:?hook name required}}\"; shift || true\n\
+         GITVAULT_BIN=\"{}\"\n\
+         if [ ! -x \"$GITVAULT_BIN\" ]; then\n\
+         \x20 printf 'gitvault: not installed; refusing the action\\n' >&2\n\
+         \x20 exit 1\n\
+         fi\n\
+         \"$GITVAULT_BIN\" hook \"$HOOK\" || exit $?\n\
+         REPO_LOCAL_HOOK=\"$(git rev-parse --show-toplevel 2>/dev/null || true)/.githooks/$HOOK\"\n\
+         if [ -x \"$REPO_LOCAL_HOOK\" ]; then\n\
+         \x20 \"$REPO_LOCAL_HOOK\" \"$@\"; exit $?\n\
+         fi\n\
+         exit 0\n",
+        target.display()
+    )
+}
+
+/// A stub finds its dispatcher by its own location: a caller who redirects
+/// HOME at push time must not point the gate at a substitute _dispatch in a
+/// writable directory.
+fn hook_stub_script(event: &str) -> String {
+    format!("#!/usr/bin/env bash\nexec \"$(dirname -- \"$0\")/_dispatch\" {event} \"$@\"\n")
+}
+
 fn cmd_install() -> anyhow::Result<ExitCode> {
     // The installed surface and the anchor must both live under the account
     // home, even when HOME points somewhere else: a redirect must not split
@@ -2906,34 +2946,12 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
         expected.insert(touchid.clone(), install_atomic(&touchid, &touchid, mode)?);
     }
 
-    // 2. Hook dispatchers, written only when missing: an existing dispatcher is
-    //    an operator's file, not something a reinstall may overwrite.
+    // 2. Hook dispatchers, (re)generated every install: these are this
+    //    program's own files, and a stale one keeps yesterday's resolution
+    //    rules - a dispatcher left over from an earlier install must not keep
+    //    an inheritable skip marker or a $HOME-resolved path.
     let dispatch = hooks.join("_dispatch");
-    if !dispatch.exists() {
-        std::fs::write(
-            &dispatch,
-            "#!/usr/bin/env bash\n\
-             set -u\n\
-             HOOK=\"${1:?hook name required}\"; shift || true\n\
-             # The gateway binary is fixed, never an environment override:\n\
-             # an env-set substitute would let `GITVAULT_BIN=/bin/true git push`\n\
-             # run no gate at all.\n\
-             GITVAULT_BIN=\"$HOME/.local/bin/gitvault\"\n\
-             if [ ! -x \"$GITVAULT_BIN\" ]; then\n\
-             \x20 printf 'gitvault: not installed; refusing the action\\n' >&2\n\
-             \x20 exit 1\n\
-             fi\n\
-             if [ \"${GIT_IDENTITY_GUARD_CHAINED:-0}\" != \"1\" ]; then\n\
-             \x20 \"$GITVAULT_BIN\" hook \"$HOOK\" || exit $?\n\
-             fi\n\
-             REPO_LOCAL_HOOK=\"$(git rev-parse --show-toplevel 2>/dev/null || true)/.githooks/$HOOK\"\n\
-             if [ -x \"$REPO_LOCAL_HOOK\" ]; then\n\
-             \x20 export GIT_IDENTITY_GUARD_CHAINED=1\n\
-             \x20 \"$REPO_LOCAL_HOOK\" \"$@\"; exit $?\n\
-             fi\n\
-             exit 0\n",
-        )?;
-    }
+    std::fs::write(&dispatch, dispatcher_script(&target))?;
     // Scripts land mode 0644 from fs::write; a hook git cannot execute is a
     // gate that silently does not run, so the executable bit is enforced on
     // every install, not only on first write.
@@ -2947,14 +2965,7 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
         "pre-applypatch",
     ] {
         let stub = hooks.join(event);
-        if !stub.exists() {
-            std::fs::write(
-                &stub,
-                format!(
-                    "#!/usr/bin/env bash\nexec \"$HOME/.git-hooks/_dispatch\" {event} \"$@\"\n"
-                ),
-            )?;
-        }
+        std::fs::write(&stub, hook_stub_script(event))?;
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
             .with_context(|| format!("cannot make {} executable", stub.display()))?;
     }
@@ -3248,6 +3259,14 @@ fn publication_surface(method: &str, path: &str) -> Option<String> {
         return Some(format!("{verb} /{path} (curl glob metacharacters)"));
     }
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    // The GraphQL endpoint carries mutations - createRef, updateRef,
+    // mergePullRequest, createRelease - inside a body this classifier cannot
+    // audit, and a read-only query cannot be told from a mutation without
+    // parsing the document. Refuse it outright: a write through `api` would
+    // otherwise publish around the audited commands.
+    if segments.first() == Some(&"graphql") {
+        return Some(format!("{verb} /{path} (GraphQL endpoint)"));
+    }
     // repos/{owner}/{repo}/<surface>/...
     if segments.len() < 3 || segments[0] != "repos" {
         return None;
@@ -3273,6 +3292,11 @@ fn publication_surface(method: &str, path: &str) -> Option<String> {
         // Commit statuses write to the repository's publication surface and
         // can drive server-side checks; the broker refuses them outright.
         Some("statuses") => true,
+        // A repository dispatch, or a workflow dispatch under actions, spends
+        // CI authority: a privileged workflow can run unreviewed code or
+        // publish artifacts on a selected ref without the local gate.
+        Some("dispatches") => true,
+        Some("actions") => verb == "POST" && tail.last() == Some(&"dispatches"),
         _ => false,
     };
     hit.then(|| format!("{verb} /{path}"))
@@ -3339,20 +3363,29 @@ fn cmd_pr(
             ctx.pr_head = Some(audited_head.clone());
             let (resolved_base, base_sha, base_guard) = local_pr_base(&repo_root, &base, &slug)?;
             ctx.pr_base = resolved_base.clone();
-            ctx.pr_base_sha = Some(base_sha);
+            ctx.pr_base_sha = Some(base_sha.clone());
             let (policy, _policy_path, policy_sig) = config::Policy::load_state(&cfg_path, &cfg)?;
             run_publication_gate(&cfg, &cfg_sig, &policy, &policy_sig, &ctx, "pull request")?;
             drop(base_guard);
             // A branch that advances between the fetch and the POST would
             // create a request containing a commit the audit never saw. Read
             // the branch again now; a moved head refuses before anything is
-            // sent.
+            // sent. The base branch is mutable for the same window: a request
+            // created against a moved tip carries a diff the audit never
+            // reviewed, so the remote's base is re-resolved and compared too.
             let latest = fetch_pr_branch_head(&repo_root, &head, &slug)?;
             anyhow::ensure!(
                 latest.eq_ignore_ascii_case(&audited_head),
                 "pull request head '{head}' moved from {audited_head} to {latest} \
                  while the audit ran; nothing was sent - rerun the request"
             );
+            let (_, base_now, base_now_guard) = local_pr_base(&repo_root, &base, &slug)?;
+            anyhow::ensure!(
+                base_now.eq_ignore_ascii_case(&base_sha),
+                "pull request base moved from {base_sha} to {base_now} \
+                 while the audit ran; nothing was sent - rerun the request"
+            );
+            drop(base_now_guard);
             let mut f = vec![("title".to_string(), title), ("head".to_string(), head)];
             if let Some(b) = body {
                 f.push(("body".to_string(), b));
@@ -3366,7 +3399,7 @@ fn cmd_pr(
                 f,
                 vec![("draft".to_string(), draft.to_string())],
                 Some(".html_url".to_string()),
-                Some(audited_head),
+                Some((audited_head, base_sha)),
             )
         }
         PrCommand::List { state, limit, json } => (
@@ -3525,23 +3558,28 @@ fn cmd_pr(
         jq,
         silent: false,
     };
-    // A created pull request carries the head the API actually used. If it
-    // advanced between the last read and the POST, the request contains a
-    // commit the audit never saw: close it and refuse rather than report a
-    // passing publication. The response is read instead of printed so the
-    // head can be judged before the command calls the request open.
-    if let Some(expected) = expected_head {
-        req.jq = Some(".html_url, .head.sha, .number".to_string());
+    // A created pull request carries the head and base the API actually used.
+    // If either advanced between the last read and the POST, the request
+    // contains a commit or a diff base the audit never saw: close it and
+    // refuse rather than report a passing publication. The response is read
+    // instead of printed so both can be judged before the command calls the
+    // request open.
+    if let Some((expected_head, expected_base)) = expected_head {
+        req.jq = Some(".html_url, .head.sha, .base.sha, .number".to_string());
         let body = api::run_value(&cfg, &vault, &req)?;
         let mut lines = body.lines();
         let url = lines.next().unwrap_or_default().trim().to_string();
         let created_head = lines.next().unwrap_or_default().trim().to_string();
+        let created_base = lines.next().unwrap_or_default().trim().to_string();
         let number = lines.next().unwrap_or_default().trim().to_string();
-        if !created_head.eq_ignore_ascii_case(&expected) {
+        if !created_head.eq_ignore_ascii_case(&expected_head)
+            || !created_base.eq_ignore_ascii_case(&expected_base)
+        {
             close_pull_request(&cfg, &vault, &slug, &number);
             anyhow::bail!(
-                "the pull request was created at {created_head}, but the audit reviewed \
-                 {expected}; it has been closed rather than propose unaudited content"
+                "the pull request was created at head {created_head} base {created_base}, \
+                 but the audit reviewed head {expected_head} base {expected_base}; \
+                 it has been closed rather than propose unaudited content"
             );
         }
         if !url.is_empty() {
@@ -3891,7 +3929,7 @@ fn cmd_release(
         // under GitVault's private state root - proven outside this checkout
         // - and kept open: the scan and the upload each consume a share of
         // the same descriptor, never a replaceable path.
-        let mut staged = check_release_assets(assets, &ctx.repo_root)?;
+        let mut staged = check_release_assets(&cfg, assets, &ctx.repo_root)?;
         staged.share_with_audit()?;
         // The audit binds the exact asset bytes: name, size, digest and the
         // inherited-descriptor reference go into the evidence, so the
@@ -4064,6 +4102,10 @@ struct ReleaseAsset {
 /// hashed or requested.
 const MAX_RELEASE_ASSETS: usize = 1000;
 const MAX_ASSET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// The default aggregate budget for one release's assets. Platform limits are
+/// not free local disk and bandwidth: a set past this size is staged only when
+/// the signed rules name a larger `release_asset_budget`.
+const DEFAULT_ASSET_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 
 /// The private directory holding snapshots of the operator's asset files.
 /// Its names are an implementation detail: the audit and the upload reach
@@ -4232,8 +4274,16 @@ fn release_staging_root() -> PathBuf {
 /// basename - plus the size and digest that bind its bytes to the audit.
 /// Run before the release is created so a bad path or a duplicate upload
 /// name refuses before anything is published.
-fn check_release_assets(paths: &[PathBuf], repo_root: &Path) -> anyhow::Result<StagedAssets> {
-    stage_release_assets(paths, repo_root, &release_staging_root())
+fn check_release_assets(
+    cfg: &config::Config,
+    paths: &[PathBuf],
+    repo_root: &Path,
+) -> anyhow::Result<StagedAssets> {
+    let budget = cfg
+        .rules
+        .release_asset_budget
+        .unwrap_or(DEFAULT_ASSET_BUDGET_BYTES);
+    stage_release_assets(paths, repo_root, &release_staging_root(), budget)
 }
 
 /// macOS `uchg`, the only immutable flag an unprivileged owner may set and
@@ -4301,6 +4351,7 @@ fn stage_release_assets(
     paths: &[PathBuf],
     repo_root: &Path,
     staging_root: &Path,
+    budget: u64,
 ) -> anyhow::Result<StagedAssets> {
     anyhow::ensure!(
         paths.len() <= MAX_RELEASE_ASSETS,
@@ -4374,6 +4425,7 @@ fn stage_release_assets(
         assets: Vec::with_capacity(paths.len()),
         shared: Vec::with_capacity(paths.len()),
     };
+    let mut staged_bytes = 0u64;
     for (index, path) in paths.iter().enumerate() {
         let name = path
             .file_name()
@@ -4402,6 +4454,17 @@ fn stage_release_assets(
         anyhow::ensure!(
             meta.len() < MAX_ASSET_BYTES,
             "--asset '{}' exceeds the 2 GiB release-asset limit",
+            path.display()
+        );
+        // The aggregate budget is enforced on declared sizes before any byte
+        // is copied: a set that overflows here stages nothing.
+        staged_bytes += meta.len();
+        anyhow::ensure!(
+            staged_bytes <= budget,
+            "the asset set totals over the {budget} byte release budget \
+             ({} bytes so far, '{}' included) - raise rules.release_asset_budget \
+             in the signed configuration for a deliberately large release",
+            staged_bytes,
             path.display()
         );
         // The snapshot is private from the instant it exists: mode 0600 is
@@ -4994,10 +5057,11 @@ fn latest_report(checker: &str) -> Option<serde_json::Value> {
 mod tests {
     use super::{
         MAX_ASSET_BYTES, MAX_RELEASE_ASSETS, branch_for_api, check_release_assets,
-        fetch_remote_ref, local_pr_base, outgoing_push_stdin, parse_push_args, publication_surface,
-        push_plan, remote_mirrors, sha256_file, sha256_reader, stage_release_assets,
-        verify_remote_tag,
+        dispatcher_script, fetch_remote_ref, hook_stub_script, local_pr_base, outgoing_push_stdin,
+        parse_push_args, publication_surface, push_plan, remote_mirrors, sha256_file,
+        sha256_reader, stage_release_assets, verify_remote_tag,
     };
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -5013,6 +5077,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn cfg() -> crate::config::Config {
+        crate::config::Config::default()
     }
 
     fn git(dir: &std::path::Path, args: &[&str]) -> String {
@@ -5297,13 +5365,13 @@ mod tests {
         let root = scratch("release-assets");
         let file = root.join("app-v1.0.zip");
         std::fs::write(&file, b"zip").unwrap();
-        let staged = check_release_assets(std::slice::from_ref(&file), &root).unwrap();
+        let staged = check_release_assets(&cfg(), std::slice::from_ref(&file), &root).unwrap();
         assert_eq!(staged.assets.len(), 1);
         assert_eq!(staged.assets[0].name, "app-v1.0.zip");
         assert_eq!(staged.assets[0].size, 3);
         assert_eq!(staged.assets[0].sha256.len(), 64);
-        assert!(check_release_assets(&[root.join("missing.bin")], &root).is_err());
-        assert!(check_release_assets(std::slice::from_ref(&root), &root).is_err());
+        assert!(check_release_assets(&cfg(), &[root.join("missing.bin")], &root).is_err());
+        assert!(check_release_assets(&cfg(), std::slice::from_ref(&root), &root).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5318,7 +5386,7 @@ mod tests {
         let root = scratch("release-asset-swap");
         let file = root.join("app-v1.0.zip");
         std::fs::write(&file, b"zip").unwrap();
-        let mut staged = check_release_assets(std::slice::from_ref(&file), &root).unwrap();
+        let mut staged = check_release_assets(&cfg(), std::slice::from_ref(&file), &root).unwrap();
         let digest = staged.assets[0].sha256.clone();
         let dir = staged.dir.as_deref().unwrap();
         let staged_path = dir.join("0000");
@@ -5364,7 +5432,7 @@ mod tests {
         let root = scratch("release-asset-write");
         let file = root.join("app-v1.0.zip");
         std::fs::write(&file, b"zip").unwrap();
-        let staged = check_release_assets(std::slice::from_ref(&file), &root).unwrap();
+        let staged = check_release_assets(&cfg(), std::slice::from_ref(&file), &root).unwrap();
         let digest = staged.assets[0].sha256.clone();
         let staged_path = staged.dir.as_deref().unwrap().join("0000");
         #[cfg(target_os = "macos")]
@@ -5395,7 +5463,7 @@ mod tests {
         std::fs::create_dir_all(&canary).unwrap();
         std::fs::write(canary.join("file"), b"stays").unwrap();
         {
-            let staged = stage_release_assets(&[], &root, &staging_root).unwrap();
+            let staged = stage_release_assets(&[], &root, &staging_root, u64::MAX).unwrap();
             assert!(staged.dir.is_none());
         }
         assert!(
@@ -5415,9 +5483,14 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         let file = root.join("app-v1.0.zip");
         std::fs::write(&file, b"zip").unwrap();
-        let err = stage_release_assets(std::slice::from_ref(&file), &repo, &repo.join("staged"))
-            .unwrap_err()
-            .to_string();
+        let err = stage_release_assets(
+            std::slice::from_ref(&file),
+            &repo,
+            &repo.join("staged"),
+            u64::MAX,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("inside the audited repository"), "{err}");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -5432,7 +5505,9 @@ mod tests {
             .map(|i| PathBuf::from(format!("/definitely/missing/{i}.bin")))
             .collect();
         let root = scratch("release-asset-count");
-        let err = check_release_assets(&many, &root).unwrap_err().to_string();
+        let err = check_release_assets(&cfg(), &many, &root)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("1000"), "{err}");
 
         let root = scratch("release-asset-size");
@@ -5442,7 +5517,7 @@ mod tests {
         let file = std::fs::File::create(&big).unwrap();
         file.set_len(MAX_ASSET_BYTES).unwrap();
         drop(file);
-        let err = check_release_assets(std::slice::from_ref(&big), &root)
+        let err = check_release_assets(&cfg(), std::slice::from_ref(&big), &root)
             .unwrap_err()
             .to_string();
         assert!(err.contains("2 GiB"), "{err}");
@@ -5544,6 +5619,15 @@ mod tests {
             ("POST", "/repos/o/r/releases%252F9"),
             ("POST", "/repos/o%252fr/r/contents/x"),
             ("POST", "/repos/o/r%252f..%252fstatuses/deadbeef"),
+            // CI-authority surfaces: a dispatch can run unreviewed code or
+            // publish artifacts under workflow permissions.
+            ("POST", "/repos/o/r/dispatches"),
+            ("POST", "/repos/o/r/actions/workflows/ci.yml/dispatches"),
+            ("POST", "/repos/o/r/actions/workflows/42/dispatches"),
+            // GraphQL mutations reach every write surface inside a body this
+            // classifier cannot audit; the endpoint is refused outright.
+            ("POST", "/graphql"),
+            ("POST", "https://api.github.com/graphql"),
         ] {
             assert!(
                 publication_surface(method, path).is_some(),
@@ -6067,6 +6151,88 @@ mod tests {
         assert_eq!(plan.refs[0].remote_ref, "refs/heads/main");
         // A selector is the other override git honors.
         assert!(push_plan(&repo, &["origin".into(), "--tags".into()]).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A repository-local hook that starts a nested `git push` must not escape
+    /// the gate: the nested push re-enters the dispatcher, which audits it as
+    /// a publication of its own. The local hook pushes only once (a marker
+    /// file) so the recursion terminates after exactly two gate invocations.
+    #[test]
+    fn a_local_hooks_nested_push_is_gated_again() {
+        let dir = scratch("nested-push");
+        let remote = dir.join("remote.git");
+        let repo = dir.join("repo");
+        let hooks = dir.join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        git(&dir, &["init", "-q", "--bare", remote.to_str().unwrap()]);
+        git(&dir, &["init", "-q", "-b", "main", repo.to_str().unwrap()]);
+        std::fs::write(repo.join("a"), "a").unwrap();
+        git(&repo, &["add", "a"]);
+        git(&repo, &["commit", "-m", "a"]);
+
+        // The gate is a stub executable that records each invocation; the
+        // dispatcher under test is the real generated script pointed at it.
+        let gate = dir.join("gate");
+        let log = dir.join("gate.log");
+        std::fs::write(
+            &gate,
+            format!("#!/bin/sh\necho \"$*\" >> \"{}\"\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gate, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(hooks.join("_dispatch"), dispatcher_script(&gate)).unwrap();
+        std::fs::write(hooks.join("pre-push"), hook_stub_script("pre-push")).unwrap();
+        for script in ["_dispatch", "pre-push"] {
+            std::fs::set_permissions(hooks.join(script), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+
+        // The repository-controlled hook nests one push, guarded by a marker
+        // so the nested dispatch terminates instead of recursing forever.
+        let githooks = repo.join(".githooks");
+        std::fs::create_dir_all(&githooks).unwrap();
+        let mark = dir.join("nested.done");
+        std::fs::write(
+            githooks.join("pre-push"),
+            format!(
+                "#!/bin/sh\n\
+                 if [ ! -f \"{mark}\" ]; then\n\
+                 \x20 touch \"{mark}\"\n\
+                 \x20 git push origin HEAD:refs/heads/nested 2>/dev/null || true\n\
+                 fi\n",
+                mark = mark.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            githooks.join("pre-push"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        git(
+            &repo,
+            &["config", "core.hooksPath", hooks.to_str().unwrap()],
+        );
+        git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&repo, &["push", "origin", "HEAD:refs/heads/main"]);
+
+        // One gate for the outer push, one for the nested push the local
+        // hook started: two invocations, no marker-skipped dispatch.
+        let record = std::fs::read_to_string(&log).unwrap();
+        let entries: Vec<&str> = record.lines().collect();
+        assert_eq!(entries, ["hook pre-push", "hook pre-push"]);
+        // Both refs landed on the remote.
+        assert_eq!(
+            git(&repo, &["ls-remote", "origin", "refs/heads/*"])
+                .lines()
+                .count(),
+            2
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

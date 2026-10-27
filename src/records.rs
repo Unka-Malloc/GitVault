@@ -53,6 +53,86 @@ pub fn run_dir(cfg: &Config) -> PathBuf {
     })
 }
 
+/// Canonicalize what exists and keep the rest verbatim: the record store is
+/// usually absent before the first run, so the boundary has to be judged on
+/// the nearest resolvable ancestor rather than on a path that must exist.
+fn canonicalize_lenient(path: &Path) -> Option<PathBuf> {
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    let mut probe = path.to_path_buf();
+    loop {
+        if let Ok(resolved) = probe.canonicalize() {
+            let mut out = resolved;
+            for part in missing.iter().rev() {
+                out.push(part);
+            }
+            return Some(out);
+        }
+        let file = probe.file_name()?.to_os_string();
+        missing.push(file);
+        if !probe.pop() {
+            return None;
+        }
+    }
+}
+
+/// Where records may live: the effective store must be absolute and resolve
+/// outside the audited checkout and its git common directory. A relative or
+/// in-tree `record_dir` - or an XDG state root redirected into the worktree -
+/// would put audit metadata and captured findings inside the reviewed surface
+/// where a later broad add could publish them. Checked before an audit starts.
+pub fn check_store_location(cfg: &Config, repo_root: &Path) -> Result<()> {
+    let dir = run_dir(cfg);
+    anyhow::ensure!(
+        dir.is_absolute(),
+        "the audit record directory {} must be absolute - it holds persistent \
+         audit metadata that must never land inside a checkout",
+        dir.display()
+    );
+    let store = canonicalize_lenient(&dir).with_context(|| {
+        format!(
+            "cannot resolve the audit record directory {}",
+            dir.display()
+        )
+    })?;
+    let worktree = repo_root
+        .canonicalize()
+        .with_context(|| format!("cannot resolve repository {}", repo_root.display()))?;
+    anyhow::ensure!(
+        !store.starts_with(&worktree),
+        "the audit record directory {} resolves inside the repository {} - \
+         audit metadata does not belong in the reviewed tree",
+        dir.display(),
+        worktree.display()
+    );
+    let common = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .map(|p| {
+            let p = PathBuf::from(p);
+            if p.is_absolute() {
+                p
+            } else {
+                repo_root.join(p)
+            }
+        })
+        .and_then(|p| p.canonicalize().ok());
+    if let Some(common) = common {
+        anyhow::ensure!(
+            !store.starts_with(&common),
+            "the audit record directory {} resolves inside the git directory {} - \
+             audit metadata does not belong in the reviewed tree",
+            dir.display(),
+            common.display()
+        );
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn restrict(path: &Path, mode: u32) {
     use std::os::unix::fs::PermissionsExt;

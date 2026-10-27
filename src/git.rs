@@ -67,8 +67,25 @@ impl Repo {
         }
     }
 
-    pub fn remote(&self) -> Option<&str> {
-        self.remote.as_deref()
+    /// The remote for display only: `https://user:token@host/path` keeps its
+    /// scheme, host and path but never the userinfo - a credential-bearing URL
+    /// printed verbatim would land in terminal capture or CI logs.
+    pub fn remote_display(&self) -> Option<String> {
+        let url = self.remote.as_deref()?;
+        let Some((scheme, rest)) = url.split_once("://") else {
+            return Some(url.to_string());
+        };
+        let authority_end = rest.find('/').unwrap_or(rest.len());
+        let authority = &rest[..authority_end];
+        let Some(at) = authority.rfind('@') else {
+            return Some(url.to_string());
+        };
+        Some(format!(
+            "{}://{}{}",
+            scheme,
+            &authority[at + 1..],
+            &rest[authority_end..]
+        ))
     }
 
     /// Owning account parsed out of the origin remote.

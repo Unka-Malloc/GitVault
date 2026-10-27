@@ -17,6 +17,7 @@
 //! the key is loaded into it, and ssh is pointed at that socket. An agent cannot
 //! read a file that does not exist.
 
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
@@ -157,7 +158,10 @@ pub fn run(cfg: &Config, vault: &Vault, args: &[String]) -> Result<i32> {
     load_key(&agent.sock, &key, passphrase.as_deref(), false)?;
 
     // Run the real ssh with the throwaway agent and no identities of its own.
-    let status = Command::new("ssh")
+    // A substituted ssh would inherit SSH_AUTH_SOCK and could ask the agent to
+    // sign more than this connection's handshake, so it is resolved the same
+    // trusted way as the helpers that touch the key itself.
+    let status = Command::new(trusted_tool("ssh")?)
         .args(args)
         .env("SSH_AUTH_SOCK", &agent.sock)
         .env_remove("SSH_AGENT_PID")
@@ -172,7 +176,7 @@ pub fn run(cfg: &Config, vault: &Vault, args: &[String]) -> Result<i32> {
 
 /// Pass straight through, for `-G` and any other non-authenticating call.
 fn exec_plain(args: &[String]) -> Result<i32> {
-    let status = Command::new("ssh")
+    let status = Command::new(trusted_tool("ssh")?)
         .args(args)
         .status()
         .context("failed to run ssh")?;
@@ -193,6 +197,27 @@ fn kill_agent(pid: Option<&str>) -> Result<()> {
         let _ = Command::new("kill").arg(pid).status();
     }
     Ok(())
+}
+
+/// The credential-sensitive SSH helpers must be the platform's own binaries:
+/// a PATH-resolved `ssh-add` in a writable directory would receive the
+/// plaintext key this module exists to keep off disk. Each executable is
+/// checked by the same rule the audit engine and the transport pass.
+#[cfg(unix)]
+pub(crate) fn trusted_tool(name: &str) -> Result<PathBuf> {
+    let program = PathBuf::from(format!("/usr/bin/{name}"));
+    anyhow::ensure!(
+        crate::configsig::executable_is_trusted(&program),
+        "the {name} executable {} is not trusted (root-owned, unwritable, \
+         non-replaceable chain required)",
+        program.display()
+    );
+    Ok(program)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn trusted_tool(name: &str) -> Result<PathBuf> {
+    Ok(PathBuf::from(name))
 }
 
 /// A throwaway ssh-agent holding a vault key.
@@ -217,7 +242,7 @@ impl Drop for Agent {
 
 /// Start a private ssh-agent; the caller stops it when the operation ends.
 pub fn start_agent() -> Result<Agent> {
-    let agent = Command::new("ssh-agent")
+    let agent = Command::new(trusted_tool("ssh-agent")?)
         .arg("-s")
         .stdout(Stdio::piped())
         .spawn()
@@ -267,7 +292,7 @@ pub fn load_key(
              re-import with the passphrase: gitvault auth import-key <account> <file>"
         );
     }
-    let mut cmd = Command::new("ssh-add");
+    let mut cmd = Command::new(trusted_tool("ssh-add")?);
     cmd.arg("-")
         .env("SSH_AUTH_SOCK", sock)
         .stdin(Stdio::piped())

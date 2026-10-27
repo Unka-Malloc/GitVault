@@ -327,8 +327,13 @@ pub fn command(binary: &Path) -> Command {
     if let Some(parent) = config_root().parent() {
         command.env("XDG_CONFIG_HOME", parent);
     }
-    if let Some(value) = std::env::var_os("TMPDIR") {
-        command.env("TMPDIR", value);
+    // The engine's scratch space is the private root too: an inherited TMPDIR
+    // pointing into the checkout would let the engine or a tool it spawns
+    // write scratch data inside the reviewed tree. When the private root
+    // cannot be prepared, TMPDIR is simply unset - the platform's default is
+    // per-user and outside the worktree.
+    if let Ok(tmp) = crate::tempsecret::private_temp_root() {
+        command.env("TMPDIR", tmp);
     }
     for key in [
         "LANG", "LC_ALL", "LC_CTYPE", "TERM", "USER", "LOGNAME", "SHELL",

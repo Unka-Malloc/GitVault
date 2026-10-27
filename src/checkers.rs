@@ -246,17 +246,33 @@ pub fn identity_gate(ctx: &Context, routing_certified: bool) -> Option<CheckerOu
         },
         outcome,
         duration_ms: 0,
+        // The outcome text is persisted into engine.json records that can be
+        // shared or copied, so addresses are masked to a categorical form -
+        // the exact value lives in the signed routing table already.
         stdout: if actual.eq_ignore_ascii_case(expected) {
-            format!("git will attribute this to {actual}")
+            format!("git will attribute this to {}", mask_email(actual))
         } else {
             format!(
-                "git would attribute this to '{actual}' but identity '{}' expects '{expected}'\n\
-                 fix: git config user.email {expected}   (or unset the override)",
-                ctx.identity
+                "git would attribute this to '{}' but identity '{}' expects '{}'\n\
+                 fix: set user.email to that identity's configured address   (or unset the override)",
+                mask_email(actual),
+                ctx.identity,
+                mask_email(expected)
             )
         },
         stderr: String::new(),
     })
+}
+
+/// `name@host` reduced to `n…@host`: enough to recognise which address was
+/// compared, not enough to carry a personal address into a stored record.
+fn mask_email(address: &str) -> String {
+    match address.split_once('@') {
+        Some((local, domain)) if !local.is_empty() => {
+            format!("{}…@{domain}", &local[..1])
+        }
+        _ => "(unparseable address)".to_string(),
+    }
 }
 
 /// Run the interception gates and the delegated audit, then record the run.
@@ -282,6 +298,11 @@ pub fn audit(
     report.outcomes.extend(crate::history::gates(ctx));
 
     let audited = crate::probator::applies(&ctx.event);
+    if audited {
+        // The record store's location is part of the boundary: refuse before
+        // the engine runs when it would write inside the reviewed tree.
+        records::check_store_location(cfg, &ctx.repo_root)?;
+    }
     let run = if audited {
         records::begin(cfg, 1)
     } else {

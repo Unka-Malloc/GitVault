@@ -50,7 +50,7 @@ pub fn is_signing_request(args: &[String]) -> bool {
 
 /// Hand the request to the real ssh-keygen unchanged.
 fn passthrough(args: &[String]) -> Result<i32> {
-    let status = std::process::Command::new("ssh-keygen")
+    let status = std::process::Command::new(crate::ssh::trusted_tool("ssh-keygen")?)
         .args(args)
         .status()
         .context("failed to run ssh-keygen")?;
@@ -204,7 +204,7 @@ pub fn run(cfg: &Config, vault: &Vault, args: &[String], cwd: &Path) -> Result<i
     // were this signature.
     let _ = std::fs::remove_file(&sig_path);
 
-    let status = Command::new("ssh-keygen")
+    let status = Command::new(crate::ssh::trusted_tool("ssh-keygen")?)
         .arg("-Y")
         .arg("sign")
         .arg("-n")
@@ -254,7 +254,7 @@ pub fn public_key_of_material(private: &str, passphrase: Option<&str>) -> Result
         Some(_) => Some(crate::ssh::askpass_script()?),
         None => None,
     };
-    let mut cmd = Command::new("ssh-keygen");
+    let mut cmd = Command::new(crate::ssh::trusted_tool("ssh-keygen")?);
     cmd.arg("-y").arg("-f").arg(secret.path());
     if let (Some(guard), Some(p)) = (&askpass, passphrase) {
         cmd.env("SSH_ASKPASS", guard.path())
@@ -282,7 +282,7 @@ pub fn public_key_of_material(private: &str, passphrase: Option<&str>) -> Result
 /// command needs the passphrase and has no way to ask the agent. Reading it from
 /// the agent avoids decrypting anything a second time.
 fn public_key_from_agent(sock: &str, expected_fingerprint: &str) -> Result<String> {
-    let out = Command::new("ssh-add")
+    let out = Command::new(crate::ssh::trusted_tool("ssh-add")?)
         .arg("-L")
         .env("SSH_AUTH_SOCK", sock)
         .output()

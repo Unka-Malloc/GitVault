@@ -14,14 +14,48 @@ pub struct TempSecret {
     path: PathBuf,
 }
 
+/// The private scratch root every secret file lives under: the account's state
+/// directory, never `std::env::temp_dir()`. TMPDIR is caller-controlled and can
+/// point inside a checkout, which would put key material in the reviewed tree
+/// where abnormal termination or a broad `git add` could publish it. The root
+/// is also verified not to resolve inside the current working tree - a HOME
+/// redirected into a checkout must not quietly defeat the boundary either.
+pub(crate) fn private_temp_root() -> Result<PathBuf> {
+    let root = crate::configsig::account_home()?.join(".local/state/gitvault/tmp");
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder
+        .create(&root)
+        .with_context(|| format!("cannot create the secret scratch root {}", root.display()))?;
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("cannot resolve the secret scratch root {}", root.display()))?;
+    if let Ok(cwd) = std::env::current_dir().and_then(|c| c.canonicalize())
+        && root.starts_with(&cwd)
+    {
+        anyhow::bail!(
+            "the secret scratch root {} resolves inside the working tree {} - refusing",
+            root.display(),
+            cwd.display()
+        );
+    }
+    Ok(root)
+}
+
 impl TempSecret {
-    /// Create a uniquely named file in the temp directory, atomically, at `mode`.
+    /// Create a uniquely named file under the private scratch root,
+    /// atomically, at `mode`.
     ///
     /// `create_new` makes this fail rather than follow a planted symlink or
     /// inherit a pre-created file's permissions: a same-user attacker who raced
     /// the name ahead of us gets an error, not our contents.
     pub fn write(contents: &str, mode: u32) -> Result<Self> {
-        let path = std::env::temp_dir().join(format!(
+        let path = private_temp_root()?.join(format!(
             "gitvault-secret-{}-{:016x}",
             std::process::id(),
             rand::random::<u64>()

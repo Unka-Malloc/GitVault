@@ -475,7 +475,7 @@ fn verify_signed(config_path: &Path, data: Option<&[u8]>, anchor: &Path) -> Resu
     if !sig.exists() {
         bail!("no signature sidecar at {}", sig.display());
     }
-    let mut child = Command::new("ssh-keygen")
+    let mut child = Command::new(crate::ssh::trusted_tool("ssh-keygen")?)
         .arg("-Y")
         .arg("verify")
         .arg("-f")
@@ -528,7 +528,7 @@ pub fn sign(config_path: &Path, key_material: &str) -> Result<PathBuf> {
     let sig = sig_path(config_path);
     // A stale sidecar must not be read back as this signature.
     let _ = std::fs::remove_file(&sig);
-    let status = Command::new("ssh-keygen")
+    let status = Command::new(crate::ssh::trusted_tool("ssh-keygen")?)
         .arg("-Y")
         .arg("sign")
         .arg("-n")
@@ -555,8 +555,10 @@ pub fn sign(config_path: &Path, key_material: &str) -> Result<PathBuf> {
 /// allowed-signers form: `<principal> ssh-ed25519 <key>`.
 pub fn keygen() -> Result<(String, String)> {
     // ssh-keygen wants a path to write to; the pair is read back and the
-    // directory removed on every path below it.
-    let dir = std::env::temp_dir().join(format!(
+    // directory removed on every path below it. The scratch root is the
+    // private one, not TMPDIR: a caller-selected temp directory can sit inside
+    // the checkout being audited, and this file holds a signing key.
+    let dir = crate::tempsecret::private_temp_root()?.join(format!(
         "gitvault-keygen-{}-{:016x}",
         std::process::id(),
         rand::random::<u64>()
@@ -574,7 +576,7 @@ pub fn keygen() -> Result<(String, String)> {
 
 fn keygen_in(dir: &Path) -> Result<(String, String)> {
     let key = dir.join("key");
-    let status = Command::new("ssh-keygen")
+    let status = Command::new(crate::ssh::trusted_tool("ssh-keygen")?)
         .args(["-t", "ed25519", "-N", "", "-C", PRINCIPAL, "-f"])
         .arg(&key)
         .stdout(Stdio::null())
@@ -606,7 +608,10 @@ mod tests {
     }
 
     fn have_ssh_keygen() -> bool {
-        Command::new("ssh-keygen")
+        let Ok(program) = crate::ssh::trusted_tool("ssh-keygen") else {
+            return false;
+        };
+        Command::new(program)
             .arg("-Y")
             .arg("sign")
             .stdout(Stdio::null())

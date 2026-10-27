@@ -98,6 +98,13 @@ pub struct Rules {
     /// which is the safe default for a tool whose job is preventing mistakes.
     #[serde(default)]
     pub default: Option<String>,
+    /// Aggregate byte ceiling for one release's assets. Staging refuses once
+    /// the running total would exceed it - an accidentally giant asset set
+    /// stops before any byte is read or sent, and a deliberate large release
+    /// raises it here explicitly. Being signed into the routing table, the
+    /// budget is policy, not a flag a caller can widen unilaterally.
+    #[serde(default)]
+    pub release_asset_budget: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
