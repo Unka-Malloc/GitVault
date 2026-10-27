@@ -232,27 +232,50 @@ fn has_extended_acl(_path: &Path) -> bool {
 /// root-owned file below such a directory can have its name swapped for
 /// another inode between a trust check and exec, so ownership of the file
 /// alone cannot be trusted there.
+///
+/// Two chains are judged, not one. The spelling's own parents matter
+/// because a symlinked component is swapped by whoever writes its parent;
+/// the canonical target's ancestors matter because a swap deeper in the
+/// resolved tree moves every name beneath it. A component either chain
+/// cannot inspect - a failed stat, a non-directory ancestor, an unreadable
+/// ACL - is not provably protected, so the answer fails closed.
 #[cfg(unix)]
 fn path_is_user_replaceable(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt as _;
-    let mut dir = path.parent();
-    while let Some(d) = dir {
+    let mut candidates: Vec<PathBuf> = path.ancestors().skip(1).map(PathBuf::from).collect();
+    match path.canonicalize() {
+        Ok(resolved) => {
+            candidates.extend(resolved.ancestors().skip(1).map(PathBuf::from));
+        }
+        Err(_) => {
+            // The resolved chain cannot be inspected at all - the executable
+            // may not even exist - and an uninspectable chain is not
+            // provably protected.
+            return true;
+        }
+    }
+    for d in &candidates {
         let Ok(meta) = std::fs::metadata(d) else {
             return true;
         };
+        // An ancestor that is not a directory cannot hold the name being
+        // checked; the chain is malformed, not protected.
+        if !meta.is_dir() {
+            return true;
+        }
         // Non-root ownership, or group/other write: someone other than root
         // can rename the directory's entries. Root-owned 0755 chains are the
         // trusted shape (`/usr`, `/usr/bin`).
         if meta.uid() != 0 || meta.mode() & 0o022 != 0 {
             return true;
         }
-        // An extended ACL can grant write to a non-root principal even on a
-        // root-owned 0755 directory - mode bits alone cannot see it, and an
-        // ancestor that cannot be inspected is not provably protected.
+        // An extended ACL can grant add_file/delete_child to a non-root
+        // principal even on a root-owned 0755 directory - mode bits alone
+        // cannot see it, and an ACL that cannot be inspected may grant the
+        // rename this check exists to rule out.
         if has_extended_acl(d) {
             return true;
         }
-        dir = d.parent();
     }
     false
 }
@@ -776,6 +799,39 @@ mod tests {
                 assert!(has_extended_acl(&binary), "an ACL entry must register");
             }
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The replaceability walk inspects ACLs on every ancestor, not only the
+    /// file: an ACL granting add_file/delete_child on a directory is exactly
+    /// how a non-root principal swaps a name the mode bits protect. The
+    /// fixture proves the detection layer on a directory; the root-owned
+    /// chain shape itself cannot be built inside a test.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_acl_on_a_parent_directory_registers() {
+        let d = dir("acl-parent");
+        assert!(
+            !has_extended_acl(&d),
+            "the fixture directory carries no ACL"
+        );
+        let added = std::process::Command::new("chmod")
+            .args(["+a", "everyone deny delete_child"])
+            .arg(&d)
+            .status();
+        if added.map(|s| s.success()).unwrap_or(false) {
+            assert!(
+                has_extended_acl(&d),
+                "an ACL on a directory ancestor must register"
+            );
+            // The same probe failing closed is what makes the directory
+            // untrusted; a directory carrying an ACL can never be a provably
+            // protected ancestor.
+        }
+        let _ = std::process::Command::new("chmod")
+            .args(["-a#", "0"])
+            .arg(&d)
+            .status();
         let _ = std::fs::remove_dir_all(&d);
     }
 }

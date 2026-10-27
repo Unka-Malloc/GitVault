@@ -323,19 +323,45 @@ fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, String, O
 
     // A streamed body is piped into curl: the read end becomes its
     // `--data-binary` source, the write end is where we feed and hash the
-    // descriptor. The pipe exists before the arguments so the descriptor
-    // number can be named in them.
+    // descriptor. Both ends are born close-on-exec: a child that inherited
+    // its own copy of the writer would hold the pipe open after our last
+    // write and wait on an EOF that can never arrive. The descriptors are
+    // owned as Files from creation, so a spawn failure or early refusal
+    // still closes them.
     #[cfg(unix)]
-    let (pipe_read, pipe_write) = if req.body_stream.is_some() {
+    let body_pipe: Option<(std::fs::File, std::fs::File)> = if req.body_stream.is_some() {
+        use std::os::unix::io::FromRawFd as _;
         let mut fds = [0i32; 2];
         anyhow::ensure!(
             unsafe { libc::pipe(fds.as_mut_ptr()) } == 0,
             "cannot pipe the request body"
         );
-        (fds[0], fds[1])
+        for fd in fds {
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+                unsafe {
+                    libc::close(fds[0]);
+                    libc::close(fds[1]);
+                }
+                anyhow::bail!("cannot mark the request-body pipe close-on-exec");
+            }
+        }
+        Some(unsafe {
+            (
+                std::fs::File::from_raw_fd(fds[0]),
+                std::fs::File::from_raw_fd(fds[1]),
+            )
+        })
     } else {
-        (-1, -1)
+        None
     };
+    #[cfg(unix)]
+    let pipe_read = body_pipe
+        .as_ref()
+        .map(|(reader, _)| {
+            use std::os::unix::io::AsRawFd as _;
+            reader.as_raw_fd()
+        })
+        .unwrap_or(-1);
     #[cfg(not(unix))]
     anyhow::ensure!(
         req.body_stream.is_none(),
@@ -425,13 +451,30 @@ fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, String, O
     }
     args.push(url);
 
-    let mut child = Command::new("curl")
+    let mut command = Command::new("curl");
+    command
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to run curl")?;
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    if req.body_stream.is_some() {
+        // The child gets exactly the read descriptor and nothing else:
+        // clearing its close-on-exec flag in pre-exec lets `/dev/fd/N`
+        // survive the exec at the same number, while the write end stays
+        // marked and never reaches curl at all.
+        use std::os::unix::process::CommandExt as _;
+        let inherited = pipe_read;
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(inherited, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let mut child = command.spawn().context("failed to run curl")?;
 
     {
         let stdin = child
@@ -454,9 +497,10 @@ fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, String, O
     let sent_digest = if let Some(source) = req.body_stream.as_ref() {
         use sha2::Digest as _;
         use std::io::{Read as _, Write as _};
-        use std::os::unix::io::FromRawFd as _;
+        let (reader, mut writer) = body_pipe.expect("a streamed request body always owns its pipe");
+        // The parent's read end is never used - curl holds its own copy.
+        drop(reader);
         let mut source = source;
-        let mut writer = unsafe { std::fs::File::from_raw_fd(pipe_write) };
         let mut hasher = sha2::Sha256::new();
         let mut buffer = [0u8; 64 * 1024];
         let result = (|| -> Result<String> {
@@ -477,9 +521,6 @@ fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, String, O
         // Closing the write end is how curl learns the body ended - even on
         // a stream failure, so the child cannot wait on a pipe we abandoned.
         drop(writer);
-        unsafe {
-            libc::close(pipe_read);
-        }
         match result {
             Ok(digest) => Some(digest),
             Err(why) => {
@@ -951,5 +992,64 @@ mod tests {
             outcome.via_default,
             "an unrouted repository must not look routed"
         );
+    }
+
+    /// The streamed-body handoff must reach EOF: the child inherits only the
+    /// pipe's read end, because an inherited writer inside the child would
+    /// hold the pipe open forever and the request would hang instead of
+    /// completing. `cat /dev/fd/N` stands in for curl's `--data-binary` read.
+    #[cfg(unix)]
+    #[test]
+    fn a_streamed_request_reaches_eof_when_the_producer_closes() {
+        use std::io::Write as _;
+        use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
+        use std::os::unix::process::CommandExt as _;
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        for fd in fds {
+            assert_ne!(
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                -1,
+                "cannot mark the pipe close-on-exec"
+            );
+        }
+        let (reader, mut writer) = unsafe {
+            (
+                std::fs::File::from_raw_fd(fds[0]),
+                std::fs::File::from_raw_fd(fds[1]),
+            )
+        };
+        let inherited = reader.as_raw_fd();
+        let mut command = Command::new("cat");
+        command
+            .arg(format!("/dev/fd/{inherited}"))
+            .stdout(Stdio::piped());
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(inherited, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().expect("cat must spawn");
+        drop(reader);
+        writer.write_all(b"streamed payload").unwrap();
+        drop(writer);
+        // A bounded wait: the defect this guards against is a child that
+        // never sees EOF, so the proof of completion cannot wait forever.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                panic!("the child never reached EOF - it still holds a pipe writer");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.stdout, b"streamed payload");
     }
 }

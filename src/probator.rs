@@ -473,16 +473,17 @@ fn actions(ctx: &Context) -> Result<Vec<Value>, String> {
             }
             // The assets publish alongside the commit, so the evidence names
             // their exact bytes and where the scan can read them: name, size,
-            // digest and the private immutable snapshot path per file. The
-            // upload streams that same snapshot to GitHub.
+            // digest, the descriptor-bound reference and whether the snapshot
+            // carries the OS seal - the property that lets the upload publish
+            // the same verified bytes rather than merely detect divergence.
             if !ctx.release_assets.is_empty() {
                 detail.insert(
                     "assets".into(),
                     Value::Array(
                         ctx.release_assets
                             .iter()
-                            .map(|(name, size, sha256, staged)| {
-                                json!({"name": name, "size": size, "sha256": sha256, "staged": staged})
+                            .map(|(name, size, sha256, staged, sealed)| {
+                                json!({"name": name, "size": size, "sha256": sha256, "staged": staged, "sealed": sealed})
                             })
                             .collect(),
                     ),

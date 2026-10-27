@@ -73,7 +73,7 @@ pub struct Context {
     /// publish may carry. The staged ref is a `/dev/fd/N` descriptor path
     /// inherited into the audit child, not a filesystem name a same-user
     /// process could swap.
-    pub release_assets: Vec<(String, u64, String, String)>,
+    pub release_assets: Vec<(String, u64, String, String, bool)>,
     /// Descriptors the audit child must inherit (numbers already reserved in
     /// this process with the share flag cleared at exec): how staged asset
     /// bytes reach the scanner without trusting a replaceable path.

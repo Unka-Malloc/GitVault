@@ -2962,23 +2962,59 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
     //    applied to a swapped-in binary. The second check after chflags
     //    closes the residual window: a swap that slipped in is detected on
     //    both inode and content, unlocked and refused.
-    let mut staged_digests: Vec<(PathBuf, u64, [u8; 32])> = Vec::new();
+    // The enumeration must be complete before the flag lands: an entry that
+    // cannot be inspected - unreadable metadata, an unlistable directory, a
+    // vanished child - would otherwise be made system-immutable without ever
+    // being hashed or compared. Every traversal error is fatal here, never a
+    // skipped entry.
+    //
+    // The record covers every object the flag will touch: regular files are
+    // pinned by inode AND content digest, directories and symlinks by inode
+    // alone (a symlink's target is nobody's business here - the object being
+    // frozen is the link itself). The flag is then applied to exactly this
+    // enumerated set with no recursion, so nothing the manifest never saw
+    // can receive it.
+    let mut staged_digests: Vec<(PathBuf, u64, Option<[u8; 32]>, bool)> = Vec::new();
+    let mut flag_targets: Vec<PathBuf> = Vec::new();
+    let mut flag_links: Vec<PathBuf> = Vec::new();
     for path in &immobilise {
-        // The flag runs recursively, so the record must too: every file in a
-        // directory tree (the hooks stubs included) is hashed and pinned by
-        // inode before sudo runs, not just the tree's top-level entry.
         let mut stack = vec![path.clone()];
         while let Some(entry) = stack.pop() {
-            let Ok(meta) = std::fs::symlink_metadata(&entry) else {
-                continue;
-            };
+            let meta = std::fs::symlink_metadata(&entry).with_context(|| {
+                format!(
+                    "cannot inspect {} before the immutable flag",
+                    entry.display()
+                )
+            })?;
             if meta.is_dir() && !meta.file_type().is_symlink() {
-                if let Ok(children) = std::fs::read_dir(&entry) {
-                    stack.extend(children.flatten().map(|child| child.path()));
+                for child in std::fs::read_dir(&entry).with_context(|| {
+                    format!("cannot list {} before the immutable flag", entry.display())
+                })? {
+                    stack.push(
+                        child
+                            .with_context(|| {
+                                format!("cannot inspect an entry under {}", entry.display())
+                            })?
+                            .path(),
+                    );
                 }
+                staged_digests.push((entry.clone(), meta.ino(), None, false));
+                flag_targets.push(entry);
                 continue;
             }
-            if !meta.is_file() || meta.file_type().is_symlink() {
+            if meta.file_type().is_symlink() {
+                // Flagged on the link itself (`chflags -h`): following it
+                // would freeze whatever it happens to point at.
+                staged_digests.push((entry.clone(), meta.ino(), None, true));
+                flag_links.push(entry);
+                continue;
+            }
+            if !meta.is_file() {
+                // A fifo, socket or device is flagged like anything else -
+                // an unflagged object could be swapped through its name -
+                // but it has no bytes to pin.
+                staged_digests.push((entry.clone(), meta.ino(), None, false));
+                flag_targets.push(entry);
                 continue;
             }
             let now = installed_digest(&entry)?;
@@ -2989,23 +3025,49 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
                     entry.display()
                 );
             }
-            staged_digests.push((entry, meta.ino(), now));
+            staged_digests.push((entry.clone(), meta.ino(), Some(now), false));
+            flag_targets.push(entry);
         }
     }
-    let status = std::process::Command::new("sudo")
-        .args(["chflags", "-R", "schg"])
-        .args(&immobilise)
-        .status()
-        .context("failed to invoke sudo - enter the login password when asked")?;
-    if !status.success() {
-        anyhow::bail!("sudo chflags failed; nothing below was applied");
+    if !flag_targets.is_empty() {
+        let status = std::process::Command::new("sudo")
+            .args(["chflags", "schg"])
+            .args(&flag_targets)
+            .status()
+            .context("failed to invoke sudo - enter the login password when asked")?;
+        if !status.success() {
+            anyhow::bail!("sudo chflags failed; nothing below was applied");
+        }
     }
-    for (path, ino, digest) in &staged_digests {
+    if !flag_links.is_empty() {
+        let status = std::process::Command::new("sudo")
+            .args(["chflags", "-h", "schg"])
+            .args(&flag_links)
+            .status()
+            .context("failed to invoke sudo - enter the login password when asked")?;
+        if !status.success() {
+            anyhow::bail!("sudo chflags -h failed; nothing below was applied");
+        }
+    }
+    // The manifest is verified after the flag: every object flagged must
+    // still be the exact object enumerated - inode for every kind, content
+    // digest for regular files. Anything else swapped in is unlocked and
+    // refused.
+    for (path, ino, digest, is_link) in &staged_digests {
         let meta = std::fs::symlink_metadata(path);
-        let now = installed_digest(path).unwrap_or_default();
-        if meta.ok().map(|m| m.ino()) != Some(*ino) || &now != digest {
+        let inode_ok = meta.as_ref().ok().map(|m| m.ino()) == Some(*ino);
+        let content_ok = match digest {
+            Some(expected) => installed_digest(path).ok().as_ref() == Some(expected),
+            None => true,
+        };
+        if !inode_ok || !content_ok {
+            let undo: &[&str] = if *is_link {
+                &["chflags", "-h", "noschg"]
+            } else {
+                &["chflags", "noschg"]
+            };
             let _ = std::process::Command::new("sudo")
-                .args(["chflags", "noschg"])
+                .args(undo)
                 .arg(path)
                 .status();
             anyhow::bail!(
@@ -3170,6 +3232,14 @@ fn publication_surface(method: &str, path: &str) -> Option<String> {
         return Some(format!("{verb} /{path} (encoded path separator)"));
     }
     let path = decoded.trim_start_matches('/');
+    // Curl glob metacharacters never appear in a legitimate API path. The
+    // broker always sends --globoff, so they cannot expand on the wire; a
+    // write that still spells them is judged publication surface outright
+    // rather than classified from a shape curl might once have expanded
+    // into several requests.
+    if verb != "GET" && verb != "HEAD" && verb != "OPTIONS" && path.contains(['{', '}', '[', ']']) {
+        return Some(format!("{verb} /{path} (curl glob metacharacters)"));
+    }
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     // repos/{owner}/{repo}/<surface>/...
     if segments.len() < 3 || segments[0] != "repos" {
@@ -3684,12 +3754,16 @@ fn cmd_repo(config: Option<&PathBuf>, command: RepoCommand) -> anyhow::Result<Ex
 /// tag, `target_commitish` will create it at the audited commit. The remote is
 /// consulted at the boundary, after the audit produced its verdict and before
 /// the release request can publish anything.
+/// Whether the remote tag exists at all - the caller needs the distinction:
+/// a missing tag is bound by creating its ref atomically, an existing one
+/// must already name the audited commit, and a vanished one after creation
+/// is a moved boundary.
 fn verify_remote_tag(
     repo_root: &std::path::Path,
     slug: &str,
     tag: &str,
     audited: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let remote = remote_for_slug(repo_root, slug).ok_or_else(|| {
         anyhow::anyhow!(
             "no remote in this checkout points at {slug}; \
@@ -3737,6 +3811,43 @@ fn verify_remote_tag(
             actual.eq_ignore_ascii_case(audited),
             "remote tag {tag} points at {actual}, but the audit reviewed {audited}; \
              refusing to create a release that describes unaudited content"
+        );
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Bind the tag to the audited commit atomically. `release create` creates
+/// a missing tag itself - at `target_commitish` but with no conditional
+/// guard, so a tag that appeared between the ls-remote check and the
+/// release POST would bind whatever the racer chose. Creating the ref first
+/// makes that conflict fail loudly (`POST /git/refs` refuses an existing
+/// ref), and a racer's tag must still resolve to the audited commit before
+/// the release is built on it.
+fn create_remote_tag_ref(
+    cfg: &config::Config,
+    vault: &vault::Vault,
+    repo_root: &std::path::Path,
+    slug: &str,
+    tag: &str,
+    audited: &str,
+) -> anyhow::Result<()> {
+    let mut req = get(
+        format!("/repos/{slug}/git/refs"),
+        slug.to_string(),
+        Some(".ref".into()),
+    );
+    req.method = "POST".into();
+    req.fields.push(("ref".into(), format!("refs/tags/{tag}")));
+    req.fields.push(("sha".into(), audited.to_string()));
+    if let Err(why) = api::run_value(cfg, vault, &req) {
+        // The only conflict worth continuing past is an already-existing
+        // tag that names the audited commit: whoever won the race still
+        // produced the binding this release needs.
+        let bound = verify_remote_tag(repo_root, slug, tag, audited).unwrap_or(false);
+        anyhow::ensure!(
+            bound,
+            "creating refs/tags/{tag} failed and no remote tag names the audited commit: {why:#}"
         );
     }
     Ok(())
@@ -3788,6 +3899,7 @@ fn cmd_release(
                     a.size,
                     a.sha256.clone(),
                     a.audit_ref.clone().unwrap_or_default(),
+                    a.sealed,
                 )
             })
             .collect();
@@ -3838,7 +3950,13 @@ fn cmd_release(
             } = release_audit
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("the release audit did not run"))?;
-            verify_remote_tag(repo_root, &slug, &tag, audited)?;
+            let tag_exists = verify_remote_tag(repo_root, &slug, &tag, audited)?;
+            if !tag_exists {
+                // A missing tag is bound atomically, not left for the
+                // release POST to create unguarded: the ref creation itself
+                // refuses if the tag appeared in between.
+                create_remote_tag_ref(&cfg, &vault, repo_root, &slug, &tag, audited)?;
+            }
             let mut r = get(
                 format!("/repos/{slug}/releases"),
                 slug.clone(),
@@ -3916,11 +4034,19 @@ struct ReleaseAsset {
     /// The operator's original path - diagnostics only, never read at upload
     /// time.
     path: PathBuf,
+    /// The snapshot's location inside the staging directory, needed to seal
+    /// the bytes and to prove the seal still holds at publish time.
+    staged_path: PathBuf,
     /// The private snapshot's open descriptor, held from staging to publish.
     fd: std::fs::File,
     /// The `/dev/fd/N` reference the audit evidence names, once the
     /// descriptor share for the audit child exists.
     audit_ref: Option<String>,
+    /// Whether the snapshot carries the OS seal this platform can give it
+    /// (`uchg` on macOS). Publication refuses an unsealed snapshot: without
+    /// it a same-user process could rewrite the staged bytes between the
+    /// audit and the upload.
+    sealed: bool,
     name: String,
     size: u64,
     sha256: String,
@@ -3936,10 +4062,18 @@ const MAX_ASSET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Its names are an implementation detail: the audit and the upload reach
 /// the bytes through open descriptors, so a same-user process that learns
 /// or replaces a staged path cannot redirect either side. Dropping the
-/// guard closes the descriptors and removes the directory.
+/// guard closes the descriptors and removes the directory - but only the
+/// directory this guard actually created: a release without assets stages
+/// nothing, and a cleanup that cannot prove the path still sits inside the
+/// private staging root removes nothing.
 #[derive(Debug)]
 struct StagedAssets {
-    dir: PathBuf,
+    /// `Some` only when this guard created the directory; `None` for the
+    /// empty asset set, which owns nothing and must delete nothing.
+    dir: Option<PathBuf>,
+    /// The canonical staging root `dir` was created under: the boundary a
+    /// cleanup must prove before deleting anything.
+    root: PathBuf,
     assets: Vec<ReleaseAsset>,
     /// Descriptor numbers reserved for the audit child's inheritance; closed
     /// when the staged set drops.
@@ -3954,7 +4088,24 @@ impl Drop for StagedAssets {
                 libc::close(*fd);
             }
         }
-        let _ = std::fs::remove_dir_all(&self.dir);
+        let Some(dir) = &self.dir else {
+            return;
+        };
+        #[cfg(target_os = "macos")]
+        for asset in &self.assets {
+            let _ = unseal_staged(&asset.staged_path);
+        }
+        // A swapped staging path must never drag the delete outside the
+        // private root: resolve both sides and refuse the removal rather
+        // than follow a planted link into the checkout or the state root.
+        let inside = dir
+            .canonicalize()
+            .ok()
+            .map(|resolved| resolved.starts_with(&self.root))
+            .unwrap_or(false);
+        if inside {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }
 
@@ -4078,6 +4229,67 @@ fn check_release_assets(paths: &[PathBuf], repo_root: &Path) -> anyhow::Result<S
     stage_release_assets(paths, repo_root, &release_staging_root())
 }
 
+/// macOS `uchg`, the only immutable flag an unprivileged owner may set and
+/// later clear. It is applied the moment a snapshot's digest exists: from
+/// then on the staged bytes cannot be written, renamed or deleted by any
+/// same-user process, so the audit's read and the upload's stream are the
+/// identical byte sequence by construction - not only by post-hoc digest.
+#[cfg(target_os = "macos")]
+fn seal_staged(path: &Path) -> anyhow::Result<bool> {
+    use std::os::unix::ffi::OsStrExt as _;
+    const UF_IMMUTABLE: u32 = 0x0000_0002;
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("cannot seal staged asset {}", path.display()))?;
+    anyhow::ensure!(
+        unsafe { libc::chflags(cpath.as_ptr(), UF_IMMUTABLE) } == 0,
+        "cannot seal the staged asset {} - refusing before the audit sees it",
+        path.display()
+    );
+    Ok(true)
+}
+
+/// No user-level immutable flag exists here: the snapshot cannot be sealed,
+/// and an unsealed snapshot refuses at publish time rather than upload
+/// bytes the audit cannot be proven to have judged.
+#[cfg(not(target_os = "macos"))]
+fn seal_staged(_path: &Path) -> anyhow::Result<bool> {
+    Ok(false)
+}
+
+/// Clear the seal a staged snapshot carries, so the guard's cleanup may
+/// remove it. The owner may clear `uchg` without a password - which is also
+/// why the seal is a hardening layer under the digest binding, not the
+/// binding itself.
+#[cfg(target_os = "macos")]
+fn unseal_staged(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("cannot unseal staged asset {}", path.display()))?;
+    anyhow::ensure!(
+        unsafe { libc::chflags(cpath.as_ptr(), 0) } == 0,
+        "cannot unseal the staged asset {}",
+        path.display()
+    );
+    Ok(())
+}
+
+/// Whether the snapshot at `path` still carries the seal it was staged
+/// with. Checked again at publish: a seal that vanished between the audit
+/// and the upload means the binding cannot be proven.
+#[cfg(target_os = "macos")]
+fn asset_is_sealed(path: &Path) -> bool {
+    use std::os::macos::fs::MetadataExt as _;
+    const UF_IMMUTABLE: u32 = 0x0000_0002;
+    std::fs::symlink_metadata(path)
+        .map(|meta| meta.st_flags() & UF_IMMUTABLE != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn asset_is_sealed(_path: &Path) -> bool {
+    false
+}
+
 fn stage_release_assets(
     paths: &[PathBuf],
     repo_root: &Path,
@@ -4090,10 +4302,13 @@ fn stage_release_assets(
     );
     // Nothing to stage: no directory is created and the staging-root
     // boundary check does not run, so a bare release does not depend on
-    // where the state root happens to resolve.
+    // where the state root happens to resolve. The guard owns nothing -
+    // `dir` stays empty so its cleanup can never remove a path it did not
+    // make.
     if paths.is_empty() {
         return Ok(StagedAssets {
-            dir: staging_root.join("release-empty"),
+            dir: None,
+            root: PathBuf::new(),
             assets: Vec::new(),
             shared: Vec::new(),
         });
@@ -4147,7 +4362,8 @@ fn stage_release_assets(
         .create(&dir)
         .with_context(|| format!("cannot stage assets in {}", dir.display()))?;
     let mut staged = StagedAssets {
-        dir,
+        dir: Some(dir.clone()),
+        root: root_canonical,
         assets: Vec::with_capacity(paths.len()),
         shared: Vec::with_capacity(paths.len()),
     };
@@ -4184,7 +4400,7 @@ fn stage_release_assets(
         // The snapshot is private from the instant it exists: mode 0600 is
         // applied by the create itself, not repaired afterwards, and the
         // handle stays open as the descriptor the audit and upload bind.
-        let snapshot = staged.dir.join(format!("{index:04}"));
+        let snapshot = dir.join(format!("{index:04}"));
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).create_new(true);
         #[cfg(unix)]
@@ -4199,7 +4415,7 @@ fn stage_release_assets(
         // the bytes that actually landed in the snapshot, so the staged
         // digest is the audited digest by construction. The read is still
         // bounded - a source that grows mid-copy cannot exceed the cap.
-        let sha256 = {
+        let (sha256, total) = {
             use sha2::Digest as _;
             use std::io::Read as _;
             let mut hasher = sha2::Sha256::new();
@@ -4223,21 +4439,42 @@ fn stage_release_assets(
                     .with_context(|| format!("cannot stage asset '{}'", path.display()))?;
                 hasher.update(&buffer[..read]);
             }
-            hasher
-                .finalize()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
+            (
+                hasher
+                    .finalize()
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+                total,
+            )
         };
         file.sync_all()
             .with_context(|| format!("cannot stage asset '{}'", path.display()))?;
+        // The staged size is the measured copy, not the source's earlier
+        // metadata: a file that changed length mid-staging produced a torn
+        // snapshot whose declared Content-Length would misframe the upload.
+        anyhow::ensure!(
+            total == meta.len(),
+            "--asset '{}' changed size while staging ({} -> {} bytes) - refusing",
+            path.display(),
+            meta.len(),
+            total
+        );
+        // Seal the snapshot the moment its digest exists: nothing - not a
+        // same-user rename and not an in-place write - may alter the staged
+        // bytes between the audit's read and the upload's stream. A platform
+        // with no user seal reports `sealed: false`, and publication refuses
+        // before a byte is transmitted rather than rely on detection alone.
+        let sealed = seal_staged(&snapshot)?;
         std::io::Seek::rewind(&mut file)?;
         staged.assets.push(ReleaseAsset {
             path: path.clone(),
+            staged_path: snapshot,
             fd: file,
             audit_ref: None,
+            sealed,
             name: name.to_string(),
-            size: meta.len(),
+            size: total,
             sha256,
         });
     }
@@ -4271,6 +4508,17 @@ fn create_release_staged(
     mut req: api::Request,
     staged: &StagedRelease<'_>,
 ) -> anyhow::Result<ExitCode> {
+    // Every staged asset must still be sealed before a release exists: the
+    // seal is what lets the upload stream bytes the audit judged, and a
+    // snapshot that lost it - or never carried it on this platform - cannot
+    // prove the published bytes will be the audited ones.
+    for asset in staged.assets {
+        anyhow::ensure!(
+            asset.sealed && asset_is_sealed(&asset.staged_path),
+            "staged asset '{}' is not sealed - refusing before the release exists",
+            asset.path.display()
+        );
+    }
     req.jq = Some(".id, .html_url".into());
     let created = api::run_value(cfg, vault, &req)?;
     let mut lines = created.lines();
@@ -4280,9 +4528,19 @@ fn create_release_staged(
     // resolves to its live commit here, a new tag is created at
     // `target_commitish`. If the tag already moved, the draft recorded
     // unaudited content - it is deleted, not kept.
-    if let Err(why) = verify_remote_tag(staged.repo_root, slug, staged.tag, staged.audited) {
-        delete_release_quietly(cfg, vault, slug, &id);
-        return Err(why.context("the draft bound unaudited content and was deleted"));
+    match verify_remote_tag(staged.repo_root, slug, staged.tag, staged.audited) {
+        Ok(true) => {}
+        Ok(false) => {
+            delete_release_quietly(cfg, vault, slug, &id);
+            anyhow::bail!(
+                "the remote tag {} vanished while the draft was created - the draft was deleted",
+                staged.tag
+            );
+        }
+        Err(why) => {
+            delete_release_quietly(cfg, vault, slug, &id);
+            return Err(why.context("the draft bound unaudited content and was deleted"));
+        }
     }
     let upload = (|| -> anyhow::Result<()> {
         for asset in staged.assets {
@@ -4332,14 +4590,34 @@ fn create_release_staged(
     // content. That is unrecoverable by this run: the draft stays put for
     // the operator to inspect rather than being silently deleted or
     // published on a stale binding.
-    verify_remote_tag(staged.repo_root, slug, staged.tag, staged.audited)
+    let still_bound = verify_remote_tag(staged.repo_root, slug, staged.tag, staged.audited)
         .context("the tag moved after the draft was bound; it stays unpublished for inspection")?;
+    anyhow::ensure!(
+        still_bound,
+        "the remote tag {} vanished after the draft was bound; it stays unpublished for inspection",
+        staged.tag
+    );
     if staged.keep_draft {
         if let Some(url) = lines.next() {
             println!("{}", url.trim());
         }
         return Ok(ExitCode::SUCCESS);
     }
+    // Publishing is the last point the release can still be held: read the
+    // draft's own recorded commit back and refuse to make public a release
+    // that names anything but the audited head.
+    let bound = get(
+        format!("/repos/{slug}/releases/{id}"),
+        slug.to_string(),
+        Some(".target_commitish".into()),
+    );
+    let resolved = api::run_value(cfg, vault, &bound).unwrap_or_default();
+    anyhow::ensure!(
+        resolved.trim().eq_ignore_ascii_case(staged.audited),
+        "the draft release resolves to '{}' not the audited {} - it stays a draft",
+        resolved.trim(),
+        staged.audited
+    );
     let mut publish = get(
         format!("/repos/{slug}/releases/{id}"),
         slug.to_string(),
@@ -5029,10 +5307,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The binding is the open descriptor, not the staged path: an attacker
-    /// who replaces the staged file's bytes - or swaps the path itself for
-    /// another file - cannot move the held descriptor off the audited inode.
-    /// The scan reads and the upload re-hashes that same description.
+    /// The binding is the open descriptor plus the OS seal on the snapshot:
+    /// an attacker who replaces the staged file's bytes - or swaps the path
+    /// itself for another file - is refused by the seal on macOS, and the
+    /// held descriptor cannot move off the audited inode anywhere. The scan
+    /// reads and the upload re-hashes that same description.
     #[cfg(unix)]
     #[test]
     fn staged_descriptor_survives_a_path_swap() {
@@ -5041,12 +5320,25 @@ mod tests {
         std::fs::write(&file, b"zip").unwrap();
         let mut staged = check_release_assets(std::slice::from_ref(&file), &root).unwrap();
         let digest = staged.assets[0].sha256.clone();
-        // Swap the staged path for clean bytes, then "restore" it - the
-        // sequence the published-digest check once trusted.
-        let staged_path = staged.dir.join("0000");
-        let aside = staged.dir.join("swapped");
-        std::fs::rename(&staged_path, &aside).unwrap();
-        std::fs::write(&staged_path, b"clean").unwrap();
+        let dir = staged.dir.as_deref().unwrap();
+        let staged_path = dir.join("0000");
+        #[cfg(target_os = "macos")]
+        {
+            // The seal refuses the swap outright: renaming or writing the
+            // staged path is exactly the attack it exists to stop.
+            assert!(staged.assets[0].sealed);
+            assert!(std::fs::rename(&staged_path, dir.join("moved")).is_err());
+            assert!(std::fs::write(&staged_path, b"clean").is_err());
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Where no seal exists the descriptor binding is the defense:
+            // swap the staged path for clean bytes, then prove the held
+            // descriptor still reads the audited inode.
+            let aside = dir.join("swapped");
+            std::fs::rename(&staged_path, &aside).unwrap();
+            std::fs::write(&staged_path, b"clean").unwrap();
+        }
         let file = staged.assets[0].fd.try_clone().unwrap();
         assert_eq!(sha256_reader(&file).unwrap(), digest);
         // The audit's own share reaches the same inode through /dev/fd.
@@ -5058,14 +5350,14 @@ mod tests {
             digest
         );
         assert!(!staged.shared.is_empty());
-        std::fs::rename(&aside, &staged_path).unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A write to the staged inode itself - the shape a concurrent-writer
-    /// attack takes once the path is out of reach - lands on the same
-    /// descriptor the upload streams and hashes, so the sent digest can
-    /// never quietly match the audited one.
+    /// attack takes once the path is out of reach - is refused by the seal
+    /// where the platform has one; elsewhere it lands on the same descriptor
+    /// the upload streams and hashes, so the sent digest can never quietly
+    /// match the audited one.
     #[cfg(unix)]
     #[test]
     fn staged_inode_writes_change_the_streamed_digest() {
@@ -5074,11 +5366,42 @@ mod tests {
         std::fs::write(&file, b"zip").unwrap();
         let staged = check_release_assets(std::slice::from_ref(&file), &root).unwrap();
         let digest = staged.assets[0].sha256.clone();
-        // Truncating the staged path writes the same inode the held
-        // descriptor reads; the stream hashes what it actually sent.
-        std::fs::write(staged.dir.join("0000"), b"mutated").unwrap();
-        let file = staged.assets[0].fd.try_clone().unwrap();
-        assert_ne!(sha256_reader(&file).unwrap(), digest);
+        let staged_path = staged.dir.as_deref().unwrap().join("0000");
+        #[cfg(target_os = "macos")]
+        {
+            // Sealed bytes cannot be mutated at all: the write is refused,
+            // so the digest can only ever match the audited content.
+            assert!(std::fs::write(&staged_path, b"mutated").is_err());
+            let file = staged.assets[0].fd.try_clone().unwrap();
+            assert_eq!(sha256_reader(&file).unwrap(), digest);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            std::fs::write(&staged_path, b"mutated").unwrap();
+            let file = staged.assets[0].fd.try_clone().unwrap();
+            assert_ne!(sha256_reader(&file).unwrap(), digest);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A release with no assets stages no directory - and its guard must
+    /// delete none either: the staging root and anything already inside it
+    /// are untouched when the empty set drops.
+    #[test]
+    fn an_empty_release_deletes_nothing_it_did_not_create() {
+        let root = scratch("release-empty");
+        let staging_root = root.join("staged");
+        let canary = staging_root.join("keep");
+        std::fs::create_dir_all(&canary).unwrap();
+        std::fs::write(canary.join("file"), b"stays").unwrap();
+        {
+            let staged = stage_release_assets(&[], &root, &staging_root).unwrap();
+            assert!(staged.dir.is_none());
+        }
+        assert!(
+            canary.join("file").exists(),
+            "an empty release must not remove state it never created"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
