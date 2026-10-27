@@ -2426,11 +2426,12 @@ fn cmd_auth(config: Option<&PathBuf>, command: AuthCommand) -> anyhow::Result<Ex
         } => {
             // Read the passphrase separately from the key: a combined prompt would
             // put both on one line, and stdin is the only channel that keeps it out
-            // of argv and shell history.
+            // of argv and shell history. A signing key has its own passphrase -
+            // it may legitimately differ from the account's authentication key.
             let pass = if signing {
-                None
+                read_optional_passphrase("signing key")?
             } else {
-                read_optional_passphrase()?
+                read_optional_passphrase("key")?
             };
             auth::cmd_import_key(&vault, &account, &file, signing, pass)?
         }
@@ -2813,6 +2814,13 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
     immobilise.push(hooks.clone());
     let anchor = configsig::anchor_path();
     let anchor_armed = anchor.exists();
+    // The anchor joins the enforcement surface: root-owned AND schg-flagged.
+    // Ownership alone is not protection - the file sits under a user-writable
+    // config directory where a same-UID process could unlink it and drop a
+    // substitute; the system-immutable flag is what removes that move.
+    if anchor_armed {
+        immobilise.push(anchor.clone());
+    }
 
     // Release what a previous install froze and hand the files back to this
     // user, so the copies below can replace them. Self-healing too: binaries
@@ -2834,6 +2842,18 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
         .context("failed to run sudo chown")?;
     if !status.success() {
         anyhow::bail!("sudo chown failed; the enforcement surface stays locked");
+    }
+    // The anchor's ownership is claimed here, before the flag step: a file
+    // that already carries schg cannot be chowned.
+    if anchor_armed {
+        let status = std::process::Command::new("sudo")
+            .args(["chown", "root:wheel"])
+            .arg(&anchor)
+            .status()
+            .context("failed to run sudo chown on the anchor")?;
+        if !status.success() {
+            anyhow::bail!("sudo chown of the anchor failed");
+        }
     }
 
     // 1. Deploy the binaries atomically. A rename over the target gives the
@@ -3076,25 +3096,12 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
             );
         }
     }
-    let mut anchor_ok = false;
-    if anchor_armed {
-        let status = std::process::Command::new("sudo")
-            .args(["chown", "root:wheel"])
-            .arg(&anchor)
-            .status()
-            .context("failed to run sudo chown on the anchor")?;
-        anchor_ok = status.success();
-        if !anchor_ok {
-            anyhow::bail!("sudo chown of the anchor failed");
-        }
-    }
-
     println!("installed to {}", bin_dir.display());
     println!("enforcement surface is immutable (schg):");
     for p in &immobilise {
         println!("  {}", p.display());
     }
-    if anchor_armed && anchor_ok {
+    if anchor_armed {
         println!(
             "signature enforcement: armed ({} is root-owned)",
             anchor.display()
@@ -4696,18 +4703,11 @@ fn cmd_ssh(config: Option<&PathBuf>, args: &[String]) -> anyhow::Result<ExitCode
 ///
 /// An empty line means "no passphrase". Reading it here rather than accepting it
 /// as an argument keeps it out of argv and out of shell history.
-fn read_optional_passphrase() -> anyhow::Result<Option<String>> {
-    use anyhow::Context as _;
-    use std::io::BufRead;
-    eprint!("passphrase for this key (empty if none): ");
-    use std::io::Write;
-    std::io::stderr().flush().ok();
-    let mut line = String::new();
-    std::io::stdin()
-        .lock()
-        .read_line(&mut line)
-        .context("could not read the key passphrase")?;
-    let t = line.trim_end_matches(['\n', '\r']).to_string();
+fn read_optional_passphrase(what: &str) -> anyhow::Result<Option<String>> {
+    let t = auth::read_secret_line(
+        &format!("passphrase for this {what} (empty if none, input hidden): "),
+        "the key passphrase",
+    )?;
     Ok(if t.is_empty() { None } else { Some(t) })
 }
 

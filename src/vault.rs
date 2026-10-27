@@ -63,6 +63,11 @@ pub struct Entry {
     /// exactly what this module exists to avoid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub passphrase: Option<String>,
+    /// Passphrase for `signing_key`, when it has one. Keys can legitimately
+    /// carry different passphrases, so the signing key does not borrow the
+    /// authentication key's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_passphrase: Option<String>,
 }
 
 /// Wire form that also accepts the earlier layout.
@@ -89,6 +94,8 @@ struct EntryFields {
     signing_key: Option<String>,
     #[serde(default)]
     passphrase: Option<String>,
+    #[serde(default)]
+    signing_passphrase: Option<String>,
 }
 
 impl From<EntryWire> for Entry {
@@ -99,12 +106,14 @@ impl From<EntryWire> for Entry {
                 ssh_key: None,
                 signing_key: None,
                 passphrase: None,
+                signing_passphrase: None,
             },
             EntryWire::Full(f) => Entry {
                 token: f.token,
                 ssh_key: f.ssh_key,
                 signing_key: f.signing_key,
                 passphrase: f.passphrase,
+                signing_passphrase: f.signing_passphrase,
             },
         }
     }
@@ -116,6 +125,7 @@ impl Entry {
             && self.ssh_key.is_none()
             && self.signing_key.is_none()
             && self.passphrase.is_none()
+            && self.signing_passphrase.is_none()
     }
 }
 
@@ -167,6 +177,13 @@ impl Store {
             .entry(account.to_string())
             .or_default()
             .signing_key = Some(key.to_string());
+    }
+
+    pub fn set_signing_passphrase(&mut self, account: &str, pass: &str) {
+        self.accounts
+            .entry(account.to_string())
+            .or_default()
+            .signing_passphrase = Some(pass.to_string());
     }
 
     /// Drop an entry once nothing is held for it, so a listing does not show an
@@ -264,11 +281,21 @@ impl Vault {
             .and_then(|e| e.passphrase.clone())
     }
 
+    /// The passphrase for an account's signing key, when one is held. Entries
+    /// imported before the fields split stored the passphrase in `passphrase`;
+    /// those keep working until they are re-imported.
+    pub fn signing_passphrase_for(&self, account: &str) -> Option<String> {
+        self.load()
+            .ok()?
+            .entry(account)
+            .and_then(|e| e.signing_passphrase.clone().or(e.passphrase.clone()))
+    }
+
     /// The public half of an account's signing key, derived without writing the
     /// private key anywhere.
     pub fn signing_key_public(&self, account: &str) -> Result<String> {
         let key = self.signing_key_for(account)?;
-        let pass = self.passphrase_for(account);
+        let pass = self.signing_passphrase_for(account);
         crate::sign::public_key_of_material(&key, pass.as_deref())
     }
 

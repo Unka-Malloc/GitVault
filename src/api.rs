@@ -13,6 +13,7 @@
 //! the target repository, and issuance refuses if the routing is not explicit.
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
@@ -311,6 +312,27 @@ fn authorize(cfg: &Config, target: &Target, vault: &Vault) -> Result<String> {
     Ok(token)
 }
 
+/// The transport executable: the platform's own curl, checked against the same
+/// root-owned / non-replaceable chain rule the audit engine must pass. A PATH
+/// lookup would hand the vault token to whatever `curl` a writable directory
+/// happens to name first.
+#[cfg(unix)]
+fn curl_program() -> Result<PathBuf> {
+    let program = PathBuf::from("/usr/bin/curl");
+    anyhow::ensure!(
+        crate::configsig::executable_is_trusted(&program),
+        "the transport executable {} is not trusted (root-owned, unwritable, \
+         non-replaceable chain required)",
+        program.display()
+    );
+    Ok(program)
+}
+
+#[cfg(not(unix))]
+fn curl_program() -> Result<PathBuf> {
+    Ok(PathBuf::from("curl"))
+}
+
 /// Authorize, send the request and return the HTTP status and response body.
 /// Output policy (printing, jq, error reporting) is the caller's choice.
 fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, String, Option<String>)> {
@@ -355,13 +377,13 @@ fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, String, O
         None
     };
     #[cfg(unix)]
-    let pipe_read = body_pipe
+    let (pipe_read, pipe_write) = body_pipe
         .as_ref()
-        .map(|(reader, _)| {
+        .map(|(reader, writer)| {
             use std::os::unix::io::AsRawFd as _;
-            reader.as_raw_fd()
+            (reader.as_raw_fd(), writer.as_raw_fd())
         })
-        .unwrap_or(-1);
+        .unwrap_or((-1, -1));
     #[cfg(not(unix))]
     anyhow::ensure!(
         req.body_stream.is_none(),
@@ -369,11 +391,21 @@ fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, String, O
     );
 
     let mut args: Vec<String> = vec![
+        // First argument is `-q`: curl skips the user's curlrc entirely, so a
+        // ~/.curlrc cannot weaken TLS, add redirects or set a proxy under the
+        // broker's endpoint allowlist.
+        "-q".into(),
         "-sS".into(),
         // One request carries one URL: curl's `{}`/`[]` globbing could expand
         // a single classified path into requests to routes the publication
         // check never saw (e.g. a `releases` write riding inside a read).
         "--globoff".into(),
+        // The token may only ride HTTPS - no protocol downgrade, and no
+        // redirect may carry it to another scheme either.
+        "--proto".into(),
+        "=https".into(),
+        "--proto-redir".into(),
+        "=https".into(),
         "-X".into(),
         req.method.to_ascii_uppercase(),
         // The token arrives on stdin, never in argv.
@@ -451,9 +483,15 @@ fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, String, O
     }
     args.push(url);
 
-    let mut command = Command::new("curl");
+    // The broker's transport is the system curl, never whatever `curl` a PATH
+    // search finds: a shim in a user-writable directory would receive the
+    // token. The executable must pass the same trust check the audit engine
+    // does, and the child starts with an empty environment so CURL_* or
+    // proxy variables cannot steer the request.
+    let mut command = Command::new(curl_program()?);
     command
         .args(&args)
+        .env_clear()
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -461,15 +499,18 @@ fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, String, O
     if req.body_stream.is_some() {
         // The child gets exactly the read descriptor and nothing else:
         // clearing its close-on-exec flag in pre-exec lets `/dev/fd/N`
-        // survive the exec at the same number, while the write end stays
-        // marked and never reaches curl at all.
+        // survive the exec at the same number, and the write end is closed
+        // explicitly so curl can never hold the pipe open past our last
+        // write.
         use std::os::unix::process::CommandExt as _;
         let inherited = pipe_read;
+        let writer = pipe_write;
         unsafe {
             command.pre_exec(move || {
                 if libc::fcntl(inherited, libc::F_SETFD, 0) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
+                libc::close(writer);
                 Ok(())
             });
         }

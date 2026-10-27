@@ -172,15 +172,14 @@ pub fn run(cfg: &Config, vault: &Vault, args: &[String], cwd: &Path) -> Result<i
     // an egress operation still needs a window. Reading the key for a local signature
     // is not egress.
     let key = vault.signing_key_for(&account)?;
-    let passphrase = vault.passphrase_for(&account);
+    let passphrase = vault.signing_passphrase_for(&account);
 
+    // The guard kills the agent on every exit path - a failure after the key
+    // is loaded cannot leave a live agent holding it.
     let agent = crate::ssh::start_agent()?;
     // Signing keys are always stored encrypted (import requires the passphrase),
     // so a missing one is a setup defect, not an unencrypted key.
-    if let Err(e) = crate::ssh::load_key(&agent.sock, &key, passphrase.as_deref(), true) {
-        agent.stop();
-        return Err(e);
-    }
+    crate::ssh::load_key(&agent.sock, &key, passphrase.as_deref(), true)?;
 
     // Signing itself uses the agent; `-f` only needs a public key, which holds no
     // secret. The public key's temporary file lives inside this guard and is
@@ -234,9 +233,8 @@ pub fn run(cfg: &Config, vault: &Vault, args: &[String], cwd: &Path) -> Result<i
         .status()
         .context("failed to run ssh-keygen")?;
 
-    // ssh-keygen wrote the signature to stdout, which is where git reads it. The
-    // only remaining work is to stop the temporary agent.
-    agent.stop();
+    // ssh-keygen wrote the signature to stdout, which is where git reads it.
+    // The agent guard drops here and stops the temporary agent itself.
     Ok(status.code().unwrap_or(1))
 }
 

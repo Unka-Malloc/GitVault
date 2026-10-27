@@ -151,11 +151,10 @@ pub fn run(cfg: &Config, vault: &Vault, args: &[String]) -> Result<i32> {
     let passphrase = vault.passphrase_for(&account);
 
     // A throwaway agent holds the key in memory. Nothing is written to disk.
+    // The guard's Drop kills the agent on every exit path, including an error
+    // after the key was loaded - nothing below may skip that teardown.
     let agent = start_agent()?;
-    if let Err(e) = load_key(&agent.sock, &key, passphrase.as_deref(), false) {
-        agent.stop();
-        return Err(e);
-    }
+    load_key(&agent.sock, &key, passphrase.as_deref(), false)?;
 
     // Run the real ssh with the throwaway agent and no identities of its own.
     let status = Command::new("ssh")
@@ -168,7 +167,6 @@ pub fn run(cfg: &Config, vault: &Vault, args: &[String]) -> Result<i32> {
         .status()
         .context("failed to run ssh")?;
 
-    agent.stop();
     Ok(status.code().unwrap_or(1))
 }
 
@@ -206,6 +204,14 @@ pub struct Agent {
 impl Agent {
     pub fn stop(&self) {
         let _ = kill_agent(self.pid.as_deref());
+    }
+}
+
+/// The agent dies with its guard: an early return, a failed load or a refused
+/// connection can never leave a live process holding the vault key.
+impl Drop for Agent {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 

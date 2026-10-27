@@ -61,34 +61,86 @@ pub fn cmd_add(vault: &Vault, account: &str) -> Result<()> {
 
 /// Read a token without echoing it and without putting it in argv.
 fn read_token(account: &str) -> Result<String> {
+    read_secret_line(
+        &format!("token for {account} (input hidden): "),
+        "the token",
+    )
+}
+
+/// Read one secret line: prompt on stderr, no terminal echo, nothing in argv.
+///
+/// A terminal whose echo cannot be disabled refuses rather than leaking the
+/// secret into scrollback; the restore guard puts the terminal back on every
+/// exit path, including an interrupted or failed read. A non-terminal stdin is
+/// the piped-input mode and reads plainly.
+pub(crate) fn read_secret_line(prompt: &str, what: &str) -> Result<String> {
     let stdin = io::stdin();
-    if stdin.is_terminal() {
-        eprint!("token for {account} (input hidden): ");
-        io::stderr().flush().ok();
-        let token = rpassword_fallback()?;
-        eprintln!();
-        Ok(token.trim().to_string())
-    } else {
+    if !stdin.is_terminal() {
         let mut line = String::new();
         stdin
             .lock()
             .read_line(&mut line)
-            .context("could not read the token from stdin")?;
-        Ok(line.trim().to_string())
+            .with_context(|| format!("could not read {what} from stdin"))?;
+        return Ok(line.trim_end_matches(['\n', '\r']).to_string());
+    }
+    eprint!("{prompt}");
+    io::stderr().flush().ok();
+    let line = {
+        let _hidden = HiddenEcho::engage()?;
+        let mut line = String::new();
+        stdin
+            .lock()
+            .read_line(&mut line)
+            .with_context(|| format!("could not read {what}"))?;
+        line
+    };
+    eprintln!();
+    Ok(line.trim_end_matches(['\n', '\r']).to_string())
+}
+
+/// The terminal with echo switched off; dropping restores the saved flags.
+/// On a terminal, hidden input either holds or the read never happens.
+#[cfg(unix)]
+struct HiddenEcho {
+    fd: i32,
+    saved: libc::termios,
+}
+
+#[cfg(unix)]
+impl HiddenEcho {
+    fn engage() -> Result<Self> {
+        use std::os::unix::io::AsRawFd as _;
+        let fd = io::stdin().as_raw_fd();
+        let mut saved = unsafe { std::mem::zeroed::<libc::termios>() };
+        if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
+            anyhow::bail!("cannot read terminal state for hidden input");
+        }
+        let mut hidden = saved;
+        hidden.c_lflag &= !(libc::ECHO | libc::ECHONL);
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &hidden) } != 0 {
+            anyhow::bail!("cannot disable terminal echo for hidden input");
+        }
+        Ok(Self { fd, saved })
     }
 }
 
-/// Minimal hidden-input reader. Avoids a dependency for one prompt; falls back to
-/// a plain read when the terminal cannot be put in no-echo mode.
-fn rpassword_fallback() -> Result<String> {
-    let status = std::process::Command::new("stty").arg("-echo").status();
-    let mut line = String::new();
-    let read = io::stdin().lock().read_line(&mut line);
-    if status.map(|s| s.success()).unwrap_or(false) {
-        let _ = std::process::Command::new("stty").arg("echo").status();
+#[cfg(unix)]
+impl Drop for HiddenEcho {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.saved);
+        }
     }
-    read.context("could not read the token")?;
-    Ok(line)
+}
+
+#[cfg(not(unix))]
+struct HiddenEcho;
+
+#[cfg(not(unix))]
+impl HiddenEcho {
+    fn engage() -> Result<Self> {
+        anyhow::bail!("hidden terminal input is not supported on this platform")
+    }
 }
 
 /// Remove selected material for an account.
@@ -110,6 +162,10 @@ pub fn cmd_remove(vault: &Vault, account: &str, what: RemoveWhat) -> Result<()> 
         entry.ssh_key.is_some().then_some("ssh-key"),
         entry.signing_key.is_some().then_some("signing-key"),
         entry.passphrase.is_some().then_some("passphrase"),
+        entry
+            .signing_passphrase
+            .is_some()
+            .then_some("signing-passphrase"),
     ]
     .into_iter()
     .flatten()
@@ -148,6 +204,9 @@ pub fn cmd_remove(vault: &Vault, account: &str, what: RemoveWhat) -> Result<()> 
             if e.passphrase.take().is_some() {
                 removed.push("passphrase");
             }
+            if e.signing_passphrase.take().is_some() {
+                removed.push("signing-passphrase");
+            }
         }
     }
     store.prune(account);
@@ -174,7 +233,11 @@ pub fn cmd_remove_key(vault: &Vault, account: &str, signing: bool) -> Result<()>
         };
         found = slot.take().is_some();
         // A passphrase with no key left to unlock is dead weight.
-        if !signing && e.ssh_key.is_none() && e.signing_key.is_none() {
+        if signing {
+            if e.signing_key.is_none() {
+                e.signing_passphrase = None;
+            }
+        } else if e.ssh_key.is_none() {
             e.passphrase = None;
         }
     }
@@ -222,6 +285,9 @@ pub fn cmd_list(vault: &Vault, cfg: &Config, json: bool) -> Result<()> {
         }
         if e.passphrase.is_some() {
             kinds.push("passphrase".to_string());
+        }
+        if e.signing_passphrase.is_some() {
+            kinds.push("signing-passphrase".to_string());
         }
         kinds
     };
@@ -292,7 +358,11 @@ pub fn cmd_import_key(
     if let Some(pass) = passphrase
         && !pass.is_empty()
     {
-        store.set_passphrase(account, &pass);
+        if signing {
+            store.set_signing_passphrase(account, &pass);
+        } else {
+            store.set_passphrase(account, &pass);
+        }
     }
     vault.save(&store)?;
 

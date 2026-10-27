@@ -166,14 +166,35 @@ fn load_rulings_at(path: &Path) -> Vec<Ruling> {
     if !path.is_file() {
         return Vec::new();
     }
-    if crate::configsig::verify(path).is_err() {
-        eprintln!("gitvault: objections ledger is not signed - no ruling applies");
-        return Vec::new();
-    }
-    let entries = match load_list(path, "ruling") {
-        Ok(entries) => entries,
+    // One buffer, verified and parsed: a ledger swapped between a path-level
+    // verify and a second read would waive findings it never proved.
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
         Err(e) => {
             eprintln!("gitvault: objections ledger unreadable - {e}");
+            return Vec::new();
+        }
+    };
+    match crate::configsig::signature_state_for(path, &raw) {
+        crate::configsig::SigState::Valid | crate::configsig::SigState::Inactive => {}
+        crate::configsig::SigState::Invalid(reason) => {
+            eprintln!("gitvault: objections ledger is not certified - {reason}");
+            return Vec::new();
+        }
+    }
+    let entries = match String::from_utf8(raw) {
+        Ok(text) => match toml::from_str::<toml::Value>(&text) {
+            Ok(doc) => doc
+                .get("ruling")
+                .and_then(|v| v.as_array().cloned())
+                .unwrap_or_default(),
+            Err(e) => {
+                eprintln!("gitvault: objections ledger unreadable - {e}");
+                return Vec::new();
+            }
+        },
+        Err(_) => {
+            eprintln!("gitvault: objections ledger is not text - no ruling applies");
             return Vec::new();
         }
     };
@@ -206,9 +227,42 @@ pub fn write_rulings(rulings: &[Ruling], key: &str) -> Result<(), String> {
         body.push_str(&body_lines.join("\n"));
         body.push('\n');
     }
-    std::fs::write(&path, body).map_err(|e| format!("{}: {e}", path.display()))?;
-    crate::configsig::sign(&path, key).map_err(|e| e.to_string())?;
-    Ok(())
+    // Sign exactly the approved bytes, then land the pair atomically. Writing
+    // the ledger in place before signing would let a same-user process swap
+    // the path between the write and the sign, certifying bytes the operator
+    // never saw.
+    let dir = path
+        .parent()
+        .ok_or_else(|| format!("{} has no directory", path.display()))?;
+    let tmp = dir.join(format!(
+        ".rulings-{}-{:016x}.tmp",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    std::fs::write(&tmp, &body).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    let outcome = (|| -> Result<(), String> {
+        crate::configsig::sign(&tmp, key).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))?;
+        std::fs::rename(
+            crate::configsig::sig_path(&tmp),
+            crate::configsig::sig_path(&path),
+        )
+        .map_err(|e| format!("ledger signature rename: {e}"))?;
+        // The bytes that landed must be the bytes that were signed; a final
+        // path cannot be a different file swapped in behind the rename.
+        let landed = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if landed != body.as_bytes() {
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(crate::configsig::sig_path(&path));
+            return Err("the signed ledger on disk is not the approved buffer - removed".into());
+        }
+        Ok(())
+    })();
+    if outcome.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(crate::configsig::sig_path(&tmp));
+    }
+    outcome
 }
 
 #[cfg(test)]

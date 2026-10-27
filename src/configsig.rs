@@ -314,13 +314,37 @@ pub fn sig_path(config_path: &Path) -> PathBuf {
 pub enum Anchor {
     /// No anchor: legacy mode, unsigned configurations are accepted.
     Absent,
-    /// Present but user-owned: a same-user process could have planted it, so it
-    /// anchors nothing. Verification stays off and a warning is printed so the
-    /// setup gap is visible rather than silent.
+    /// Present but not immobilised: a same-user process could plant or replace
+    /// it, so it anchors nothing. Boundaries fail closed rather than downgrade
+    /// to unsigned acceptance.
     Unanchored,
-    /// Root-owned: enforcement is on, unsigned or wrongly signed configurations
-    /// are refused.
+    /// Root-owned and irreplaceable by this user: enforcement is on, unsigned
+    /// or wrongly signed configurations are refused.
     Anchored,
+}
+
+/// Whether the anchor's inode and name are beyond this user's reach: a
+/// root-owned regular file, no group/other write or extended ACL, and either
+/// the system-immutable flag or a directory chain no non-root rename can move.
+/// A root-owned file under a user-writable parent is still replaceable - the
+/// parent lets a same-UID process unlink it and drop a substitute anchor.
+#[cfg(unix)]
+fn anchor_is_protected(anchor: &Path, meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return false;
+    }
+    if meta.uid() != 0 || file_is_untrusted_writable(meta) || has_extended_acl(anchor) {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::MetadataExt as _;
+        if trusted_executable_locked(meta.st_flags()) {
+            return true;
+        }
+    }
+    !path_is_user_replaceable(anchor)
 }
 
 pub fn anchor_state(anchor: &Path) -> Anchor {
@@ -340,14 +364,12 @@ pub fn anchor_state(anchor: &Path) -> Anchor {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
-        if std::fs::metadata(anchor)
-            .map(|m| m.uid() == 0)
-            .unwrap_or(false)
-        {
-            Anchor::Anchored
-        } else {
-            Anchor::Unanchored
+        match std::fs::symlink_metadata(anchor) {
+            Ok(meta) if anchor_is_protected(anchor, &meta) => Anchor::Anchored,
+            // An anchor that exists but cannot be proven protected is not
+            // "absent": treating it as legacy mode would let a same-user
+            // process disarm enforcement by degrading the file.
+            _ => Anchor::Unanchored,
         }
     }
     #[cfg(not(unix))]
@@ -377,7 +399,16 @@ pub enum SigState {
 pub fn signature_state(config_path: &Path) -> SigState {
     let anchor = anchor_path();
     match anchor_state(&anchor) {
-        Anchor::Absent | Anchor::Unanchored => SigState::Inactive,
+        Anchor::Absent => SigState::Inactive,
+        // An anchor that cannot be proven protected is a degraded trust root:
+        // unsigned or tampered routing must refuse, not fall back to legacy
+        // acceptance - otherwise deleting the flag removes enforcement.
+        Anchor::Unanchored => SigState::Invalid(format!(
+            "the trust anchor {} is present but not protected (root-owned and \
+             system-immutable or beneath a root-owned chain) - enforcement \
+             cannot tell armed from tampered; run `gitvault install`",
+            anchor.display()
+        )),
         Anchor::Anchored => {
             if !sig_path(config_path).exists() {
                 return SigState::Invalid(format!("{} is unsigned", config_path.display()));
@@ -400,7 +431,12 @@ pub fn signature_state(config_path: &Path) -> SigState {
 pub fn signature_state_for(config_path: &Path, data: &[u8]) -> SigState {
     let anchor = anchor_path();
     match anchor_state(&anchor) {
-        Anchor::Absent | Anchor::Unanchored => SigState::Inactive,
+        Anchor::Absent => SigState::Inactive,
+        Anchor::Unanchored => SigState::Invalid(format!(
+            "the trust anchor {} is present but not protected - refusing to \
+             trust unsigned routing; run `gitvault install`",
+            anchor.display()
+        )),
         Anchor::Anchored => {
             if !sig_path(config_path).exists() {
                 return SigState::Invalid(format!("{} is unsigned", config_path.display()));
@@ -423,15 +459,6 @@ pub fn signature_state_for(config_path: &Path, data: &[u8]) -> SigState {
 /// Audit surfaces use [`signature_state`] instead: they run first and ask for
 /// the blessing afterwards.
 pub fn verify(config_path: &Path) -> Result<()> {
-    let anchor = anchor_path();
-    if anchor_state(&anchor) == Anchor::Unanchored {
-        eprintln!(
-            "gitvault: {} exists but is not root-owned; signature enforcement is inactive\n  \
-             fix: run `gitvault install` (or sudo chown root:wheel {})",
-            anchor.display(),
-            anchor.display()
-        );
-    }
     match signature_state(config_path) {
         SigState::Valid | SigState::Inactive => Ok(()),
         SigState::Invalid(reason) => {

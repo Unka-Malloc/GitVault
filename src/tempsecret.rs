@@ -34,9 +34,15 @@ impl TempSecret {
             opts.mode(mode);
         }
         use std::io::Write;
-        opts.open(&path)
+        if let Err(why) = opts
+            .open(&path)
             .and_then(|mut f| f.write_all(contents.as_bytes()))
-            .with_context(|| format!("could not create {}", path.display()))?;
+        {
+            // A failed write must not leave a partial secret on disk: the
+            // name is gone before the error surfaces.
+            let _ = std::fs::remove_file(&path);
+            return Err(why).with_context(|| format!("could not create {}", path.display()));
+        }
         Ok(Self { path })
     }
 
