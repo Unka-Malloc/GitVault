@@ -17,7 +17,7 @@
 //! the key is loaded into it, and ssh is pointed at that socket. An agent cannot
 //! read a file that does not exist.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
@@ -299,11 +299,19 @@ pub fn load_key(
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     if let (Some(guard), Some(p)) = (&askpass, passphrase) {
-        // execve needs a real path - a /dev/fd spelling cannot be exec'd -
-        // so the script keeps its re-asserted path under the pinned root;
-        // it carries no secret, only the fixed `print the variable` body.
-        cmd.env("SSH_ASKPASS", guard.path()?)
-            .env("SSH_ASKPASS_REQUIRE", "force")
+        // execve needs a real path, so a /dev/fd spelling cannot serve an
+        // executable helper. Instead the child's cwd is bound to the pinned
+        // scratch directory and SSH_ASKPASS is the RELATIVE name: the exec
+        // resolves `./name` inside the pinned inode, and no path component
+        // a same-user process could reparent stands in the lookup.
+        #[cfg(unix)]
+        {
+            guard.fchdir_child(&mut cmd);
+            cmd.env("SSH_ASKPASS", Path::new(".").join(guard.name()));
+        }
+        #[cfg(not(unix))]
+        cmd.env("SSH_ASKPASS", guard.path()?);
+        cmd.env("SSH_ASKPASS_REQUIRE", "force")
             .env("DISPLAY", ":0")
             .env("GITVAULT_ASKPASS_VALUE", p);
     }

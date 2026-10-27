@@ -397,7 +397,7 @@ fn signed_redirect_target(url: &str) -> Result<String> {
 ///
 /// Returns `(status, next_redirect)`.
 #[cfg(unix)]
-fn stream_signed_target(url: &str, sink: &mut impl std::io::Write) -> Result<(i32, String)> {
+fn stream_signed_target(url: &str, sink: &mut dyn std::io::Write) -> Result<(i32, String)> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
     anyhow::ensure!(
         !url.contains(['"', '\\', '\n', '\r']),
@@ -412,7 +412,7 @@ fn stream_signed_target(url: &str, sink: &mut impl std::io::Write) -> Result<(i3
         "cannot create the redirect hop's header pipe: {}",
         std::io::Error::last_os_error()
     );
-    let (header_read, header_write) = unsafe {
+    let (mut header_read, header_write) = unsafe {
         (
             std::fs::File::from_raw_fd(header_pipe[0]),
             std::fs::File::from_raw_fd(header_pipe[1]),
@@ -465,29 +465,28 @@ fn stream_signed_target(url: &str, sink: &mut impl std::io::Write) -> Result<(i3
         .context("no stdin for the redirect hop")?
         .write_all(format!("url = \"{url}\"\n").as_bytes())
         .context("could not hand the signed URL to curl")?;
-    let mut headers = String::new();
-    header_read
-        .take(64 * 1024)
-        .read_to_string(&mut headers)
-        .context("could not read the redirect hop's headers")?;
-    let status = headers
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("HTTP/")
-                .and_then(|rest| rest.split_whitespace().nth(1))
-                .and_then(|code| code.parse::<i32>().ok())
-        })
-        .unwrap_or(0);
-    let redirect = headers
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.trim()
-                .eq_ignore_ascii_case("location")
-                .then(|| value.trim().to_string())
-        })
-        .unwrap_or_default();
+    // The head block ends at the first blank line - read exactly that
+    // far, bounded, instead of waiting on the descriptor's EOF: curl keeps
+    // the `-D` handle open for the whole transfer, so waiting for EOF
+    // would deadlock against a body that fills its pipe before exit.
+    let mut headers = Vec::new();
+    {
+        let mut byte = [0u8; 1];
+        while headers.len() < 64 * 1024 && !headers.ends_with(b"\r\n\r\n") {
+            match header_read.read(&mut byte) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => headers.push(byte[0]),
+            }
+        }
+    }
+    let (status, redirect) =
+        parse_response_head(&headers).context("the download host sent no complete header block")?;
     if status >= 400 {
+        // The error page's body still fills the stdout pipe - drain it
+        // before waiting or the child parks mid-transfer and never exits.
+        if let Some(mut body) = child.stdout.take() {
+            std::io::copy(&mut body, &mut std::io::sink()).ok();
+        }
         let out = child
             .wait_with_output()
             .context("the redirect hop did not finish")?;
@@ -517,10 +516,40 @@ fn stream_signed_target(url: &str, sink: &mut impl std::io::Write) -> Result<(i3
     Ok((status, String::new()))
 }
 
+/// Parse a complete HTTP response head (status + Location) out of the bytes
+/// a `-D` dump handed us. The block must end at a CRLF blank line - that is
+/// the bound that lets the caller stop reading while the transfer is still
+/// streaming, instead of waiting for an EOF that only arrives at exit.
+fn parse_response_head(raw: &[u8]) -> Option<(i32, String)> {
+    let cut = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)?;
+    let head = String::from_utf8_lossy(&raw[..cut]);
+    let status = head
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("HTTP/")
+                .and_then(|rest| rest.split_whitespace().nth(1))
+                .and_then(|code| code.parse::<i32>().ok())
+        })
+        .unwrap_or(0);
+    let redirect = head
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("location")
+                .then(|| value.trim().to_string())
+        })
+        .unwrap_or_default();
+    Some((status, redirect))
+}
+
 /// Redirect hops need descriptor passing that only unix provides; a follow
 /// request there refuses before the first hop rather than after it.
 #[cfg(not(unix))]
-fn stream_signed_target(_url: &str, _sink: &mut impl std::io::Write) -> Result<(i32, String)> {
+fn stream_signed_target(_url: &str, _sink: &mut dyn std::io::Write) -> Result<(i32, String)> {
     anyhow::bail!("--follow needs descriptor inheritance, which this platform lacks")
 }
 
@@ -551,7 +580,12 @@ fn split_transport_output(stdout: &[u8]) -> (Vec<u8>, i32, String) {
 
 /// Authorize, send the request and return the HTTP status and response body.
 /// Output policy (printing, jq, error reporting) is the caller's choice.
-fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, Vec<u8>, Option<String>)> {
+fn perform(
+    cfg: &Config,
+    vault: &Vault,
+    req: &Request,
+    sink: &mut dyn std::io::Write,
+) -> Result<(i32, Vec<u8>, Option<String>)> {
     // Redirect following exists for the log/archive GETs it was built
     // for: a second hop cannot carry a different method's contract, and a
     // body that streams straight to the caller's stdout cannot be
@@ -826,9 +860,7 @@ fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, Vec<u8>, 
     let mut hops = 0;
     while req.follow && hops < 4 && (300..400).contains(&status) && !redirect.is_empty() {
         let target = signed_redirect_target(&redirect)?;
-        let mut sink = std::io::stdout().lock();
-        let (next_status, next_redirect) = stream_signed_target(&target, &mut sink)?;
-        use std::io::Write as _;
+        let (next_status, next_redirect) = stream_signed_target(&target, sink)?;
         sink.flush()?;
         status = next_status;
         redirect = next_redirect;
@@ -839,7 +871,15 @@ fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, Vec<u8>, 
 }
 
 pub fn run(cfg: &Config, vault: &Vault, req: &Request) -> Result<i32> {
-    let (status, body, _sent) = perform(cfg, vault, req)?;
+    // A followed response streams to the caller's sink while it downloads:
+    // --silent drains those bytes too, so a silent call never leaks a log
+    // body to the terminal or a pipeline capture.
+    let mut sink: Box<dyn std::io::Write> = if req.silent {
+        Box::new(std::io::sink())
+    } else {
+        Box::new(std::io::stdout().lock())
+    };
+    let (status, body, _sent) = perform(cfg, vault, req, &mut sink)?;
     if status >= 400 {
         // Relay the API's own message: it is the most useful thing to show, and it
         // never contains the token.
@@ -876,7 +916,7 @@ pub fn run(cfg: &Config, vault: &Vault, req: &Request) -> Result<i32> {
 /// resolving an owner's account type before choosing a list endpoint) use this;
 /// the credential handling is identical to `run`.
 pub fn run_value(cfg: &Config, vault: &Vault, req: &Request) -> Result<String> {
-    let (status, body, _sent) = perform(cfg, vault, req)?;
+    let (status, body, _sent) = perform(cfg, vault, req, &mut std::io::sink())?;
     let body = String::from_utf8_lossy(&body).to_string();
     if status >= 400 {
         bail!("HTTP {status}: {}", body.trim());
@@ -897,7 +937,7 @@ pub fn run_value_streamed(cfg: &Config, vault: &Vault, req: &Request) -> Result<
         req.body_stream.is_some(),
         "a streamed upload needs its source descriptor"
     );
-    let (status, body, sent) = perform(cfg, vault, req)?;
+    let (status, body, sent) = perform(cfg, vault, req, &mut std::io::sink())?;
     let body = String::from_utf8_lossy(&body).to_string();
     if status >= 400 {
         bail!("HTTP {status}: {}", body.trim());
@@ -1173,6 +1213,32 @@ mod tests {
             .to_string();
         assert!(err.contains("evil.example"), "{err}");
         assert!(!err.contains("SECRET"), "{err}");
+    }
+
+    /// The response head is complete at the CRLF blank line - that bound
+    /// lets the reader stop while curl is still streaming the body, so a
+    /// transfer bigger than the pipe capacity cannot deadlock the hop.
+    /// Trailing bytes after the cut (a body curl wrote through `-D` only
+    /// up to the head) never reach the parser.
+    #[test]
+    fn a_response_head_is_complete_at_the_blank_line() {
+        let raw = b"HTTP/2 200\r\ncontent-type: application/zip\r\nlocation: https://x.blob.core.windows.net/a\r\n\r\nBODY-BYTES-CONTINUE";
+        let (status, redirect) = parse_response_head(raw).expect("a complete head");
+        assert_eq!(status, 200);
+        assert_eq!(redirect, "https://x.blob.core.windows.net/a");
+
+        // A 302 the way GitHub answers /logs.
+        let raw = b"HTTP/2 302\r\nlocation: https://objects.githubusercontent.com/y?sig=z\r\n\r\n";
+        let (status, redirect) = parse_response_head(raw).expect("a complete head");
+        assert_eq!(status, 302);
+        assert_eq!(redirect, "https://objects.githubusercontent.com/y?sig=z");
+
+        // An unterminated head is no head at all - refuse instead of
+        // parsing a truncated block.
+        assert!(parse_response_head(b"HTTP/2 200\r\ncontent-type: text/plain\r\n").is_none());
+        // Location matching is case-insensitive per HTTP.
+        let raw = b"HTTP/1.1 301\r\nLocation: https://github.com/a\r\n\r\n";
+        assert_eq!(parse_response_head(raw).unwrap().1, "https://github.com/a");
     }
 
     #[test]

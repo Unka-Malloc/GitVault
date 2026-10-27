@@ -149,6 +149,45 @@ impl ScratchRoot {
         }
     }
 
+    /// Create a subdirectory relative to the pinned descriptor itself:
+    /// `mkdirat` binds the create to the inode the boundary check judged,
+    /// so no path component - swapped, moved or replanted - can redirect
+    /// where the key directory lands.
+    #[cfg(unix)]
+    pub fn mkdir_pinned(&self, leaf: &std::ffi::OsStr, mode: libc::mode_t) -> Result<PathBuf> {
+        use std::os::fd::AsRawFd as _;
+        let cname = std::ffi::CString::new(leaf.as_encoded_bytes())
+            .context("leaf name is not encodable")?;
+        anyhow::ensure!(
+            unsafe { libc::mkdirat(self.fd.as_raw_fd(), cname.as_ptr(), mode) } == 0,
+            "cannot create the pinned scratch leaf: {}",
+            std::io::Error::last_os_error()
+        );
+        Ok(self.path.join(leaf))
+    }
+
+    /// Remove a leaf created by `mkdir_pinned` along with the file names
+    /// `keygen` leaves in it - each `unlinkat` resolves inside the pinned
+    /// inode, so a reparented scratch root cannot redirect the delete to
+    /// names outside it.
+    #[cfg(unix)]
+    pub fn remove_leaf_pinned(&self, leaf: &std::ffi::OsStr, files: &[&str]) {
+        use std::os::fd::AsRawFd as _;
+        for file in files {
+            let composite = Path::new(leaf).join(file);
+            if let Ok(name) = std::ffi::CString::new(composite.as_os_str().as_encoded_bytes()) {
+                unsafe {
+                    libc::unlinkat(self.fd.as_raw_fd(), name.as_ptr(), 0);
+                }
+            }
+        }
+        if let Ok(name) = std::ffi::CString::new(leaf.as_encoded_bytes()) {
+            unsafe {
+                libc::unlinkat(self.fd.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
+            }
+        }
+    }
+
     /// The validated root's path - re-verified against the pinned
     /// descriptor on every call. A relocation after the boundary check
     /// makes the descriptor's live path differ from the one that was

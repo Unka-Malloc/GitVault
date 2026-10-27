@@ -293,8 +293,15 @@ pub fn public_key_of_material(private: &str, passphrase: Option<&str>) -> Result
     #[cfg(not(unix))]
     cmd.arg(secret.path()?);
     if let (Some(guard), Some(p)) = (&askpass, passphrase) {
-        // execve needs a real path for the askpass helper - /dev/fd cannot
-        // be exec'd - so the script keeps its re-asserted path.
+        // execve cannot take a /dev/fd spelling, so the askpass script is
+        // handed over the same way - relative name inside an fchdir-bound
+        // pinned cwd - rather than a reparent-able absolute path.
+        #[cfg(unix)]
+        {
+            guard.fchdir_child(&mut cmd);
+            cmd.env("SSH_ASKPASS", std::path::Path::new(".").join(guard.name()));
+        }
+        #[cfg(not(unix))]
         cmd.env("SSH_ASKPASS", guard.path()?);
         cmd.env("SSH_ASKPASS_REQUIRE", "force")
             .env("DISPLAY", ":0")

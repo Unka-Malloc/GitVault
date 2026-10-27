@@ -3361,15 +3361,17 @@ fn publication_surface(method: &str, path: &str) -> Option<String> {
         // pages build publishes a site; deploy keys, hooks and deployments
         // move trust or publish refs. None of it passes through an audited
         // push, so every mutating verb on any of these surfaces refuses.
-        // `repository_dispatch` and `workflow_dispatch` fire privileged
-        // workflows on a caller-chosen ref with caller-shaped payloads;
-        // every other `actions` write (rerun, approve, cancel, secrets,
-        // variables, cache) steers CI authority too. All refuse: a workflow
-        // that runs unaudited code under CI credentials IS a publication.
-        Some("dispatches" | "actions") => true,
+        // `repository_dispatch`/`workflow_dispatch` fire privileged
+        // workflows on a caller-chosen ref with caller payloads - CI
+        // authority IS publication power; `actions` writes (rerun, approve,
+        // cancel, secrets, variables, caches) steer the same authority;
+        // `forks`, `generate`, `import` and `migrations` mint repositories;
+        // `transfer`, `branches`, `pages`, `keys`, `hooks` and `deployments`
+        // move trust or refs outside an audited push. Every mutating verb
+        // on these surfaces refuses: nothing here publishes unreviewed code.
         Some(
-            "forks" | "generate" | "import" | "transfer" | "branches" | "pages" | "keys" | "hooks"
-            | "deployments",
+            "dispatches" | "actions" | "forks" | "generate" | "import" | "migrations" | "transfer"
+            | "branches" | "pages" | "keys" | "hooks" | "deployments",
         ) => true,
         // The repository root itself: only mutating verbs reach this arm,
         // and they are the widest publication surface of all - PATCH flips
@@ -4216,7 +4218,6 @@ impl ReleaseAsset {
             }
             #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
             AssetImage::Bytes(bytes) => {
-                use std::io::Write as _;
                 use std::os::fd::FromRawFd as _;
                 let mut pipes = [0i32; 2];
                 anyhow::ensure!(
@@ -4229,14 +4230,9 @@ impl ReleaseAsset {
                         libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
                     }
                 }
-                let image = bytes.clone();
-                // Detached: a consumer that stops early gives the writer
-                // EPIPE and it ends; closing the shared read ends at drop
-                // releases any writer still parked on a full pipe.
-                std::thread::spawn(move || {
-                    let mut writer = unsafe { std::fs::File::from_raw_fd(pipes[1]) };
-                    let _ = writer.write_all(&image);
-                });
+                bytes_writer()
+                    .send((bytes.clone(), pipes[1]))
+                    .map_err(|_| anyhow::anyhow!("the staged-image writer is gone"))?;
                 Ok(unsafe { std::fs::File::from_raw_fd(pipes[0]) })
             }
         }
@@ -4264,6 +4260,35 @@ impl ReleaseAsset {
 /// hashed or requested.
 const MAX_RELEASE_ASSETS: usize = 1000;
 const MAX_ASSET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// On unixes without a real anonymous-inode primitive the staged image is a
+/// `Vec<u8>`: private memory, not an inode. A signed budget can raise the
+/// DISK ceiling, but it must not silently raise a RAM residency - one
+/// release's staged set is capped here regardless of the signed budget.
+/// Platforms with a kernel-backed image (memfd) are not bound by this.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+const MAX_MEMORY_STAGING_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// One writer thread serves every in-memory staged image's pipe, FIFO, so a
+/// release's openers never multiply threads with the asset count. A reader
+/// that stops early gives EPIPE and the item ends; the channel is unbounded
+/// in count but each item is one cheap (Arc, fd) pair.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn bytes_writer() -> &'static std::sync::mpsc::Sender<(std::sync::Arc<Vec<u8>>, i32)> {
+    use std::io::Write as _;
+    use std::os::fd::FromRawFd as _;
+    static WRITER: std::sync::OnceLock<std::sync::mpsc::Sender<(std::sync::Arc<Vec<u8>>, i32)>> =
+        std::sync::OnceLock::new();
+    WRITER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<(std::sync::Arc<Vec<u8>>, i32)>();
+        std::thread::spawn(move || {
+            for (image, fd) in rx {
+                let mut writer = unsafe { std::fs::File::from_raw_fd(fd) };
+                let _ = writer.write_all(&image);
+            }
+        });
+        tx
+    })
+}
 /// The default aggregate budget for one release's assets. Platform limits are
 /// not free local disk and bandwidth: a set past this size is staged only when
 /// the signed rules name a larger `release_asset_budget`.
@@ -4700,6 +4725,19 @@ fn stage_release_assets(
             "the asset set totals over the {budget} byte release budget \
              ({} bytes so far, '{}' included) - raise rules.release_asset_budget \
              in the signed configuration for a deliberately large release",
+            declared_total,
+            path.display()
+        );
+        // On unixes without a kernel anonymous-inode primitive the staged
+        // image is resident process memory; the signed budget may raise the
+        // disk ceiling, never the RAM one - refuse before any byte is read.
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+        anyhow::ensure!(
+            declared_total <= MAX_MEMORY_STAGING_BYTES,
+            "the asset set totals over the {} byte in-memory staging limit \
+             ({} bytes so far, '{}' included) - this platform keeps staged \
+             images in private memory and no signature may raise that",
+            MAX_MEMORY_STAGING_BYTES,
             declared_total,
             path.display()
         );

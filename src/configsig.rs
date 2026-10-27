@@ -582,25 +582,38 @@ pub fn keygen() -> Result<(String, String)> {
         std::process::id(),
         rand::random::<u64>()
     );
-    let dir = scratch.path()?.join(&leaf);
-    std::fs::create_dir_all(&dir)?;
+    // On unix the leaf is created and removed relative to the pinned
+    // descriptor (mkdirat/unlinkat), and the keygen child's cwd is that
+    // same descriptor (fchdir in pre_exec): no path component - swapped,
+    // moved or replanted - can redirect where the private key is written
+    // or what cleanup removes. The boundary check above already proved
+    // the root sits outside every checkout.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        let leaf_os = std::ffi::OsStr::new(&leaf);
+        scratch.mkdir_pinned(leaf_os, 0o700)?;
+        let out = keygen_in(Path::new(&leaf), &scratch).and_then(|pair| {
+            scratch
+                .path()
+                .map(|_| pair)
+                .context("the signing-key scratch root moved during keygen - refusing")
+        });
+        scratch.remove_leaf_pinned(leaf_os, &["key", "key.pub"]);
+        out
     }
-    // On unix the keygen child's cwd is the pinned root itself (fchdir in
-    // pre_exec): the relative leaf name resolves through the pinned inode,
-    // so a reparented scratch tree cannot redirect the write. Elsewhere the
-    // re-asserted absolute path stands.
-    let out = keygen_in(Path::new(&leaf), &scratch).and_then(|pair| {
-        scratch
-            .path()
-            .map(|_| pair)
-            .context("the signing-key scratch root moved during keygen - refusing")
-    });
-    let _ = std::fs::remove_dir_all(&dir);
-    out
+    #[cfg(not(unix))]
+    {
+        let dir = scratch.path()?.join(&leaf);
+        std::fs::create_dir_all(&dir)?;
+        let out = keygen_in(Path::new(&dir), &scratch).and_then(|pair| {
+            scratch
+                .path()
+                .map(|_| pair)
+                .context("the signing-key scratch root moved during keygen - refusing")
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
 }
 
 fn keygen_in(dir: &Path, scratch: &crate::tempsecret::ScratchRoot) -> Result<(String, String)> {
