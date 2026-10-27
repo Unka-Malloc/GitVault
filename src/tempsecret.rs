@@ -23,6 +23,18 @@ fn checkout_boundary(probe: &Path, flag: &str) -> Result<Option<PathBuf>> {
         .arg("-C")
         .arg(probe)
         .args(["rev-parse", flag])
+        // A caller's Git discovery overrides must not repoint this probe at a
+        // different repository (or break the lookup): GIT_DIR/GIT_WORK_TREE
+        // and friends are dropped so the boundary git reports is the one the
+        // probe directory actually lives in.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_CEILING_DIRECTORIES")
+        .env_remove("GIT_DISCOVERY_ACROSS_FILESYSTEM")
         .output()
         .with_context(|| format!("git rev-parse {flag} could not run"))?;
     if !output.status.success() {
@@ -32,7 +44,7 @@ fn checkout_boundary(probe: &Path, flag: &str) -> Result<Option<PathBuf>> {
         }
         anyhow::bail!(
             "git rev-parse {flag} failed at {}: {}",
-            probe.display(),
+            crate::records::redact(&probe.display().to_string()),
             stderr.trim()
         );
     }
@@ -46,9 +58,12 @@ fn checkout_boundary(probe: &Path, flag: &str) -> Result<Option<PathBuf>> {
     } else {
         probe.join(path)
     };
-    path.canonicalize()
-        .map(Some)
-        .with_context(|| format!("git rev-parse {flag} resolved to an unreadable path {reported}"))
+    path.canonicalize().map(Some).with_context(|| {
+        format!(
+            "git rev-parse {flag} resolved to an unreadable path {}",
+            crate::records::redact(&reported)
+        )
+    })
 }
 
 /// The private scratch root every secret file lives under: the account's state
@@ -86,19 +101,25 @@ fn scratch_root(home: &Path, probe: &Path) -> Result<PathBuf> {
         use std::os::unix::fs::DirBuilderExt as _;
         builder.mode(0o700);
     }
-    builder
-        .create(&root)
-        .with_context(|| format!("cannot create the secret scratch root {}", root.display()))?;
-    let root = root
-        .canonicalize()
-        .with_context(|| format!("cannot resolve the secret scratch root {}", root.display()))?;
+    builder.create(&root).with_context(|| {
+        format!(
+            "cannot create the secret scratch root {}",
+            crate::records::redact(&root.display().to_string())
+        )
+    })?;
+    let root = root.canonicalize().with_context(|| {
+        format!(
+            "cannot resolve the secret scratch root {}",
+            crate::records::redact(&root.display().to_string())
+        )
+    })?;
     for flag in ["--show-toplevel", "--git-common-dir"] {
         if let Some(boundary) = checkout_boundary(probe, flag)? {
             anyhow::ensure!(
                 !root.starts_with(&boundary),
                 "the secret scratch root {} resolves inside the checkout boundary {} - refusing",
-                root.display(),
-                boundary.display()
+                crate::records::redact(&root.display().to_string()),
+                crate::records::redact(&boundary.display().to_string())
             );
         }
     }

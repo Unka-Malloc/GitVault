@@ -240,10 +240,14 @@ The remaining commands — `api`, `repo`, `issue` and `ssh` — do **not** reach
 the audit engine, and `api` additionally *refuses* every request that
 would publish: content writes (`contents`, `git/*`), ref-moving endpoints
 (`merges`, `merge-upstream`, `pulls` create/merge/update-branch), releases,
-commit statuses, workflow dispatches (`dispatches`,
-`actions/workflows/*/dispatches`), and the GraphQL endpoint outright —
+commit statuses, and the GraphQL endpoint outright —
 mutations there cannot be told from queries without parsing the body, so
-`/graphql` is refused rather than classified. The path is
+`/graphql` is refused rather than classified. Every write under the CI
+authority surface refuses as well: `dispatches`, and all of `actions/*`
+(workflow dispatches, run reruns, approvals, cancellations and the rest) —
+a privileged workflow can execute unreviewed code or publish artifacts on a
+selected ref, so the whole subtree is closed to writes while reads such as
+`GET /repos/o/r/actions/runs` stay open. The path is
 percent-decoded and matched on the route the server will see; an encoded
 separator, an encoded route name, or a percent escape that survives one decode
 refuses anywhere in the path, including owner/repo. A token

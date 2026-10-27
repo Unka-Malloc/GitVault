@@ -77,7 +77,10 @@ impl Repo {
             // No authority to split out - still drop any query or fragment.
             return Some(url.split(['?', '#']).next().unwrap_or_default().to_string());
         };
-        let authority_end = rest.find('/').unwrap_or(rest.len());
+        // The authority ends at the EARLIEST of '/', '?' or '#': a URL like
+        // `https://host?token=x` carries its credential inside the authority
+        // span a naive `find('/')` would print whole.
+        let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         let authority = &rest[..authority_end];
         // The host is what follows the last '@' in the authority; without
         // userinfo it is the whole authority.
@@ -295,6 +298,26 @@ mod tests {
                 .remote_display()
                 .as_deref(),
             Some("git@github.com:acme/launcher.git")
+        );
+        // No path at all: the query or fragment sits directly on the host,
+        // and userinfo still comes off first.
+        assert_eq!(
+            repo_for("https://github.com?token=secret")
+                .remote_display()
+                .as_deref(),
+            Some("https://github.com")
+        );
+        assert_eq!(
+            repo_for("https://github.com#frag")
+                .remote_display()
+                .as_deref(),
+            Some("https://github.com")
+        );
+        assert_eq!(
+            repo_for("https://oauth2:ghp_hidden@github.com?token=secret#frag")
+                .remote_display()
+                .as_deref(),
+            Some("https://github.com")
         );
     }
 }

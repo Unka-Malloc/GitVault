@@ -4495,6 +4495,22 @@ fn stage_release_assets(
     builder
         .create(&dir)
         .with_context(|| format!("cannot stage assets in {}", dir.display()))?;
+    // The boundary check on `staging_root` predates this create: a same-user
+    // swap of the root to a symlink inside the checkout would make `dir`
+    // resolve into the reviewed tree. Re-validate the CREATED directory's
+    // canonical location - still under the validated root, still outside the
+    // repository - before a single snapshot byte is written.
+    let dir_canonical = dir
+        .canonicalize()
+        .with_context(|| format!("cannot resolve staged asset dir {}", dir.display()))?;
+    anyhow::ensure!(
+        dir_canonical.parent() == Some(root_canonical.as_path())
+            && !dir_canonical.starts_with(&repo_canonical),
+        "the staged asset dir {} resolves to {} - outside the validated \
+         staging root or inside the repository; refusing",
+        dir.display(),
+        dir_canonical.display()
+    );
     let mut staged = StagedAssets {
         dir: Some(dir.clone()),
         root: root_canonical,
@@ -5705,15 +5721,22 @@ mod tests {
             ("POST", "/repos/o/r/releases%252F9"),
             ("POST", "/repos/o%252fr/r/contents/x"),
             ("POST", "/repos/o/r%252f..%252fstatuses/deadbeef"),
-            // CI-authority surfaces: a dispatch can run unreviewed code or
-            // publish artifacts under workflow permissions.
+            // CI-authority surfaces: every write under actions can trigger a
+            // privileged workflow - dispatch, rerun, approval - so the whole
+            // subtree refuses on any mutating verb, not only dispatches.
             ("POST", "/repos/o/r/dispatches"),
             ("POST", "/repos/o/r/actions/workflows/ci.yml/dispatches"),
             ("POST", "/repos/o/r/actions/workflows/42/dispatches"),
+            ("POST", "/repos/o/r/actions/runs/42/rerun"),
+            ("POST", "/repos/o/r/actions/runs/42/approve"),
+            ("POST", "/repos/o/r/actions/runs/42/cancel"),
+            ("DELETE", "/repos/o/r/actions/runs/42/logs"),
+            ("PUT", "/repos/o/r/actions/permissions/access"),
             // GraphQL mutations reach every write surface inside a body this
             // classifier cannot audit; the endpoint is refused outright.
             ("POST", "/graphql"),
             ("POST", "https://api.github.com/graphql"),
+            ("POST", "/graphql?query=mutation{createRef}"),
         ] {
             assert!(
                 publication_surface(method, path).is_some(),
@@ -5730,6 +5753,8 @@ mod tests {
             ("PATCH", "/repos/o/r/pulls/7"),   // metadata edit, not publication
             ("POST", "/repos/o/r/labels"),
             ("POST", "/repos/o/r/pulls/7/merge-ish"), // not the merge endpoint
+            ("GET", "/repos/o/r/actions/runs"),       // an Actions read stays open
+            ("GET", "/repos/o/r/actions/runs/42/logs"), // logs are metadata reads
         ] {
             assert!(
                 publication_surface(method, path).is_none(),
