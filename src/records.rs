@@ -66,10 +66,10 @@ fn canonicalize_lenient(path: &Path) -> Option<PathBuf> {
     loop {
         if let Ok(resolved) = probe.canonicalize() {
             let mut out = resolved;
-            for part in missing.iter().rev() {
+            for part in missing.drain(..).rev() {
                 match part.to_str() {
                     Some(".") | Some("..") => return None,
-                    _ => out.push(part),
+                    _ => out.push(&part),
                 }
             }
             return Some(out);

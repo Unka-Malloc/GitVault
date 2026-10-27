@@ -77,25 +77,17 @@ impl Repo {
             // No authority to split out - still drop any query or fragment.
             return Some(url.split(['?', '#']).next().unwrap_or_default().to_string());
         };
-        // The authority ends at the EARLIEST of '/', '?' or '#': a URL like
-        // `https://host?token=x` carries its credential inside the authority
-        // span a naive `find('/')` would print whole.
+        // The displayable span is rebuilt in one pass: it starts after the
+        // last '@' inside the authority - which itself ends at the EARLIEST
+        // of '/', '?' or '#', so `https://host?token=x` never shows its
+        // query - and it ends at the first '?' or '#' anywhere, so userinfo,
+        // query and fragment can never reach the output.
         let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         let authority = &rest[..authority_end];
-        // The host is what follows the last '@' in the authority; without
-        // userinfo it is the whole authority.
-        let host = match authority.rfind('@') {
-            Some(at) => &authority[at + 1..],
-            None => authority,
-        };
-        // The path tail may be displayed; a query or fragment may carry a
-        // credential and is cut at its first separator, same as the
-        // authority's own end above.
-        let tail = rest[authority_end..]
-            .split(['?', '#'])
-            .next()
-            .unwrap_or_default();
-        Some(format!("{scheme}://{host}{tail}"))
+        let host_start = authority.rfind('@').map_or(0, |at| at + 1);
+        let span = &rest[host_start..];
+        let end = span.find(['?', '#']).unwrap_or(span.len());
+        Some(format!("{scheme}://{}", &span[..end]))
     }
 
     /// Owning account parsed out of the origin remote.

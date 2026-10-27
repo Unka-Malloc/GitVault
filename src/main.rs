@@ -3287,7 +3287,18 @@ fn publication_surface(method: &str, path: &str) -> Option<String> {
     }
     // repos/{owner}/{repo}/<surface>/...
     if segments.len() < 3 || segments[0] != "repos" {
-        return None;
+        // Outside repos/* a write can still mint a repository or a
+        // migration - new homes content can be pushed into without the gate
+        // ever seeing a push. Those refuse; account metadata, notifications
+        // and the other non-publishing routes stay open.
+        return matches!(
+            segments.as_slice(),
+            ["user", "repos", ..]
+                | ["user", "migrations", ..]
+                | ["orgs", _, "repos", ..]
+                | ["orgs", _, "migrations", ..]
+        )
+        .then(|| format!("{verb} /{route}"));
     }
     let tail: Vec<&str> = segments.get(3..).unwrap_or(&[]).to_vec();
     let hit = match tail.first().copied() {
@@ -3315,9 +3326,17 @@ fn publication_surface(method: &str, path: &str) -> Option<String> {
         // both spend CI authority on a selected ref with a caller payload -
         // and so does every other write under actions: reruns, approvals,
         // cancellations, artifact and secret writes all execute or publish
-        // without the local gate reviewing what runs. Reads returned above;
-        // any mutating verb on either surface refuses.
-        Some("dispatches" | "actions") => true,
+        // without the local gate reviewing what runs. Repository-lifecycle,
+        // ref-moving and trust-moving writes are the same class: forking,
+        // templating, importing and transferring mint or move publication
+        // homes; branch writes rename refs or rewrite protection rules; a
+        // pages build publishes a site; deploy keys, hooks and deployments
+        // move trust or publish refs. None of it passes through an audited
+        // push, so every mutating verb on any of these surfaces refuses.
+        Some(
+            "dispatches" | "actions" | "forks" | "generate" | "import" | "transfer" | "branches"
+            | "pages" | "keys" | "hooks" | "deployments",
+        ) => true,
         _ => false,
     };
     hit.then(|| format!("{verb} /{route}"))
@@ -3394,14 +3413,19 @@ fn cmd_pr(
             // window. Both refs are read again now and judged as one pair:
             // either side moving refuses before anything is sent, and the
             // refusal says which tip changed.
-            let latest = fetch_pr_branch_head(&repo_root, &head, &slug)?;
-            let (_, base_now, base_now_guard) = local_pr_base(&repo_root, &base, &slug)?;
+            let (latest, (base_now_ref, base_now, base_now_guard)) = (
+                fetch_pr_branch_head(&repo_root, &head, &slug)?,
+                local_pr_base(&repo_root, &base, &slug)?,
+            );
             anyhow::ensure!(
                 latest.eq_ignore_ascii_case(&audited_head)
-                    && base_now.eq_ignore_ascii_case(&base_sha),
+                    && base_now.eq_ignore_ascii_case(&base_sha)
+                    && base_now_ref == resolved_base,
                 "pull request refs moved while the audit ran \
-                 (head {audited_head} -> {latest}, base {base_sha} -> {base_now}); \
-                 nothing was sent - rerun the request"
+                 (head {audited_head} -> {latest}, base {}@{base_sha} \
+                 -> {}@{base_now}); nothing was sent - rerun the request",
+                resolved_base.as_deref().unwrap_or("<default>"),
+                base_now_ref.as_deref().unwrap_or("<default>")
             );
             drop(base_now_guard);
             let mut f = vec![("title".to_string(), title), ("head".to_string(), head)];
@@ -4127,18 +4151,17 @@ const MAX_ASSET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// the signed rules name a larger `release_asset_budget`.
 const DEFAULT_ASSET_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 
-/// The private directory holding snapshots of the operator's asset files.
-/// Its names are an implementation detail: the audit and the upload reach
-/// the bytes through open descriptors, so a same-user process that learns
-/// or replaces a staged path cannot redirect either side. Dropping the
-/// guard closes the descriptors and removes the directory - but only the
-/// directory this guard actually created: a release without assets stages
-/// nothing, and a cleanup that cannot prove the path still sits inside the
-/// private staging root removes nothing.
+/// The staged set of the operator's asset files. On unix the snapshots are
+/// anonymous inodes - created under the pinned staging root and unlinked
+/// before a byte lands - so the open descriptors are the only way to reach
+/// the bytes, and closing them frees everything. Elsewhere a per-release
+/// directory holds the snapshots and is removed at drop, but only the
+/// directory this guard actually created: a cleanup that cannot prove the
+/// path still sits inside the private staging root removes nothing.
 #[derive(Debug)]
 struct StagedAssets {
-    /// `Some` only when this guard created the directory; `None` for the
-    /// empty asset set, which owns nothing and must delete nothing.
+    /// `Some` only on platforms whose snapshots keep names; anonymous
+    /// snapshots (and the empty asset set) own no directory.
     dir: Option<PathBuf>,
     /// The canonical staging root `dir` was created under: the boundary a
     /// cleanup must prove before deleting anything.
@@ -4157,13 +4180,13 @@ impl Drop for StagedAssets {
                 libc::close(*fd);
             }
         }
-        let Some(dir) = &self.dir else {
-            return;
-        };
         #[cfg(target_os = "macos")]
         for asset in &self.assets {
             let _ = unseal_staged(&asset.fd);
         }
+        let Some(dir) = &self.dir else {
+            return;
+        };
         // A swapped staging path must never drag the delete outside the
         // private root: resolve both sides and refuse the removal rather
         // than follow a planted link into the checkout or the state root.
@@ -4303,30 +4326,22 @@ fn open_pinned_dir(
     Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
-/// `mkdirat` under a pinned directory: the child lands inside the held inode
-/// regardless of what the root's path components resolve to afterwards.
-#[cfg(unix)]
-fn make_pinned_dir(parent: &std::fs::File, name: &std::ffi::CStr) -> anyhow::Result<()> {
-    use std::os::fd::AsRawFd as _;
-    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| "cannot create a directory under the pinned root");
-    }
-    Ok(())
-}
-
 /// A snapshot created inside a pinned directory: `O_EXCL` so nothing could
 /// have planted the predictable name, `O_NOFOLLOW` so a same-tick swap to a
 /// link cannot redirect the create, mode 0600 at birth.
 #[cfg(unix)]
-fn create_pinned_file(dir: &std::fs::File, name: &std::ffi::CStr) -> anyhow::Result<std::fs::File> {
+fn create_pinned_file(
+    dir: &std::fs::File,
+    name: &std::ffi::CStr,
+    mode: libc::c_uint,
+) -> anyhow::Result<std::fs::File> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
     let fd = unsafe {
         libc::openat(
             dir.as_raw_fd(),
             name.as_ptr(),
             libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600,
+            mode,
         )
     };
     if fd < 0 {
@@ -4337,10 +4352,17 @@ fn create_pinned_file(dir: &std::fs::File, name: &std::ffi::CStr) -> anyhow::Res
 }
 
 /// The canonical path of the inode a descriptor actually holds - `F_GETPATH`
-/// here, `/proc/self/fd` on Linux. Comparing this against the path-level
-/// validation result proves the pin named the directory that was judged;
-/// a descriptor whose path cannot be established fails closed.
-#[cfg(target_os = "macos")]
+/// on the BSDs and macOS, `/proc/self/fd` where procfs is the mechanism.
+/// Comparing this against the path-level validation result proves the pin
+/// named the directory that was judged; a descriptor whose path cannot be
+/// established fails closed.
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+))]
 fn fd_canonical_path(file: &std::fs::File) -> anyhow::Result<PathBuf> {
     use std::os::fd::AsRawFd as _;
     let mut buf = vec![0u8; libc::MAXPATHLEN as usize];
@@ -4354,11 +4376,28 @@ fn fd_canonical_path(file: &std::fs::File) -> anyhow::Result<PathBuf> {
         .with_context(|| "cannot canonicalize the pinned directory's path")
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn fd_canonical_path(file: &std::fs::File) -> anyhow::Result<PathBuf> {
     use std::os::fd::AsRawFd as _;
     std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
         .with_context(|| "cannot establish the pinned directory's path")
+}
+
+/// A unix target without a descriptor-path mechanism cannot prove a pinned
+/// directory is the one that was judged: descriptor-relative staging is
+/// unavailable there, so the operation refuses rather than trust a path.
+#[cfg(all(
+    unix,
+    not(target_vendor = "apple"),
+    not(target_os = "linux"),
+    not(target_os = "android"),
+    not(target_os = "freebsd"),
+    not(target_os = "openbsd"),
+    not(target_os = "netbsd"),
+    not(target_os = "dragonfly")
+))]
+fn fd_canonical_path(_file: &std::fs::File) -> anyhow::Result<PathBuf> {
+    anyhow::bail!("descriptor path resolution is unsupported on this platform")
 }
 
 /// The private root staged asset snapshots live under: GitVault's own state
@@ -4566,26 +4605,14 @@ fn stage_release_assets(
             declared: meta.len(),
         });
     }
-    let dir_name = format!(
-        "release-{}-{:x}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default()
-    );
-    let dir = staging_root.join(&dir_name);
-    // The boundary check on `staging_root` judged a path; the pin below binds
-    // the inode that path named. The root and the created staging directory
-    // are each opened on a descriptor with no-follow semantics and re-proved
-    // against the descriptor's own path (F_GETPATH/procfs) - never against a
-    // path re-resolved across the preflight window. Every snapshot is then
-    // created with openat relative to the pinned directory, so a same-user
-    // swap of the root's path components cannot move a snapshot into the
-    // checkout after these checks ran.
+    // Snapshots never carry a usable name: each is created under the pinned
+    // staging root and UNLINKED before a byte is copied, so only the open
+    // descriptor addresses the inode. There is no staging directory or
+    // snapshot path to swap, rename into the checkout, or leave behind -
+    // closing the descriptor frees the bytes, and the audit and the upload
+    // bind the same descriptor by construction.
     #[cfg(unix)]
-    let dir_fd = {
-        use std::os::fd::AsRawFd as _;
+    let root_fd = {
         use std::os::unix::ffi::OsStrExt as _;
         let croot = std::ffi::CString::new(staging_root.as_os_str().as_bytes())
             .context("the staging root is not an encodable path")?;
@@ -4600,26 +4627,18 @@ fn stage_release_assets(
             "the staging root pinned on a descriptor is not the validated \
              directory - the path was swapped; refusing"
         );
-        let cdir = std::ffi::CString::new(dir_name.as_str())
-            .context("the staging dir name is not encodable")?;
-        make_pinned_dir(&root, &cdir).with_context(|| {
-            format!(
-                "cannot stage assets under {}",
-                crate::records::redact(&dir.display().to_string())
-            )
-        })?;
-        let pinned = open_pinned_dir(root.as_raw_fd(), &cdir)?;
-        let pinned_path = fd_canonical_path(&pinned)?;
-        anyhow::ensure!(
-            pinned_path.parent() == Some(root_canonical.as_path())
-                && !pinned_path.starts_with(&repo_canonical),
-            "the pinned staging directory is not under the validated root \
-             or resolves inside the repository - refusing"
-        );
-        pinned
+        root
     };
     #[cfg(not(unix))]
-    {
+    let dir = {
+        let dir = staging_root.join(format!(
+            "release-{}-{:x}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
         let mut builder = std::fs::DirBuilder::new();
         builder
             .create(&dir)
@@ -4633,9 +4652,17 @@ fn stage_release_assets(
             "the staged asset dir resolves outside the validated staging \
              root or inside the repository - refusing"
         );
-    }
+        dir
+    };
+    // On unix the snapshots are unlinked anonymous inodes: there is no
+    // staging directory for the guard to own or clean up. Elsewhere the
+    // per-release directory keeps its cleanup proof.
+    #[cfg(not(unix))]
+    let staged_dir = Some(dir);
+    #[cfg(unix)]
+    let staged_dir: Option<PathBuf> = None;
     let mut staged = StagedAssets {
-        dir: Some(dir.clone()),
+        dir: staged_dir,
         root: root_canonical,
         assets: Vec::with_capacity(paths.len()),
         shared: Vec::with_capacity(paths.len()),
@@ -4651,16 +4678,28 @@ fn stage_release_assets(
         // The snapshot is private from the instant it exists: mode 0600 is
         // applied by the create itself, not repaired afterwards, and the
         // handle stays open as the descriptor the audit and upload bind. On
-        // unix the create is openat relative to the pinned staging directory
-        // with O_NOFOLLOW, so the bytes land in the held inode even if the
-        // staging path is swapped mid-flight.
+        // unix the create is openat relative to the pinned staging root with
+        // O_EXCL|O_NOFOLLOW, and the name is unlinked before a byte lands -
+        // nothing but the descriptor can address the inode afterwards, so a
+        // same-user rename or path swap has no surface to work against.
         #[cfg(unix)]
-        let mut file = create_pinned_file(
-            &dir_fd,
-            &std::ffi::CString::new(format!("{index:04}"))
-                .expect("snapshot names are ASCII digits"),
-        )
-        .with_context(|| format!("cannot stage asset '{}'", path.display()))?;
+        let mut file = {
+            use std::os::fd::AsRawFd as _;
+            // The name exists only for the instant between create and
+            // unlink - randomness keeps concurrent stagings from colliding
+            // inside the shared private root during that window.
+            let cname =
+                std::ffi::CString::new(format!("s{:016x}-{index:04}", rand::random::<u64>()))
+                    .expect("snapshot names are ASCII");
+            let file = create_pinned_file(&root_fd, &cname, 0o600)
+                .with_context(|| format!("cannot stage asset '{}'", path.display()))?;
+            anyhow::ensure!(
+                unsafe { libc::unlinkat(root_fd.as_raw_fd(), cname.as_ptr(), 0) } == 0,
+                "cannot make the staged snapshot for '{}' anonymous",
+                path.display()
+            );
+            file
+        };
         #[cfg(not(unix))]
         let mut file = {
             let mut options = std::fs::OpenOptions::new();
@@ -5254,8 +5293,8 @@ mod tests {
     use super::{
         MAX_ASSET_BYTES, MAX_RELEASE_ASSETS, branch_for_api, check_release_assets,
         dispatcher_script, fetch_remote_ref, hook_stub_script, local_pr_base, outgoing_push_stdin,
-        parse_push_args, publication_surface, push_plan, remote_mirrors, sha256_file,
-        sha256_reader, stage_release_assets, verify_remote_tag,
+        parse_push_args, publication_surface, push_plan, release_staging_root, remote_mirrors,
+        sha256_file, sha256_reader, stage_release_assets, verify_remote_tag,
     };
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -5571,11 +5610,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The binding is the open descriptor plus the OS seal on the snapshot:
-    /// an attacker who replaces the staged file's bytes - or swaps the path
-    /// itself for another file - is refused by the seal on macOS, and the
-    /// held descriptor cannot move off the audited inode anywhere. The scan
-    /// reads and the upload re-hashes that same description.
+    /// The binding is the open descriptor plus the OS seal on the inode: the
+    /// snapshot carries no path at all - it is unlinked before a byte lands -
+    /// so there is nothing to swap, and on macOS the seal refuses writes even
+    /// through a duplicate descriptor. The scan reads and the upload
+    /// re-hashes that same description.
     #[cfg(unix)]
     #[test]
     fn staged_descriptor_survives_a_path_swap() {
@@ -5584,26 +5623,35 @@ mod tests {
         std::fs::write(&file, b"zip").unwrap();
         let mut staged = check_release_assets(&cfg(), std::slice::from_ref(&file), &root).unwrap();
         let digest = staged.assets[0].sha256.clone();
-        let dir = staged.dir.as_deref().unwrap();
-        let staged_path = dir.join("0000");
+        // No name survives staging: a path swap has nothing to work against.
+        let leftover_names: Vec<_> = std::fs::read_dir(release_staging_root())
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| {
+                        e.file_name()
+                            .to_str()
+                            .is_some_and(|n| n.starts_with('s') && n.len() == 22)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            leftover_names.is_empty(),
+            "anonymous snapshots leave no names behind: {leftover_names:?}"
+        );
         #[cfg(target_os = "macos")]
         {
-            // The seal refuses the swap outright: renaming or writing the
-            // staged path is exactly the attack it exists to stop.
+            // The seal is on the inode: it refuses new opens and name
+            // operations. (A descriptor opened while mutable is the process's
+            // own surface - the anonymous snapshot has no path for anyone
+            // else to open anyway.)
             assert!(staged.assets[0].sealed);
-            assert!(std::fs::rename(&staged_path, dir.join("moved")).is_err());
-            assert!(std::fs::write(&staged_path, b"clean").is_err());
+            assert!(super::asset_is_sealed(&staged.assets[0].fd));
         }
-        #[cfg(not(target_os = "macos"))]
-        {
-            // Where no seal exists the descriptor binding is the defense:
-            // swap the staged path for clean bytes, then prove the held
-            // descriptor still reads the audited inode.
-            let aside = dir.join("swapped");
-            std::fs::rename(&staged_path, &aside).unwrap();
-            std::fs::write(&staged_path, b"clean").unwrap();
-        }
-        let file = staged.assets[0].fd.try_clone().unwrap();
+        let mut file = staged.assets[0].fd.try_clone().unwrap();
+        use std::io::Seek as _;
+        file.rewind().unwrap();
         assert_eq!(sha256_reader(&file).unwrap(), digest);
         // The audit's own share reaches the same inode through /dev/fd.
         staged.share_with_audit().unwrap();
@@ -5618,34 +5666,61 @@ mod tests {
     }
 
     /// A write to the staged inode itself - the shape a concurrent-writer
-    /// attack takes once the path is out of reach - is refused by the seal
-    /// where the platform has one; elsewhere it lands on the same descriptor
-    /// the upload streams and hashes, so the sent digest can never quietly
-    /// match the audited one.
+    /// attack takes - is refused by the seal where the platform has one;
+    /// elsewhere it lands on the same descriptor the upload streams and
+    /// hashes, so the sent digest can never quietly match the audited one.
     #[cfg(unix)]
     #[test]
     fn staged_inode_writes_change_the_streamed_digest() {
+        use std::io::{Seek as _, Write as _};
         let root = scratch("release-asset-write");
         let file = root.join("app-v1.0.zip");
         std::fs::write(&file, b"zip").unwrap();
         let staged = check_release_assets(&cfg(), std::slice::from_ref(&file), &root).unwrap();
         let digest = staged.assets[0].sha256.clone();
-        let staged_path = staged.dir.as_deref().unwrap().join("0000");
-        #[cfg(target_os = "macos")]
-        {
-            // Sealed bytes cannot be mutated at all: the write is refused,
-            // so the digest can only ever match the audited content.
-            assert!(std::fs::write(&staged_path, b"mutated").is_err());
-            let file = staged.assets[0].fd.try_clone().unwrap();
-            assert_eq!(sha256_reader(&file).unwrap(), digest);
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            std::fs::write(&staged_path, b"mutated").unwrap();
-            let file = staged.assets[0].fd.try_clone().unwrap();
-            assert_ne!(sha256_reader(&file).unwrap(), digest);
-        }
+        let mut dup = staged.assets[0].fd.try_clone().unwrap();
+        // A same-inode write through a held descriptor lands regardless of
+        // the seal - the seal's job is keeping anyone else from opening the
+        // bytes, which the anonymous inode already makes impossible. What
+        // cannot happen quietly is the upload matching the audit: any
+        // mutation changes the streamed digest.
+        dup.rewind().unwrap();
+        let _ = dup.write_all(b"mutated");
+        dup.rewind().unwrap();
+        assert_ne!(sha256_reader(&dup).unwrap(), digest);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Relocating the staging root mid-flight loses nothing and gains the
+    /// attacker nothing: the snapshots are anonymous inodes addressed only
+    /// by their open descriptors, so the rename moves an empty directory
+    /// name while the audited bytes stay bound to the held descriptors.
+    #[cfg(unix)]
+    #[test]
+    fn relocating_the_staging_root_loses_no_snapshot() {
+        let base = scratch("release-relocate");
+        let repo = base.join("repo");
+        let staging = base.join("staging");
+        std::fs::create_dir_all(&repo).unwrap();
+        let file = base.join("app-v1.0.zip");
+        std::fs::write(&file, b"zip").unwrap();
+        let staged =
+            stage_release_assets(std::slice::from_ref(&file), &repo, &staging, u64::MAX).unwrap();
+        let digest = staged.assets[0].sha256.clone();
+        let moved = base.join("staging-moved");
+        std::fs::rename(&staging, &moved).unwrap();
+        let mut file = staged.assets[0].fd.try_clone().unwrap();
+        use std::io::Seek as _;
+        file.rewind().unwrap();
+        assert_eq!(
+            sha256_reader(&file).unwrap(),
+            digest,
+            "the descriptor still serves the audited inode after relocation"
+        );
+        drop(staged);
+        let leftovers = std::fs::read_dir(&moved).map(|e| e.count()).unwrap_or(0);
+        assert_eq!(leftovers, 0, "a relocated root holds no lingering names");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A release with no assets stages no directory - and its guard must
@@ -5899,6 +5974,24 @@ mod tests {
             ("POST", "/repos/o/r/merges?base=main"),
             ("POST", "/repos/o/r/dispatches?client_payload=x"),
             ("POST", "/repos/o/r/actions/runs/42/rerun?force=true"),
+            // Repository-lifecycle, ref-moving and trust-moving writes mint
+            // or move publication homes without an audited push.
+            ("POST", "/repos/o/r/forks"),
+            ("POST", "/repos/o/r/generate"),
+            ("PUT", "/repos/o/r/import"),
+            ("POST", "/repos/o/r/transfer"),
+            ("POST", "/repos/o/r/branches/main/rename"),
+            ("PATCH", "/repos/o/r/branches/main/protection"),
+            ("POST", "/repos/o/r/pages/builds"),
+            ("POST", "/repos/o/r/keys"),
+            ("POST", "/repos/o/r/hooks"),
+            ("POST", "/repos/o/r/deployments"),
+            // Repo and migration creation outside repos/* publishes new
+            // homes without the gate ever seeing a push.
+            ("POST", "/user/repos"),
+            ("POST", "/orgs/acme/repos"),
+            ("POST", "/user/migrations"),
+            ("POST", "/orgs/acme/migrations"),
         ] {
             assert!(
                 publication_surface(method, path).is_some(),
