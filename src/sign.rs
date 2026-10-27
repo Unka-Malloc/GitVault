@@ -210,7 +210,7 @@ pub fn run(cfg: &Config, vault: &Vault, args: &[String], cwd: &Path) -> Result<i
         .arg("-n")
         .arg(&inv.namespace)
         .arg("-f")
-        .arg(pub_file.path())
+        .arg(pub_file.path()?)
         .arg(&inv.buffer)
         // No trailing "-". ssh-keygen rejects it alongside a buffer path
         // ("Cannot sign mix of paths and standard input"), and it is not wanted
@@ -255,9 +255,9 @@ pub fn public_key_of_material(private: &str, passphrase: Option<&str>) -> Result
         None => None,
     };
     let mut cmd = Command::new(crate::ssh::trusted_tool("ssh-keygen")?);
-    cmd.arg("-y").arg("-f").arg(secret.path());
+    cmd.arg("-y").arg("-f").arg(secret.path()?);
     if let (Some(guard), Some(p)) = (&askpass, passphrase) {
-        cmd.env("SSH_ASKPASS", guard.path())
+        cmd.env("SSH_ASKPASS", guard.path()?)
             .env("SSH_ASKPASS_REQUIRE", "force")
             .env("DISPLAY", ":0")
             .env("GITVAULT_ASKPASS_VALUE", p);

@@ -319,7 +319,13 @@ fn config_home(xdg: Option<&std::ffi::OsStr>, home: &Path, fixed: bool) -> PathB
 /// scratch root is refused when it resolves inside that worktree or its git
 /// common directory, not merely when it happens to sit inside the process's
 /// own directory.
-pub fn command(binary: &Path, repo: Option<&Path>) -> Command {
+/// The returned `ScratchShare` keeps the scratch root's pin alive: it must
+/// be held until the spawned child has finished, or the descriptor the
+/// child's TMPDIR resolves through closes early.
+pub fn command(
+    binary: &Path,
+    repo: Option<&Path>,
+) -> (Command, Option<crate::tempsecret::ScratchShare>) {
     let armed = enforcement_armed();
     let mut command = Command::new(binary);
     command.env_clear();
@@ -335,9 +341,12 @@ pub fn command(binary: &Path, repo: Option<&Path>) -> Command {
     // pointing into the checkout would let the engine or a tool it spawns
     // write scratch data inside the reviewed tree. When the private root
     // cannot be prepared, TMPDIR is simply unset - the platform's default is
-    // per-user and outside the worktree.
-    if let Ok(tmp) = crate::tempsecret::private_temp_root_at(repo) {
-        command.env("TMPDIR", tmp);
+    // per-user and outside the worktree. On unix the child gets a descriptor
+    // spelling (`/dev/fd/N`), not a path that is re-resolved: the guard lives
+    // in the returned share and keeps the pin open across the child's run.
+    let scratch = crate::tempsecret::scratch_for_child(repo).ok();
+    if let Some((_, tmpdir)) = &scratch {
+        command.env("TMPDIR", tmpdir);
     }
     for key in [
         "LANG", "LC_ALL", "LC_CTYPE", "TERM", "USER", "LOGNAME", "SHELL",
@@ -358,7 +367,7 @@ pub fn command(binary: &Path, repo: Option<&Path>) -> Command {
             }
         }
     }
-    command
+    (command, scratch.map(|(share, _)| share))
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -728,7 +737,10 @@ fn covers_hardening(rows: &Value, ctx: &Context, profiles: &Path, binary: &Path)
 /// empty policy must not bless a gate. Reading Probator's own machine
 /// form keeps GitVault from parsing the policy file itself.
 fn policy_covers(binary: &Path, ctx: &Context) -> Result<(), String> {
-    let output = command(binary, Some(&ctx.repo_root))
+    // `_scratch` keeps the scratch pin alive until the inspect child has
+    // finished; dropping it early would close the fd its TMPDIR resolves.
+    let (mut inspect, _scratch) = command(binary, Some(&ctx.repo_root));
+    let output = inspect
         .args(["inspect", "--json"])
         .output()
         .map_err(|error| format!("probator inspect could not run: {error}"))?;
@@ -1191,7 +1203,7 @@ fn run_gate(
     anchor: Option<&Path>,
     shared: &[i32],
 ) -> Result<Vec<Value>, String> {
-    let mut engine = command(binary, Some(repo));
+    let (mut engine, scratch) = command(binary, Some(repo));
     engine
         .arg("gate-audit")
         .stdin(Stdio::piped())
@@ -1238,6 +1250,15 @@ fn run_gate(
     let output = child
         .wait_with_output()
         .map_err(|error| format!("probator gate-audit could not finish: {error}"))?;
+    // The scratch share's pin outlived the child: if the directory was
+    // relocated mid-run into a checkout, the descriptor's live path no
+    // longer matches the judged one and this run's result is refused
+    // rather than trusted.
+    if let Some(share) = &scratch {
+        share
+            .reassert()
+            .map_err(|error| format!("the audit's scratch root moved during the run: {error}"))?;
+    }
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let first = stderr

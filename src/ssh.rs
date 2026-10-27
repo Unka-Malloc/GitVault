@@ -299,7 +299,7 @@ pub fn load_key(
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     if let (Some(guard), Some(p)) = (&askpass, passphrase) {
-        cmd.env("SSH_ASKPASS", guard.path())
+        cmd.env("SSH_ASKPASS", guard.path()?)
             .env("SSH_ASKPASS_REQUIRE", "force")
             .env("DISPLAY", ":0")
             .env("GITVAULT_ASKPASS_VALUE", p);
@@ -417,14 +417,22 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let a = TempSecret::write("first", 0o600).unwrap();
         let b = TempSecret::write("second", 0o600).unwrap();
-        assert_ne!(a.path(), b.path(), "secret files must not collide");
-        let mode = std::fs::metadata(a.path()).unwrap().permissions().mode() & 0o777;
+        assert_ne!(
+            a.path().unwrap(),
+            b.path().unwrap(),
+            "secret files must not collide"
+        );
+        let mode = std::fs::metadata(a.path().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(
             mode, 0o600,
             "the file must be private from creation, not chmodded after"
         );
-        assert!(a.path().exists());
-        let held = a.path().to_path_buf();
+        assert!(a.path().unwrap().exists());
+        let held = a.path().unwrap().to_path_buf();
         drop(a);
         assert!(!held.exists(), "the guard deletes the file when it drops");
     }

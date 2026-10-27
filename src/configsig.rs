@@ -534,7 +534,7 @@ pub fn sign(config_path: &Path, key_material: &str) -> Result<PathBuf> {
         .arg("-n")
         .arg(NAMESPACE)
         .arg("-f")
-        .arg(secret.path())
+        .arg(secret.path()?)
         .arg(config_path)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -557,8 +557,12 @@ pub fn keygen() -> Result<(String, String)> {
     // ssh-keygen wants a path to write to; the pair is read back and the
     // directory removed on every path below it. The scratch root is the
     // private one, not TMPDIR: a caller-selected temp directory can sit inside
-    // the checkout being audited, and this file holds a signing key.
-    let dir = crate::tempsecret::private_temp_root()?.join(format!(
+    // the checkout being audited, and this file holds a signing key. The
+    // guard stays alive for the whole keygen and `path()` re-verifies the
+    // pinned directory at each use, so a mid-run relocation cannot write the
+    // key into a moved root or hide that it did.
+    let scratch = crate::tempsecret::private_temp_root()?;
+    let dir = scratch.path()?.join(format!(
         "gitvault-keygen-{}-{:016x}",
         std::process::id(),
         rand::random::<u64>()
@@ -569,7 +573,12 @@ pub fn keygen() -> Result<(String, String)> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     }
-    let out = keygen_in(&dir);
+    let out = keygen_in(&dir).and_then(|pair| {
+        scratch
+            .path()
+            .map(|_| pair)
+            .context("the signing-key scratch root moved during keygen - refusing")
+    });
     let _ = std::fs::remove_dir_all(&dir);
     out
 }

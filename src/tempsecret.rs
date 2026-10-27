@@ -12,11 +12,15 @@ use anyhow::{Context, Result};
 
 pub struct TempSecret {
     path: PathBuf,
-    /// The pinned scratch-root descriptor and the file's name inside it:
-    /// Drop's `unlinkat` removes the name from the directory the boundary
-    /// check judged, wherever the scratch path happens to resolve by then.
+    /// The pinned scratch-root descriptor, the canonical root it validated
+    /// against, and the file's name inside it: `path()` re-resolves the
+    /// descriptor at every use so a relocated root refuses, and Drop's
+    /// `unlinkat` removes the name from the directory the boundary check
+    /// judged, wherever the scratch path happens to resolve by then.
     #[cfg(unix)]
     dir_fd: std::fs::File,
+    #[cfg(unix)]
+    root: PathBuf,
     #[cfg(unix)]
     name: std::ffi::OsString,
 }
@@ -97,7 +101,11 @@ fn is_gitdir(dir: &Path) -> bool {
 /// is refused when it resolves inside the checkout's worktree or git common
 /// directory - an account home planted under a worktree root must not defeat
 /// the boundary from a nested invocation directory either.
-pub(crate) fn private_temp_root() -> Result<PathBuf> {
+/// The pinned scratch root for consumers that need a filesystem path:
+/// the guard pins the directory on a descriptor and `path()` re-verifies
+/// it at every use, so the validated root is never reduced to a bare
+/// pathname that a same-user rename could move into a checkout.
+pub(crate) fn private_temp_root() -> Result<ScratchRoot> {
     private_temp_root_at(None)
 }
 
@@ -105,17 +113,97 @@ pub(crate) fn private_temp_root() -> Result<PathBuf> {
 /// review when the caller has one, or `None` to probe the process's own
 /// directory.
 /// The validated scratch root plus - on unix - the directory pinned open
-/// on a descriptor: files are created relative to the descriptor, so a
-/// same-user swap or rename of a path component after validation cannot
-/// move a secret file somewhere the boundary never judged.
+/// on a descriptor: files are created relative to the descriptor, and the
+/// path is never reduced to a bare string - `path()` re-resolves the
+/// descriptor at every use, so a same-user rename or reparenting between
+/// the boundary check and a consumer's write is caught rather than letting
+/// a moved root put secrets somewhere the boundary never judged.
 pub(crate) struct ScratchRoot {
-    pub path: PathBuf,
+    path: PathBuf,
     #[cfg(unix)]
     fd: std::fs::File,
 }
 
-pub(crate) fn private_temp_root_at(repo: Option<&Path>) -> Result<PathBuf> {
-    Ok(private_scratch_at(repo)?.path)
+impl ScratchRoot {
+    /// The validated root's path - re-verified against the pinned
+    /// descriptor on every call. A relocation after the boundary check
+    /// makes the descriptor's live path differ from the one that was
+    /// judged, and the consumer refuses instead of writing through a
+    /// moved path. A descriptor whose path cannot be re-established fails
+    /// closed.
+    pub fn path(&self) -> Result<&Path> {
+        #[cfg(unix)]
+        {
+            let live = crate::fd_canonical_path(&self.fd)
+                .context("cannot re-establish the scratch root's path - refusing")?;
+            anyhow::ensure!(
+                live == self.path,
+                "the secret scratch root moved after the boundary check - refusing"
+            );
+        }
+        Ok(&self.path)
+    }
+}
+
+/// A scratch root handed to a child process, kept alive for the child's
+/// whole run: on unix the child does not get a re-resolved path at all -
+/// its `TMPDIR` is `/dev/fd/N` over an inheritable duplicate of the pinned
+/// descriptor, so the scratch space it writes into is the inode the
+/// boundary check judged, whatever the path does meanwhile. `reassert`
+/// after the child finishes catches a mid-run relocation: a moved root
+/// cannot have been the judged directory, and the run's result is refused
+/// rather than trusted.
+pub(crate) struct ScratchShare {
+    root: ScratchRoot,
+    /// The plain (non-close-on-exec) duplicate the child inherits; it is
+    /// closed when the share drops, after the spawn boundary is crossed.
+    #[cfg(unix)]
+    _shared: std::fs::File,
+}
+
+impl ScratchShare {
+    /// Fail when the pinned directory is no longer where the boundary
+    /// check judged it: `path()` re-resolves the descriptor and refuses
+    /// on any divergence.
+    pub fn reassert(&self) -> Result<()> {
+        self.root.path().map(|_| ())
+    }
+}
+
+/// Prepare the private scratch root for a child process: the share guard
+/// pins the directory (and, on unix, an inheritable duplicate descriptor)
+/// until it is dropped, and the returned path is what the child's TMPDIR
+/// should hold - `/dev/fd/N` on unix, so scratch writes resolve through
+/// the pinned inode rather than a path a same-user rename could have
+/// moved into the checkout since validation.
+pub(crate) fn scratch_for_child(repo: Option<&Path>) -> Result<(ScratchShare, PathBuf)> {
+    let root = private_scratch_at(repo)?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        let fd = unsafe { libc::fcntl(root.fd.as_raw_fd(), libc::F_DUPFD, 300) };
+        anyhow::ensure!(fd >= 0, "cannot share the scratch root with the child");
+        let shared = unsafe { std::fs::File::from_raw_fd(fd) };
+        Ok((
+            ScratchShare {
+                root,
+                _shared: shared,
+            },
+            PathBuf::from(format!("/dev/fd/{fd}")),
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let path = root.path()?.to_path_buf();
+        Ok((ScratchShare { root }, path))
+    }
+}
+
+/// The pinned scratch root for callers whose consumers need a filesystem
+/// path: keep the guard for the whole write/use lifetime and take `path()`
+/// at each use boundary so a relocation is always caught.
+pub(crate) fn private_temp_root_at(repo: Option<&Path>) -> Result<ScratchRoot> {
+    private_scratch_at(repo)
 }
 
 /// `repo` names the checkout whose boundary matters - the repository under
@@ -145,7 +233,9 @@ fn scratch_root(home: &Path, probe: &Path) -> Result<ScratchRoot> {
             crate::records::redact(&root.display().to_string())
         )
     })?;
-    let root = root.canonicalize().with_context(|| {
+    // Canonicalize after creation: the boundary judges the directory as it
+    // exists, not the spelling the caller's environment happened to give.
+    let root = std::fs::canonicalize(&root).with_context(|| {
         format!(
             "cannot resolve the secret scratch root {}",
             crate::records::redact(&root.display().to_string())
@@ -237,17 +327,37 @@ impl TempSecret {
             let _ = std::fs::remove_file(&path);
             return Err(why).with_context(|| format!("could not create {}", path.display()));
         }
-        Ok(Self {
+        let secret = Self {
             path,
             #[cfg(unix)]
             dir_fd: root.fd,
             #[cfg(unix)]
+            root: root.path,
+            #[cfg(unix)]
             name,
-        })
+        };
+        secret.path()?;
+        Ok(secret)
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// The secret file's path for consumers that need one - re-validated
+    /// on every call: on unix the pinned scratch descriptor is resolved
+    /// again and must still name the directory the boundary check judged.
+    /// A same-user rename or reparenting between the write and this use
+    /// makes the descriptor's live path differ, and the consumer refuses
+    /// rather than hand a moved path to a tool that re-resolves it. A
+    /// descriptor whose path can no longer be established fails closed.
+    pub fn path(&self) -> Result<&Path> {
+        #[cfg(unix)]
+        {
+            let live = crate::fd_canonical_path(&self.dir_fd)
+                .context("cannot re-establish the scratch root's path - refusing")?;
+            anyhow::ensure!(
+                live == self.root,
+                "the secret scratch root moved after the boundary check - refusing"
+            );
+        }
+        Ok(&self.path)
     }
 }
 

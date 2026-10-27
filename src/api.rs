@@ -193,6 +193,13 @@ pub struct Request {
     /// wire are provably the bytes the digest was computed on. Mutually
     /// exclusive with `body`.
     pub body_stream: Option<std::fs::File>,
+    /// Follow one redirect hop inside the broker: some read endpoints
+    /// (Actions logs, archive downloads) answer 302 to a signed URL on a
+    /// download host. The signed URL carries a download credential in its
+    /// query, so it is fetched here - never printed - with a second,
+    /// unauthenticated request restricted to the download-host allowlist.
+    /// The account token exists only inside the first request's pipe.
+    pub follow: bool,
     pub jq: Option<String>,
     pub silent: bool,
 }
@@ -333,9 +340,111 @@ fn curl_program() -> Result<PathBuf> {
     Ok(PathBuf::from("curl"))
 }
 
+/// The host a redirect may point at. Log and archive downloads leave the
+/// API origin for a signed URL on a download host - GitHub's own redirect
+/// names one of these, and the second hop authenticates nothing itself.
+/// Anything else refuses: the signed URL is never sent anywhere the
+/// broker did not already sanction.
+const REDIRECT_HOSTS: [&str; 4] = [
+    "github.com",
+    "githubusercontent.com",
+    "amazonaws.com",
+    "blob.core.windows.net",
+];
+
+/// Judge where a redirect goes. The signed URL carries a download
+/// credential inside its query, so it is fetched and never echoed - a
+/// refusal names the host, not the URL. `https` stays mandatory, userinfo
+/// is refused, and the host must sit on the download allowlist.
+fn signed_redirect_target(url: &str) -> Result<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .with_context(|| "a redirect must stay on https")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    anyhow::ensure!(
+        !authority.contains('@'),
+        "a redirect carrying userinfo is refused"
+    );
+    let host = authority
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    anyhow::ensure!(
+        REDIRECT_HOSTS
+            .iter()
+            .any(|d| host == *d || host.ends_with(&format!(".{d}"))),
+        "a redirect to '{host}' is not on the download allowlist"
+    );
+    Ok(url.to_string())
+}
+
+/// Fetch a redirect target with no credential at all: the signed URL is
+/// self-authenticating, and sending the account token - or any header -
+/// to a download host would hand a credential where none is needed. Runs
+/// the same trusted curl under the same cleared environment and HTTPS
+/// protocol lock as the authenticated hop.
+fn fetch_signed_target(url: &str) -> Result<(Vec<u8>, i32, String)> {
+    let out = Command::new(curl_program()?)
+        .args([
+            "-q",
+            "-sS",
+            "--globoff",
+            "--proto",
+            "=https",
+            "-X",
+            "GET",
+            "-w",
+            "\n%{http_code}\n%{redirect_url}",
+            url,
+        ])
+        .env_clear()
+        .stdin(Stdio::null())
+        .output()
+        .context("failed to run curl for the redirect hop")?;
+    anyhow::ensure!(out.status.success(), "the redirect hop did not run");
+    Ok(split_transport_output(&out.stdout))
+}
+
+/// The trailer `-w` appends: body bytes, then a newline, the HTTP code,
+/// another newline and `redirect_url` (empty when the response was not a
+/// redirect). Split from the right so a binary body - a log archive is a
+/// zip - stays intact.
+fn split_transport_output(stdout: &[u8]) -> (Vec<u8>, i32, String) {
+    let (head, redirect) = match stdout.iter().rposition(|b| *b == b'\n') {
+        Some(at) => (
+            &stdout[..at],
+            String::from_utf8_lossy(&stdout[at + 1..]).to_string(),
+        ),
+        None => (stdout, String::new()),
+    };
+    let (body, status) = match head.iter().rposition(|b| *b == b'\n') {
+        Some(at) => (
+            head[..at].to_vec(),
+            String::from_utf8_lossy(&head[at + 1..])
+                .trim()
+                .parse::<i32>()
+                .unwrap_or(0),
+        ),
+        None => (head.to_vec(), 0),
+    };
+    (body, status, redirect.trim().to_string())
+}
+
 /// Authorize, send the request and return the HTTP status and response body.
 /// Output policy (printing, jq, error reporting) is the caller's choice.
-fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, String, Option<String>)> {
+fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, Vec<u8>, Option<String>)> {
+    // Redirect following exists for read endpoints: a mutating request's
+    // 3xx answer would otherwise re-fire its body at a download host.
+    anyhow::ensure!(
+        !req.follow
+            || matches!(
+                req.method.to_ascii_uppercase().as_str(),
+                "GET" | "HEAD" | "OPTIONS"
+            ),
+        "--follow is only valid on read requests"
+    );
     // The request path is validated before any credential is touched: an
     // absolute URL under a different origin would carry the account token to a
     // host the caller chose. Relative paths always resolve under API_ROOT.
@@ -412,7 +521,10 @@ fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, String, O
         "-H".into(),
         "@-".into(),
         "-w".into(),
-        "\n%{http_code}".into(),
+        // The redirect URL lands in the trailer too: a logs/download
+        // endpoint's 302 can then be followed inside the broker instead of
+        // handing the caller an empty body and no way to reach the bytes.
+        "\n%{http_code}\n%{redirect_url}".into(),
     ];
 
     // Fields go where GitHub REST expects them: query parameters on reads, a
@@ -576,17 +688,25 @@ fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, String, O
     let sent_digest: Option<String> = None;
 
     let out = child.wait_with_output().context("curl failed")?;
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-
-    // Split the trailing status code that -w appended.
-    let (body, status) = match stdout.rsplit_once('\n') {
-        Some((b, s)) => (b.to_string(), s.trim().parse::<i32>().unwrap_or(0)),
-        None => (stdout.clone(), 0),
-    };
+    let (mut body, mut status, mut redirect) = split_transport_output(&out.stdout);
 
     if status == 0 {
         bail!("request did not complete\n{}", stderr.trim());
+    }
+    // The redirect hop: a 3xx answer the caller asked to follow is re-sent
+    // by the broker itself against the signed download URL - the account
+    // token exists only in this request's pipe and never in the second
+    // hop, which carries no credential at all. At most four hops, each
+    // judged against the download-host allowlist before it is fetched.
+    let mut hops = 0;
+    while req.follow && hops < 4 && (300..400).contains(&status) && !redirect.is_empty() {
+        let target = signed_redirect_target(&redirect)?;
+        let (next_body, next_status, next_redirect) = fetch_signed_target(&target)?;
+        body = next_body;
+        status = next_status;
+        redirect = next_redirect;
+        hops += 1;
     }
     Ok((status, body, sent_digest))
 }
@@ -597,16 +717,27 @@ pub fn run(cfg: &Config, vault: &Vault, req: &Request) -> Result<i32> {
         // Relay the API's own message: it is the most useful thing to show, and it
         // never contains the token.
         eprintln!("gitvault: HTTP {status}");
-        if !body.trim().is_empty() {
-            eprintln!("{}", prettify(&body));
+        let text = String::from_utf8_lossy(&body);
+        if !text.trim().is_empty() {
+            eprintln!("{}", prettify(&text));
         }
         return Ok(1);
     }
 
-    if !req.silent && !body.trim().is_empty() {
+    if !req.silent && !body.is_empty() {
         match &req.jq {
-            Some(expr) => println!("{}", apply_jq(&body, expr)?),
-            None => println!("{}", prettify(&body)),
+            Some(expr) => println!("{}", apply_jq(&String::from_utf8_lossy(&body), expr)?),
+            // A followed log download can be a zip or a gzip stream: only
+            // a UTF-8 body goes through the JSON pretty-printer; binary
+            // bytes are written raw so nothing is mangled.
+            None => match String::from_utf8(body) {
+                Ok(text) => println!("{}", prettify(&text)),
+                Err(raw) => {
+                    let raw = raw.into_bytes();
+                    use std::io::Write as _;
+                    std::io::stdout().write_all(&raw)?;
+                }
+            },
         }
     }
     Ok(0)
@@ -619,6 +750,7 @@ pub fn run(cfg: &Config, vault: &Vault, req: &Request) -> Result<i32> {
 /// the credential handling is identical to `run`.
 pub fn run_value(cfg: &Config, vault: &Vault, req: &Request) -> Result<String> {
     let (status, body, _sent) = perform(cfg, vault, req)?;
+    let body = String::from_utf8_lossy(&body).to_string();
     if status >= 400 {
         bail!("HTTP {status}: {}", body.trim());
     }
@@ -639,6 +771,7 @@ pub fn run_value_streamed(cfg: &Config, vault: &Vault, req: &Request) -> Result<
         "a streamed upload needs its source descriptor"
     );
     let (status, body, sent) = perform(cfg, vault, req)?;
+    let body = String::from_utf8_lossy(&body).to_string();
     if status >= 400 {
         bail!("HTTP {status}: {}", body.trim());
     }
@@ -854,6 +987,71 @@ fn apply_jq_path(v: &Value, expr: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signed_redirect_targets_only_allowlisted_https_hosts() {
+        // The shapes GitHub actually returns: Azure blob for log archives,
+        // githubusercontent for media, S3 for older storage.
+        for good in [
+            "https://productionresultssa9.blob.core.windows.net/actions-results/abc/logs.zip?sig=SECRET",
+            "https://objects.githubusercontent.com/github-production-release-asset/x.zip?X-Amz-Signature=SECRET",
+            "https://github-cloud.s3.amazonaws.com/run/1/logs.zip?X-Amz-Signature=SECRET",
+            "https://api.github.com/repos/o/r/zipball/main",
+        ] {
+            assert_eq!(
+                signed_redirect_target(good).unwrap(),
+                good,
+                "must accept {good}"
+            );
+        }
+        for bad in [
+            // A non-https redirect would carry the signed URL in the clear.
+            "http://objects.githubusercontent.com/x.zip",
+            // A host the broker never sanctioned must not receive the URL.
+            "https://evil.example/x.zip",
+            "https://github.com.evil.example/x.zip",
+            "https://blob.core.windows.net.evil.example/x",
+            // Userinfo smuggles an authority-lookalike; refuse it outright.
+            "https://github.com@evil.example/x.zip",
+            // Bare nonsense and relative spellings are not redirect targets.
+            "not-a-url",
+            "/relative/path",
+            "",
+        ] {
+            assert!(signed_redirect_target(bad).is_err(), "must refuse {bad}");
+        }
+        // A refusal names the host, never the signed URL's query - the
+        // signature inside it is a download credential.
+        let err = signed_redirect_target("https://evil.example/x?sig=SECRET")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("evil.example"), "{err}");
+        assert!(!err.contains("SECRET"), "{err}");
+    }
+
+    #[test]
+    fn transport_output_splits_the_status_and_redirect_trailer() {
+        // Body text, then \nSTATUS\nREDIRECT - exactly what -w appends.
+        let out = b"log line\nmore log\n302\nhttps://x.blob.core.windows.net/a?sig=z";
+        let (body, status, redirect) = split_transport_output(out);
+        assert_eq!(body, b"log line\nmore log");
+        assert_eq!(status, 302);
+        assert_eq!(redirect, "https://x.blob.core.windows.net/a?sig=z");
+
+        // A non-redirect answer carries an empty redirect field.
+        let out = b"{\"ok\":true}\n200\n";
+        let (body, status, redirect) = split_transport_output(out);
+        assert_eq!(body, b"{\"ok\":true}");
+        assert_eq!(status, 200);
+        assert_eq!(redirect, "");
+
+        // A binary body keeps every byte: the zip magic must not be cut.
+        let mut zip = b"PK\x03\x04\nbinary\xffbytes".to_vec();
+        zip.extend_from_slice(b"\n200\n");
+        let (body, status, _) = split_transport_output(&zip);
+        assert_eq!(body, b"PK\x03\x04\nbinary\xffbytes");
+        assert_eq!(status, 200);
+    }
 
     #[test]
     fn request_url_keeps_the_token_on_the_api_origin() {
