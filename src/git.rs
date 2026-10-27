@@ -88,10 +88,13 @@ impl Repo {
             Some(at) => &authority[at + 1..],
             None => authority,
         };
-        let mut tail = &rest[authority_end..];
-        if let Some(at) = tail.find(['?', '#']) {
-            tail = &tail[..at];
-        }
+        // The path tail may be displayed; a query or fragment may carry a
+        // credential and is cut at its first separator, same as the
+        // authority's own end above.
+        let tail = rest[authority_end..]
+            .split(['?', '#'])
+            .next()
+            .unwrap_or_default();
         Some(format!("{scheme}://{host}{tail}"))
     }
 

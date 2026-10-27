@@ -3236,13 +3236,21 @@ fn publication_surface(method: &str, path: &str) -> Option<String> {
         return None;
     }
     let verb = method.to_ascii_uppercase();
+    // The route is what the server matches: everything from `?` or `#` on is
+    // a parameter the transport still sends but the path classifier must not
+    // see. `contents?ref=x` is a contents write and `graphql?q=...` still
+    // reaches the mutation endpoint, so classifying the raw string would let
+    // a query suffix detach the route's final segment from every match. All
+    // refusal text shows the stripped route only - a query can carry a
+    // credential such as an access_token parameter.
+    let shown = path.split(['?', '#']).next().unwrap_or(path);
     // A dot segment (including a percent-encoded spelling) is normalized by
     // curl and the API server after this match would run. It is refused as a
     // publication attempt rather than matched against a different path than
     // the one the transport will send. The same rule lives in api::request_url,
     // so a traversal cannot slip past this check and still be sent.
     if crate::api::path_has_traversal(path) {
-        return Some(format!("{verb} /{path} (unsafe path segment)"));
+        return Some(format!("{verb} /{shown} (unsafe path segment)"));
     }
     // Match the route the server will see, not the raw percent spelling:
     // `%63ontents` is a contents write, and `%2f` changes the segment
@@ -3250,31 +3258,32 @@ fn publication_surface(method: &str, path: &str) -> Option<String> {
     // path, including owner/repo - is ambiguous, so the write refuses instead
     // of guessing what a second decode would route to.
     let Some(decoded) = crate::api::decoded_api_path(path) else {
-        return Some(format!("{verb} /{path} (undecodable path)"));
+        return Some(format!("{verb} /{shown} (undecodable path)"));
     };
     if decoded.contains('%') {
-        return Some(format!("{verb} /{path} (double-encoded path)"));
+        return Some(format!("{verb} /{shown} (double-encoded path)"));
     }
     if crate::api::has_encoded_separator(path) {
-        return Some(format!("{verb} /{path} (encoded path separator)"));
+        return Some(format!("{verb} /{shown} (encoded path separator)"));
     }
     let path = decoded.trim_start_matches('/');
+    let route = path.split(['?', '#']).next().unwrap_or(path);
     // Curl glob metacharacters never appear in a legitimate API path. The
     // broker always sends --globoff, so they cannot expand on the wire; a
     // write that still spells them is judged publication surface outright
     // rather than classified from a shape curl might once have expanded
     // into several requests.
     if verb != "GET" && verb != "HEAD" && verb != "OPTIONS" && path.contains(['{', '}', '[', ']']) {
-        return Some(format!("{verb} /{path} (curl glob metacharacters)"));
+        return Some(format!("{verb} /{route} (curl glob metacharacters)"));
     }
-    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let segments: Vec<&str> = route.split('/').filter(|s| !s.is_empty()).collect();
     // The GraphQL endpoint carries mutations - createRef, updateRef,
     // mergePullRequest, createRelease - inside a body this classifier cannot
     // audit, and a read-only query cannot be told from a mutation without
     // parsing the document. Refuse it outright: a write through `api` would
     // otherwise publish around the audited commands.
     if segments.first() == Some(&"graphql") {
-        return Some(format!("{verb} /{path} (GraphQL endpoint)"));
+        return Some(format!("{verb} /{route} (GraphQL endpoint)"));
     }
     // repos/{owner}/{repo}/<surface>/...
     if segments.len() < 3 || segments[0] != "repos" {
@@ -3301,15 +3310,17 @@ fn publication_surface(method: &str, path: &str) -> Option<String> {
         // Commit statuses write to the repository's publication surface and
         // can drive server-side checks; the broker refuses them outright.
         Some("statuses") => true,
-        // A repository dispatch spends CI authority directly, and every write
-        // under actions is CI-authority surface: dispatches, reruns,
-        // approvals and cancellations can run unreviewed code or publish
-        // artifacts on a selected ref without the local gate seeing them.
-        // Reads already returned above; any mutating verb refuses.
+        // `repository_dispatch` (repos/.../dispatches) and
+        // `workflow_dispatch` (repos/.../actions/workflows/.../dispatches)
+        // both spend CI authority on a selected ref with a caller payload -
+        // and so does every other write under actions: reruns, approvals,
+        // cancellations, artifact and secret writes all execute or publish
+        // without the local gate reviewing what runs. Reads returned above;
+        // any mutating verb on either surface refuses.
         Some("dispatches" | "actions") => true,
         _ => false,
     };
-    hit.then(|| format!("{verb} /{path}"))
+    hit.then(|| format!("{verb} /{route}"))
 }
 
 fn cmd_pr(
@@ -3378,22 +3389,19 @@ fn cmd_pr(
             run_publication_gate(&cfg, &cfg_sig, &policy, &policy_sig, &ctx, "pull request")?;
             drop(base_guard);
             // A branch that advances between the fetch and the POST would
-            // create a request containing a commit the audit never saw. Read
-            // the branch again now; a moved head refuses before anything is
-            // sent. The base branch is mutable for the same window: a request
-            // created against a moved tip carries a diff the audit never
-            // reviewed, so the remote's base is re-resolved and compared too.
+            // create a request containing a commit the audit never saw, and a
+            // base that moves rewrites the diff under review for the same
+            // window. Both refs are read again now and judged as one pair:
+            // either side moving refuses before anything is sent, and the
+            // refusal says which tip changed.
             let latest = fetch_pr_branch_head(&repo_root, &head, &slug)?;
-            anyhow::ensure!(
-                latest.eq_ignore_ascii_case(&audited_head),
-                "pull request head '{head}' moved from {audited_head} to {latest} \
-                 while the audit ran; nothing was sent - rerun the request"
-            );
             let (_, base_now, base_now_guard) = local_pr_base(&repo_root, &base, &slug)?;
             anyhow::ensure!(
-                base_now.eq_ignore_ascii_case(&base_sha),
-                "pull request base moved from {base_sha} to {base_now} \
-                 while the audit ran; nothing was sent - rerun the request"
+                latest.eq_ignore_ascii_case(&audited_head)
+                    && base_now.eq_ignore_ascii_case(&base_sha),
+                "pull request refs moved while the audit ran \
+                 (head {audited_head} -> {latest}, base {base_sha} -> {base_now}); \
+                 nothing was sent - rerun the request"
             );
             drop(base_now_guard);
             let mut f = vec![("title".to_string(), title), ("head".to_string(), head)];
@@ -4092,10 +4100,9 @@ struct ReleaseAsset {
     /// The operator's original path - diagnostics only, never read at upload
     /// time.
     path: PathBuf,
-    /// The snapshot's location inside the staging directory, needed to seal
-    /// the bytes and to prove the seal still holds at publish time.
-    staged_path: PathBuf,
     /// The private snapshot's open descriptor, held from staging to publish.
+    /// The seal and every byte access bind this inode - never a path a
+    /// same-user process could swap.
     fd: std::fs::File,
     /// The `/dev/fd/N` reference the audit evidence names, once the
     /// descriptor share for the audit child exists.
@@ -4155,7 +4162,7 @@ impl Drop for StagedAssets {
         };
         #[cfg(target_os = "macos")]
         for asset in &self.assets {
-            let _ = unseal_staged(&asset.staged_path);
+            let _ = unseal_staged(&asset.fd);
         }
         // A swapped staging path must never drag the delete outside the
         // private root: resolve both sides and refuse the removal rather
@@ -4271,6 +4278,89 @@ fn open_asset_source(path: &Path) -> anyhow::Result<std::fs::File> {
         .with_context(|| format!("--asset '{}' is not a readable file", path.display()))
 }
 
+/// A directory pinned on a descriptor: `open`/`openat` with `O_DIRECTORY`,
+/// `O_NOFOLLOW` and `O_CLOEXEC`, so the held handle names the inode the
+/// boundary check judged - not a path a same-user process can swap to a
+/// link into the checkout. Every child created under it uses `mkdirat` /
+/// `openat` relative to the pin, never a re-resolved path string.
+#[cfg(unix)]
+fn open_pinned_dir(
+    parent: std::os::fd::RawFd,
+    name: &std::ffi::CStr,
+) -> anyhow::Result<std::fs::File> {
+    use std::os::fd::FromRawFd as _;
+    let fd = unsafe {
+        libc::openat(
+            parent,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| "cannot pin a directory on a descriptor");
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// `mkdirat` under a pinned directory: the child lands inside the held inode
+/// regardless of what the root's path components resolve to afterwards.
+#[cfg(unix)]
+fn make_pinned_dir(parent: &std::fs::File, name: &std::ffi::CStr) -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| "cannot create a directory under the pinned root");
+    }
+    Ok(())
+}
+
+/// A snapshot created inside a pinned directory: `O_EXCL` so nothing could
+/// have planted the predictable name, `O_NOFOLLOW` so a same-tick swap to a
+/// link cannot redirect the create, mode 0600 at birth.
+#[cfg(unix)]
+fn create_pinned_file(dir: &std::fs::File, name: &std::ffi::CStr) -> anyhow::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| "cannot create a snapshot under the pinned directory");
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// The canonical path of the inode a descriptor actually holds - `F_GETPATH`
+/// here, `/proc/self/fd` on Linux. Comparing this against the path-level
+/// validation result proves the pin named the directory that was judged;
+/// a descriptor whose path cannot be established fails closed.
+#[cfg(target_os = "macos")]
+fn fd_canonical_path(file: &std::fs::File) -> anyhow::Result<PathBuf> {
+    use std::os::fd::AsRawFd as _;
+    let mut buf = vec![0u8; libc::MAXPATHLEN as usize];
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| "cannot establish the pinned directory's path");
+    }
+    let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+    let path = PathBuf::from(String::from_utf8_lossy(&buf[..end]).into_owned());
+    path.canonicalize()
+        .with_context(|| "cannot canonicalize the pinned directory's path")
+}
+
+#[cfg(target_os = "linux")]
+fn fd_canonical_path(file: &std::fs::File) -> anyhow::Result<PathBuf> {
+    use std::os::fd::AsRawFd as _;
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+        .with_context(|| "cannot establish the pinned directory's path")
+}
+
 /// The private root staged asset snapshots live under: GitVault's own state
 /// directory, never `TMPDIR`. A staging root the environment selects could
 /// resolve inside the checkout and let generated snapshots enter the
@@ -4304,16 +4394,16 @@ fn check_release_assets(
 /// then on the staged bytes cannot be written, renamed or deleted by any
 /// same-user process, so the audit's read and the upload's stream are the
 /// identical byte sequence by construction - not only by post-hoc digest.
+/// The flag is set with `fchflags` on the held descriptor: the seal binds
+/// the inode the bytes were hashed from, and a swapped snapshot path can
+/// neither redirect it nor fake it away.
 #[cfg(target_os = "macos")]
-fn seal_staged(path: &Path) -> anyhow::Result<bool> {
-    use std::os::unix::ffi::OsStrExt as _;
+fn seal_staged(file: &std::fs::File) -> anyhow::Result<bool> {
+    use std::os::fd::AsRawFd as _;
     const UF_IMMUTABLE: u32 = 0x0000_0002;
-    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .with_context(|| format!("cannot seal staged asset {}", path.display()))?;
     anyhow::ensure!(
-        unsafe { libc::chflags(cpath.as_ptr(), UF_IMMUTABLE) } == 0,
-        "cannot seal the staged asset {} - refusing before the audit sees it",
-        path.display()
+        unsafe { libc::fchflags(file.as_raw_fd(), UF_IMMUTABLE) } == 0,
+        "cannot seal the staged asset descriptor - refusing before the audit sees it"
     );
     Ok(true)
 }
@@ -4322,7 +4412,7 @@ fn seal_staged(path: &Path) -> anyhow::Result<bool> {
 /// and an unsealed snapshot refuses at publish time rather than upload
 /// bytes the audit cannot be proven to have judged.
 #[cfg(not(target_os = "macos"))]
-fn seal_staged(_path: &Path) -> anyhow::Result<bool> {
+fn seal_staged(_file: &std::fs::File) -> anyhow::Result<bool> {
     Ok(false)
 }
 
@@ -4331,32 +4421,29 @@ fn seal_staged(_path: &Path) -> anyhow::Result<bool> {
 /// why the seal is a hardening layer under the digest binding, not the
 /// binding itself.
 #[cfg(target_os = "macos")]
-fn unseal_staged(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::ffi::OsStrExt as _;
-    let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .with_context(|| format!("cannot unseal staged asset {}", path.display()))?;
+fn unseal_staged(file: &std::fs::File) -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd as _;
     anyhow::ensure!(
-        unsafe { libc::chflags(cpath.as_ptr(), 0) } == 0,
-        "cannot unseal the staged asset {}",
-        path.display()
+        unsafe { libc::fchflags(file.as_raw_fd(), 0) } == 0,
+        "cannot unseal the staged asset descriptor"
     );
     Ok(())
 }
 
-/// Whether the snapshot at `path` still carries the seal it was staged
+/// Whether the staged descriptor still carries the seal it was created
 /// with. Checked again at publish: a seal that vanished between the audit
 /// and the upload means the binding cannot be proven.
 #[cfg(target_os = "macos")]
-fn asset_is_sealed(path: &Path) -> bool {
+fn asset_is_sealed(file: &std::fs::File) -> bool {
     use std::os::macos::fs::MetadataExt as _;
     const UF_IMMUTABLE: u32 = 0x0000_0002;
-    std::fs::symlink_metadata(path)
+    file.metadata()
         .map(|meta| meta.st_flags() & UF_IMMUTABLE != 0)
         .unwrap_or(false)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn asset_is_sealed(_path: &Path) -> bool {
+fn asset_is_sealed(_file: &std::fs::File) -> bool {
     false
 }
 
@@ -4411,9 +4498,10 @@ fn stage_release_assets(
         .with_context(|| format!("cannot resolve staging root {}", staging_root.display()))?;
     anyhow::ensure!(
         !root_canonical.starts_with(&repo_canonical),
-        "asset staging root {} resolves inside the audited repository {} - refusing",
-        staging_root.display(),
-        repo_root.display()
+        "asset staging root resolves inside the audited repository - refusing \
+         (root {}, repo {})",
+        crate::records::redact(&staging_root.display().to_string()),
+        crate::records::redact(&repo_root.display().to_string())
     );
     // Preflight every asset before any snapshot exists: open each source
     // once with no-follow semantics, judge it on that descriptor (a swap
@@ -4478,39 +4566,74 @@ fn stage_release_assets(
             declared: meta.len(),
         });
     }
-    let dir = staging_root.join(format!(
+    let dir_name = format!(
         "release-{}-{:x}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or_default()
-    ));
-    let mut builder = std::fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        builder.mode(0o700);
-    }
-    builder
-        .create(&dir)
-        .with_context(|| format!("cannot stage assets in {}", dir.display()))?;
-    // The boundary check on `staging_root` predates this create: a same-user
-    // swap of the root to a symlink inside the checkout would make `dir`
-    // resolve into the reviewed tree. Re-validate the CREATED directory's
-    // canonical location - still under the validated root, still outside the
-    // repository - before a single snapshot byte is written.
-    let dir_canonical = dir
-        .canonicalize()
-        .with_context(|| format!("cannot resolve staged asset dir {}", dir.display()))?;
-    anyhow::ensure!(
-        dir_canonical.parent() == Some(root_canonical.as_path())
-            && !dir_canonical.starts_with(&repo_canonical),
-        "the staged asset dir {} resolves to {} - outside the validated \
-         staging root or inside the repository; refusing",
-        dir.display(),
-        dir_canonical.display()
     );
+    let dir = staging_root.join(&dir_name);
+    // The boundary check on `staging_root` judged a path; the pin below binds
+    // the inode that path named. The root and the created staging directory
+    // are each opened on a descriptor with no-follow semantics and re-proved
+    // against the descriptor's own path (F_GETPATH/procfs) - never against a
+    // path re-resolved across the preflight window. Every snapshot is then
+    // created with openat relative to the pinned directory, so a same-user
+    // swap of the root's path components cannot move a snapshot into the
+    // checkout after these checks ran.
+    #[cfg(unix)]
+    let dir_fd = {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::ffi::OsStrExt as _;
+        let croot = std::ffi::CString::new(staging_root.as_os_str().as_bytes())
+            .context("the staging root is not an encodable path")?;
+        let root = open_pinned_dir(libc::AT_FDCWD, &croot).with_context(|| {
+            format!(
+                "cannot pin the staging root {}",
+                crate::records::redact(&staging_root.display().to_string())
+            )
+        })?;
+        anyhow::ensure!(
+            fd_canonical_path(&root)? == root_canonical,
+            "the staging root pinned on a descriptor is not the validated \
+             directory - the path was swapped; refusing"
+        );
+        let cdir = std::ffi::CString::new(dir_name.as_str())
+            .context("the staging dir name is not encodable")?;
+        make_pinned_dir(&root, &cdir).with_context(|| {
+            format!(
+                "cannot stage assets under {}",
+                crate::records::redact(&dir.display().to_string())
+            )
+        })?;
+        let pinned = open_pinned_dir(root.as_raw_fd(), &cdir)?;
+        let pinned_path = fd_canonical_path(&pinned)?;
+        anyhow::ensure!(
+            pinned_path.parent() == Some(root_canonical.as_path())
+                && !pinned_path.starts_with(&repo_canonical),
+            "the pinned staging directory is not under the validated root \
+             or resolves inside the repository - refusing"
+        );
+        pinned
+    };
+    #[cfg(not(unix))]
+    {
+        let mut builder = std::fs::DirBuilder::new();
+        builder
+            .create(&dir)
+            .with_context(|| format!("cannot stage assets in {}", dir.display()))?;
+        let dir_canonical = dir
+            .canonicalize()
+            .with_context(|| format!("cannot resolve staged asset dir {}", dir.display()))?;
+        anyhow::ensure!(
+            dir_canonical.parent() == Some(root_canonical.as_path())
+                && !dir_canonical.starts_with(&repo_canonical),
+            "the staged asset dir resolves outside the validated staging \
+             root or inside the repository - refusing"
+        );
+    }
     let mut staged = StagedAssets {
         dir: Some(dir.clone()),
         root: root_canonical,
@@ -4527,18 +4650,25 @@ fn stage_release_assets(
         );
         // The snapshot is private from the instant it exists: mode 0600 is
         // applied by the create itself, not repaired afterwards, and the
-        // handle stays open as the descriptor the audit and upload bind.
-        let snapshot = dir.join(format!("{index:04}"));
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create_new(true);
+        // handle stays open as the descriptor the audit and upload bind. On
+        // unix the create is openat relative to the pinned staging directory
+        // with O_NOFOLLOW, so the bytes land in the held inode even if the
+        // staging path is swapped mid-flight.
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&snapshot)
-            .with_context(|| format!("cannot stage asset '{}'", path.display()))?;
+        let mut file = create_pinned_file(
+            &dir_fd,
+            &std::ffi::CString::new(format!("{index:04}"))
+                .expect("snapshot names are ASCII digits"),
+        )
+        .with_context(|| format!("cannot stage asset '{}'", path.display()))?;
+        #[cfg(not(unix))]
+        let mut file = {
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            options
+                .open(dir.join(format!("{index:04}")))
+                .with_context(|| format!("cannot stage asset '{}'", path.display()))?
+        };
         // One pass does the copy and the digest together: the hash describes
         // the bytes that actually landed in the snapshot, so the staged
         // digest is the audited digest by construction. The read is bounded
@@ -4602,11 +4732,10 @@ fn stage_release_assets(
         // bytes between the audit's read and the upload's stream. A platform
         // with no user seal reports `sealed: false`, and publication refuses
         // before a byte is transmitted rather than rely on detection alone.
-        let sealed = seal_staged(&snapshot)?;
+        let sealed = seal_staged(&file)?;
         std::io::Seek::rewind(&mut file)?;
         staged.assets.push(ReleaseAsset {
             path: path.clone(),
-            staged_path: snapshot,
             fd: file,
             audit_ref: None,
             sealed,
@@ -4651,7 +4780,7 @@ fn create_release_staged(
     // prove the published bytes will be the audited ones.
     for asset in staged.assets {
         anyhow::ensure!(
-            asset.sealed && asset_is_sealed(&asset.staged_path),
+            asset.sealed && asset_is_sealed(&asset.fd),
             "staged asset '{}' is not sealed - refusing before the release exists",
             asset.path.display()
         );
@@ -5562,6 +5691,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A staging root planted as a symlink resolves through the canonical
+    /// boundary check when it points outside the repository - but the pin
+    /// opens it with O_NOFOLLOW, so the descriptor can never name an inode
+    /// the boundary check did not judge. The same refusal stands for a root
+    /// swapped to a link inside the checkout during the preflight window.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_staging_root_cannot_sit_behind_the_pin() {
+        let root = scratch("release-staging-swap");
+        let repo = root.join("repo");
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let file = root.join("app-v1.0.zip");
+        std::fs::write(&file, b"zip").unwrap();
+        let link = root.join("staging");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        let err = stage_release_assets(std::slice::from_ref(&file), &repo, &link, u64::MAX)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("pin"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The documented ceilings refuse before a byte is read: 1001 paths -
     /// none of which exist - are rejected by count alone, and a file at the
     /// 2 GiB boundary is rejected by metadata. A FIFO is refused without a
@@ -5737,6 +5890,15 @@ mod tests {
             ("POST", "/graphql"),
             ("POST", "https://api.github.com/graphql"),
             ("POST", "/graphql?query=mutation{createRef}"),
+            // A query suffix is a parameter, not part of the route: the
+            // classifier must not let it detach the final segment from the
+            // match, and refusal text must not echo it (it can carry a
+            // credential parameter).
+            ("POST", "/graphql?access_token=REDACTED"),
+            ("PUT", "/repos/o/r/contents/src/lib.rs?ref=main"),
+            ("POST", "/repos/o/r/merges?base=main"),
+            ("POST", "/repos/o/r/dispatches?client_payload=x"),
+            ("POST", "/repos/o/r/actions/runs/42/rerun?force=true"),
         ] {
             assert!(
                 publication_surface(method, path).is_some(),
@@ -5755,6 +5917,8 @@ mod tests {
             ("POST", "/repos/o/r/pulls/7/merge-ish"), // not the merge endpoint
             ("GET", "/repos/o/r/actions/runs"),       // an Actions read stays open
             ("GET", "/repos/o/r/actions/runs/42/logs"), // logs are metadata reads
+            // Query parameters on a non-surface write stay open.
+            ("POST", "/repos/o/r/issues?milestone=1"),
         ] {
             assert!(
                 publication_surface(method, path).is_none(),

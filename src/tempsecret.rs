@@ -18,23 +18,34 @@ pub struct TempSecret {
 /// common directory, canonicalized. A probe outside any checkout has no
 /// boundary; a git answer that cannot be produced at all fails closed rather
 /// than let a scratch root land in an unmeasured tree.
-fn checkout_boundary(probe: &Path, flag: &str) -> Result<Option<PathBuf>> {
-    let output = std::process::Command::new("git")
+/// The boundary probe, built as a hermetic command: the environment starts
+/// EMPTY, so discovery overrides (GIT_DIR, GIT_WORK_TREE, GIT_COMMON_DIR,
+/// ceiling/discovery flags), the whole config-injection family
+/// (GIT_CONFIG_COUNT with its KEY/VALUE pairs, GIT_CONFIG_PARAMETERS,
+/// GIT_CONFIG, GIT_CONFIG_*) and HOME/XDG-directed config - all inherited
+/// state a caller could use to repoint or break this lookup - never reach
+/// the child. GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM are then pointed at
+/// /dev/null so the account's own config files cannot inject
+/// core.worktree/core.bare either; only the probe repository's local config
+/// still applies. LC_ALL=C keeps the stderr match below stable across
+/// locales.
+fn boundary_command(probe: &Path, flag: &str) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    command
         .arg("-C")
         .arg(probe)
         .args(["rev-parse", flag])
-        // A caller's Git discovery overrides must not repoint this probe at a
-        // different repository (or break the lookup): GIT_DIR/GIT_WORK_TREE
-        // and friends are dropped so the boundary git reports is the one the
-        // probe directory actually lives in.
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
-        .env_remove("GIT_CEILING_DIRECTORIES")
-        .env_remove("GIT_DISCOVERY_ACROSS_FILESYSTEM")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+    command
+}
+
+fn checkout_boundary(probe: &Path, flag: &str) -> Result<Option<PathBuf>> {
+    let output = boundary_command(probe, flag)
         .output()
         .with_context(|| format!("git rev-parse {flag} could not run"))?;
     if !output.status.success() {
@@ -113,14 +124,20 @@ fn scratch_root(home: &Path, probe: &Path) -> Result<PathBuf> {
             crate::records::redact(&root.display().to_string())
         )
     })?;
-    for flag in ["--show-toplevel", "--git-common-dir"] {
-        if let Some(boundary) = checkout_boundary(probe, flag)? {
-            anyhow::ensure!(
-                !root.starts_with(&boundary),
-                "the secret scratch root {} resolves inside the checkout boundary {} - refusing",
-                crate::records::redact(&root.display().to_string()),
-                crate::records::redact(&boundary.display().to_string())
-            );
+    // Both the probe's checkout and the root's own hosting checkout bound
+    // the root: an account home planted under ANY worktree puts secret
+    // material in a tree some push can publish, whether or not it is the
+    // repository under review right now.
+    for dir in [probe, root.as_path()] {
+        for flag in ["--show-toplevel", "--git-common-dir"] {
+            if let Some(boundary) = checkout_boundary(dir, flag)? {
+                anyhow::ensure!(
+                    !root.starts_with(&boundary),
+                    "the secret scratch root {} resolves inside the checkout boundary {} - refusing",
+                    crate::records::redact(&root.display().to_string()),
+                    crate::records::redact(&boundary.display().to_string())
+                );
+            }
         }
     }
     Ok(root)
@@ -220,6 +237,78 @@ mod tests {
         let root = scratch_root(&outside, &nested).unwrap();
         assert!(root.starts_with(outside.canonicalize().unwrap()));
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Inherited Git config injection must not repoint or hide the checkout
+    /// the probe reports. The hostile variables are injected into a re-exec'd
+    /// copy of this test binary - a disposable process - so they exist in the
+    /// probe's actual inherited environment without ever touching the shared
+    /// test process where other fixtures run git concurrently.
+    #[test]
+    fn hostile_git_environment_cannot_hide_the_checkout_boundary() {
+        const HOSTILE: &[(&str, &str)] = &[
+            ("GIT_CONFIG_COUNT", "3"),
+            ("GIT_CONFIG_KEY_0", "core.bare"),
+            ("GIT_CONFIG_VALUE_0", "true"),
+            ("GIT_CONFIG_KEY_1", "core.worktree"),
+            ("GIT_CONFIG_VALUE_1", "/nonexistent/worktree"),
+            ("GIT_CONFIG_KEY_2", "core.repositoryformatversion"),
+            ("GIT_CONFIG_VALUE_2", "9"),
+            ("GIT_DIR", "/nonexistent/git-dir"),
+            ("GIT_WORK_TREE", "/nonexistent/worktree"),
+            ("GIT_CEILING_DIRECTORIES", "/"),
+        ];
+        if std::env::var_os("GV_BOUNDARY_PROBE_CHILD").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("tempsecret::tests::hostile_git_environment_cannot_hide_the_checkout_boundary")
+                .env("GV_BOUNDARY_PROBE_CHILD", "1")
+                .envs(HOSTILE.iter().copied())
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "the boundary probe must survive hostile inherited Git config"
+            );
+            return;
+        }
+        // Child: the hostile set is in this process's own environment. Build
+        // the fixture after dropping it - fixture git calls need a clean env
+        // - then put it back for the probe, which must see through it.
+        unsafe {
+            for (key, _) in HOSTILE {
+                std::env::remove_var(key);
+            }
+            std::env::remove_var("GV_BOUNDARY_PROBE_CHILD");
+        }
+        let base = std::env::temp_dir().join(format!(
+            "gv-scratch-env-{}-{:04x}",
+            std::process::id(),
+            rand::random::<u16>()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        let nested = repo.join("deep/down");
+        std::fs::create_dir_all(&nested).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        unsafe {
+            for (key, value) in HOSTILE {
+                std::env::set_var(key, value);
+            }
+        }
+        let boundary = checkout_boundary(&nested, "--show-toplevel").unwrap();
+        assert_eq!(
+            boundary.as_deref(),
+            Some(repo.canonicalize().unwrap().as_path()),
+            "injected Git config must not move or hide the checkout boundary"
+        );
+        // And an account home under that checkout still refuses through the
+        // whole pipeline while the hostile env is live.
+        assert!(
+            scratch_root(&repo, &nested).is_err(),
+            "a scratch root inside the checkout must refuse under injected config"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 }

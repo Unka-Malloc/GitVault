@@ -53,9 +53,13 @@ pub fn run_dir(cfg: &Config) -> PathBuf {
     })
 }
 
-/// Canonicalize what exists and keep the rest verbatim: the record store is
-/// usually absent before the first run, so the boundary has to be judged on
-/// the nearest resolvable ancestor rather than on a path that must exist.
+/// Canonicalize what exists and refuse a tail that cannot be reattached
+/// verbatim: the record store is usually absent before the first run, so the
+/// boundary has to be judged on the nearest resolvable ancestor rather than
+/// on a path that must exist. `file_name` already refuses a `..` or `.`
+/// terminator, but a component that ever reached `missing` as one is refused
+/// rather than normalized - lexical `..` resolution cannot prove where the
+/// path lands once an intermediate name is later created as a symlink.
 fn canonicalize_lenient(path: &Path) -> Option<PathBuf> {
     let mut missing: Vec<std::ffi::OsString> = Vec::new();
     let mut probe = path.to_path_buf();
@@ -63,7 +67,10 @@ fn canonicalize_lenient(path: &Path) -> Option<PathBuf> {
         if let Ok(resolved) = probe.canonicalize() {
             let mut out = resolved;
             for part in missing.iter().rev() {
-                out.push(part);
+                match part.to_str() {
+                    Some(".") | Some("..") => return None,
+                    _ => out.push(part),
+                }
             }
             return Some(out);
         }
