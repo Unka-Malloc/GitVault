@@ -738,7 +738,7 @@ fn cmd_checkers(config: Option<&PathBuf>, json: bool) -> anyhow::Result<ExitCode
         eprintln!("warning: audit policy is uncertified - {reason}");
     }
     let bin = probator::engine().map_err(anyhow::Error::msg)?;
-    let mut command = probator::command(&bin);
+    let mut command = probator::command(&bin, None);
     command.arg("inspect");
     if json {
         command.arg("--json");
@@ -2741,7 +2741,7 @@ fn install_atomic(src: &Path, target: &Path, mode: u32) -> anyhow::Result<[u8; 3
 /// (rewritten by every `gitvault config sign`). Probator is installed
 /// separately: GitVault never ships or copies it, but a `probator` and
 /// `probator-agent` already beside the binary join the locked set.
-/// The dispatcher every event stub execs. Two rules it enforces:
+/// The dispatcher every event stub execs. Three rules it enforces:
 /// - The gateway binary is the fixed install path below, never an
 ///   environment override: `GITVAULT_BIN=/bin/true git push` would otherwise
 ///   run no gate at all.
@@ -2751,6 +2751,12 @@ fn install_atomic(src: &Path, target: &Path, mode: u32) -> anyhow::Result<[u8; 3
 ///   published without an audit. Nested hooks are simply gated again - the
 ///   gate never invokes git operations that would recurse back into a
 ///   dispatcher.
+/// - The recursion bound lives on the repository-local hook, never on the
+///   gate: `GITVAULT_LOCAL_HOOK_CHAIN` records which hook names already ran
+///   their local counterpart in this chain, so a hook that re-enters itself
+///   through a nested operation is gated again but not re-run. Each event
+///   can nest at most once per name on the chain, which bounds the whole
+///   recursion without ever skipping an audit.
 fn dispatcher_script(target: &Path) -> String {
     format!(
         "#!/usr/bin/env bash\n\
@@ -2762,9 +2768,12 @@ fn dispatcher_script(target: &Path) -> String {
          \x20 exit 1\n\
          fi\n\
          \"$GITVAULT_BIN\" hook \"$HOOK\" || exit $?\n\
+         case \":${{GITVAULT_LOCAL_HOOK_CHAIN-}}:\" in\n\
+         \x20 *\":$HOOK:\"*) exit 0 ;;\n\
+         esac\n\
          REPO_LOCAL_HOOK=\"$(git rev-parse --show-toplevel 2>/dev/null || true)/.githooks/$HOOK\"\n\
          if [ -x \"$REPO_LOCAL_HOOK\" ]; then\n\
-         \x20 \"$REPO_LOCAL_HOOK\" \"$@\"; exit $?\n\
+         \x20 GITVAULT_LOCAL_HOOK_CHAIN=\"${{GITVAULT_LOCAL_HOOK_CHAIN-}}$HOOK:\" \"$REPO_LOCAL_HOOK\" \"$@\"; exit $?\n\
          fi\n\
          exit 0\n",
         target.display()
@@ -3292,11 +3301,12 @@ fn publication_surface(method: &str, path: &str) -> Option<String> {
         // Commit statuses write to the repository's publication surface and
         // can drive server-side checks; the broker refuses them outright.
         Some("statuses") => true,
-        // A repository dispatch, or a workflow dispatch under actions, spends
-        // CI authority: a privileged workflow can run unreviewed code or
-        // publish artifacts on a selected ref without the local gate.
-        Some("dispatches") => true,
-        Some("actions") => verb == "POST" && tail.last() == Some(&"dispatches"),
+        // A repository dispatch spends CI authority directly, and every write
+        // under actions is CI-authority surface: dispatches, reruns,
+        // approvals and cancellations can run unreviewed code or publish
+        // artifacts on a selected ref without the local gate seeing them.
+        // Reads already returned above; any mutating verb refuses.
+        Some("dispatches" | "actions") => true,
         _ => false,
     };
     hit.then(|| format!("{verb} /{path}"))
@@ -3563,7 +3573,10 @@ fn cmd_pr(
     // contains a commit or a diff base the audit never saw: close it and
     // refuse rather than report a passing publication. The response is read
     // instead of printed so both can be judged before the command calls the
-    // request open.
+    // request open. The create endpoint accepts no server-side conditional
+    // for either ref - the re-read before the POST bounds the window and the
+    // post-create verify is the containment, so the residual race is only
+    // the span of one request.
     if let Some((expected_head, expected_base)) = expected_head {
         req.jq = Some(".html_url, .head.sha, .base.sha, .number".to_string());
         let body = api::run_value(&cfg, &vault, &req)?;
@@ -4402,6 +4415,69 @@ fn stage_release_assets(
         staging_root.display(),
         repo_root.display()
     );
+    // Preflight every asset before any snapshot exists: open each source
+    // once with no-follow semantics, judge it on that descriptor (a swap
+    // after a path-level check cannot turn a regular file into a FIFO or a
+    // larger file mid-read), dedupe the upload names, and total the declared
+    // sizes with checked addition. A set that overflows the signed budget
+    // refuses here - no staging directory, no copied bytes.
+    struct Prepared {
+        path: PathBuf,
+        name: String,
+        source: std::fs::File,
+        declared: u64,
+    }
+    let mut names = std::collections::HashSet::new();
+    let mut prepared: Vec<Prepared> = Vec::with_capacity(paths.len());
+    let mut declared_total = 0u64;
+    for path in paths {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("--asset '{}' has no usable file name", path.display())
+            })?;
+        anyhow::ensure!(
+            names.insert(name),
+            "--asset names the upload '{name}' twice"
+        );
+        let source = open_asset_source(path)
+            .with_context(|| format!("--asset '{}' is not a readable file", path.display()))?;
+        let meta = source
+            .metadata()
+            .with_context(|| format!("--asset '{}' is not a readable file", path.display()))?;
+        anyhow::ensure!(
+            meta.is_file(),
+            "--asset '{}' is not a regular file",
+            path.display()
+        );
+        anyhow::ensure!(
+            meta.len() < MAX_ASSET_BYTES,
+            "--asset '{}' exceeds the 2 GiB release-asset limit",
+            path.display()
+        );
+        declared_total = declared_total.checked_add(meta.len()).with_context(|| {
+            format!(
+                "the asset set overflows a byte count at '{}'",
+                path.display()
+            )
+        })?;
+        anyhow::ensure!(
+            declared_total <= budget,
+            "the asset set totals over the {budget} byte release budget \
+             ({} bytes so far, '{}' included) - raise rules.release_asset_budget \
+             in the signed configuration for a deliberately large release",
+            declared_total,
+            path.display()
+        );
+        prepared.push(Prepared {
+            path: path.clone(),
+            name: name.to_string(),
+            source,
+            declared: meta.len(),
+        });
+    }
     let dir = staging_root.join(format!(
         "release-{}-{:x}",
         std::process::id(),
@@ -4426,46 +4502,12 @@ fn stage_release_assets(
         shared: Vec::with_capacity(paths.len()),
     };
     let mut staged_bytes = 0u64;
-    for (index, path) in paths.iter().enumerate() {
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .filter(|n| !n.is_empty())
-            .ok_or_else(|| {
-                anyhow::anyhow!("--asset '{}' has no usable file name", path.display())
-            })?;
-        anyhow::ensure!(
-            !staged.assets.iter().any(|a| a.name == name),
-            "--asset names the upload '{name}' twice"
-        );
-        // The source is opened once with no-follow semantics and judged on
-        // that descriptor: a swap after a path-level check cannot turn a
-        // regular file into a FIFO or a larger file mid-read.
-        let mut source = open_asset_source(path)
-            .with_context(|| format!("--asset '{}' is not a readable file", path.display()))?;
-        let meta = source
-            .metadata()
-            .with_context(|| format!("--asset '{}' is not a readable file", path.display()))?;
-        anyhow::ensure!(
-            meta.is_file(),
-            "--asset '{}' is not a regular file",
-            path.display()
-        );
-        anyhow::ensure!(
-            meta.len() < MAX_ASSET_BYTES,
-            "--asset '{}' exceeds the 2 GiB release-asset limit",
-            path.display()
-        );
-        // The aggregate budget is enforced on declared sizes before any byte
-        // is copied: a set that overflows here stages nothing.
-        staged_bytes += meta.len();
-        anyhow::ensure!(
-            staged_bytes <= budget,
-            "the asset set totals over the {budget} byte release budget \
-             ({} bytes so far, '{}' included) - raise rules.release_asset_budget \
-             in the signed configuration for a deliberately large release",
-            staged_bytes,
-            path.display()
+    for (index, prepared) in prepared.into_iter().enumerate() {
+        let (path, name, mut source, declared) = (
+            prepared.path,
+            prepared.name,
+            prepared.source,
+            prepared.declared,
         );
         // The snapshot is private from the instant it exists: mode 0600 is
         // applied by the create itself, not repaired afterwards, and the
@@ -4483,8 +4525,10 @@ fn stage_release_assets(
             .with_context(|| format!("cannot stage asset '{}'", path.display()))?;
         // One pass does the copy and the digest together: the hash describes
         // the bytes that actually landed in the snapshot, so the staged
-        // digest is the audited digest by construction. The read is still
-        // bounded - a source that grows mid-copy cannot exceed the cap.
+        // digest is the audited digest by construction. The read is bounded
+        // twice - by the per-asset cap and by the aggregate budget's
+        // remainder: a source that grew after preflight is cut off at the
+        // budget line rather than discovered over it at the end.
         let (sha256, total) = {
             use sha2::Digest as _;
             use std::io::Read as _;
@@ -4502,6 +4546,12 @@ fn stage_release_assets(
                 anyhow::ensure!(
                     total < MAX_ASSET_BYTES,
                     "--asset '{}' exceeds the 2 GiB release-asset limit",
+                    path.display()
+                );
+                anyhow::ensure!(
+                    staged_bytes + total <= budget,
+                    "--asset '{}' grew past the {budget} byte release budget \
+                     while staging - refusing before the write",
                     path.display()
                 );
                 use std::io::Write as _;
@@ -4524,12 +4574,13 @@ fn stage_release_assets(
         // metadata: a file that changed length mid-staging produced a torn
         // snapshot whose declared Content-Length would misframe the upload.
         anyhow::ensure!(
-            total == meta.len(),
+            total == declared,
             "--asset '{}' changed size while staging ({} -> {} bytes) - refusing",
             path.display(),
-            meta.len(),
+            declared,
             total
         );
+        staged_bytes += total;
         // Seal the snapshot the moment its digest exists: nothing - not a
         // same-user rename and not an in-place write - may alter the staged
         // bytes between the audit's read and the upload's stream. A platform
@@ -5524,6 +5575,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// An over-budget multi-file set refuses at preflight: every name and
+    /// declared size is judged before the staging directory exists, so a
+    /// refused set copies nothing.
+    #[test]
+    fn an_over_budget_asset_set_stages_nothing() {
+        let repo = scratch("release-budget-repo");
+        git(&repo, &["init", "-q", "-b", "main"]);
+        let dir = scratch("release-budget");
+        let staging = dir.join("staging");
+        let a = dir.join("a.bin");
+        let b = dir.join("b.bin");
+        std::fs::write(&a, vec![0u8; 1024]).unwrap();
+        std::fs::write(&b, vec![0u8; 1024]).unwrap();
+        let err = stage_release_assets(
+            &[a, b],
+            &repo,
+            &staging,
+            1024 + 512, // each file fits alone; together they overflow
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("release budget"), "{err}");
+        // The staging root may exist from the boundary check, but a refused
+        // set must not leave a snapshot directory behind.
+        let snapshots: Vec<_> = std::fs::read_dir(&staging)
+            .map(|entries| entries.flatten().collect())
+            .unwrap_or_default();
+        assert!(
+            snapshots.is_empty(),
+            "a refused set must not stage snapshots: {snapshots:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     /// The streamed digest is the same SHA-256 a whole-buffer hash produces.
     #[test]
     fn release_asset_hash_is_streamed() {
@@ -6155,9 +6241,12 @@ mod tests {
     }
 
     /// A repository-local hook that starts a nested `git push` must not escape
-    /// the gate: the nested push re-enters the dispatcher, which audits it as
-    /// a publication of its own. The local hook pushes only once (a marker
-    /// file) so the recursion terminates after exactly two gate invocations.
+    /// the gate, and the recursion must stay bounded: the nested push
+    /// re-enters the dispatcher and is audited as a publication of its own,
+    /// but the chain marker stops the local hook from running again. The
+    /// hook below nests UNCONDITIONALLY - it is the dispatcher's chain, not
+    /// the repository's cooperation, that bounds the recursion at one nested
+    /// dispatch per hook name.
     #[test]
     fn a_local_hooks_nested_push_is_gated_again() {
         let dir = scratch("nested-push");
@@ -6188,21 +6277,14 @@ mod tests {
                 .unwrap();
         }
 
-        // The repository-controlled hook nests one push, guarded by a marker
-        // so the nested dispatch terminates instead of recursing forever.
+        // The repository-controlled hook nests unconditionally: every nested
+        // dispatch gates the push it carries, and the chain marker is what
+        // stops the recursion - not anything the repository chooses.
         let githooks = repo.join(".githooks");
         std::fs::create_dir_all(&githooks).unwrap();
-        let mark = dir.join("nested.done");
         std::fs::write(
             githooks.join("pre-push"),
-            format!(
-                "#!/bin/sh\n\
-                 if [ ! -f \"{mark}\" ]; then\n\
-                 \x20 touch \"{mark}\"\n\
-                 \x20 git push origin HEAD:refs/heads/nested 2>/dev/null || true\n\
-                 fi\n",
-                mark = mark.display()
-            ),
+            "#!/bin/sh\ngit push origin HEAD:refs/heads/nested 2>/dev/null || true\n",
         )
         .unwrap();
         std::fs::set_permissions(
@@ -6222,7 +6304,8 @@ mod tests {
         git(&repo, &["push", "origin", "HEAD:refs/heads/main"]);
 
         // One gate for the outer push, one for the nested push the local
-        // hook started: two invocations, no marker-skipped dispatch.
+        // hook started: exactly two invocations - the chain bound holds and
+        // no publication slipped the audit.
         let record = std::fs::read_to_string(&log).unwrap();
         let entries: Vec<&str> = record.lines().collect();
         assert_eq!(entries, ["hook pre-push", "hook pre-push"]);

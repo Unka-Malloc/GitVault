@@ -231,23 +231,34 @@ fn outgoing_ranges(ctx: &Context) -> Result<Vec<RangeSpec>, String> {
 
 /// pre-push stdin lines are `<local ref> <local sha> <remote ref> <remote sha>`.
 /// A new remote ref scans everything the local sha has that the DESTINATION
-/// remote does not already hold. Scoping matters: excluding commits reachable
-/// from any remote-tracking ref would omit content some other remote holds
-/// while the destination does not - a push could then publish it without the
-/// scan. When no destination remote is known, nothing is excluded: the scan
-/// covers the commit's whole ancestry rather than guess.
+/// remote does not already hold. The only remote state this gate may subtract
+/// is the push's own evidence: a nonzero remote sha in a stdin line is the
+/// ref tip the destination advertised for this exact operation. A tracking
+/// ref under `refs/remotes/` is NOT proof - a stale or deleted upstream ref
+/// can hold a commit the destination no longer carries, and excluding on it
+/// would omit a tainted commit the push is about to publish. When no remote
+/// sha is proven, the scan covers the commit's whole ancestry rather than
+/// guess.
 fn push_ranges(ctx: &Context) -> Result<Vec<RangeSpec>, String> {
-    // The exclusion set for a ref the destination does not have yet: only the
-    // tracking refs of the remote actually being pushed to.
-    let exclusion = |local_sha: &str| -> Vec<String> {
-        match ctx.push_remote.as_deref() {
-            Some(remote) => vec![
-                local_sha.to_string(),
-                "--not".into(),
-                format!("--remotes={remote}"),
-            ],
-            None => vec![local_sha.to_string()],
+    // First pass: the remote tips this push itself proves the destination
+    // holds - the nonzero remote shas git handed the hook.
+    let mut advertised: Vec<String> = vec![];
+    for line in ctx.stdin.as_deref().unwrap_or("").lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 4 {
+            continue;
         }
+        if !all_zeros(fields[3]) {
+            advertised.push(fields[3].to_string());
+        }
+    }
+    let exclusion = |local_sha: &str| -> Vec<String> {
+        let mut spec = vec![local_sha.to_string()];
+        if !advertised.is_empty() {
+            spec.push("--not".into());
+            spec.extend(advertised.iter().cloned());
+        }
+        spec
     };
     let mut ranges = vec![];
     for line in ctx.stdin.as_deref().unwrap_or("").lines() {
@@ -264,8 +275,8 @@ fn push_ranges(ctx: &Context) -> Result<Vec<RangeSpec>, String> {
         } else {
             // The remote sha normally resolves locally. When it does not (a
             // remote this checkout never fetched, or a tip the remote moved
-            // since), fall back to the wider set - still scoped to the
-            // destination remote, not every tracking ref this checkout knows.
+            // since), fall back to the proven set only - never to tracking
+            // refs whose destination state is only claimed.
             let mut spec = vec![format!("{remote_sha}..{local_sha}")];
             if run_git(
                 &ctx.repo_root,
@@ -863,12 +874,13 @@ mod tests {
         assert!(outcome.stdout.contains("1 of 1"), "{}", outcome.stdout);
     }
 
-    /// The exclusion set for a first-push ref covers only the DESTINATION
-    /// remote's tracking refs. A commit some other remote already holds is
-    /// still outgoing toward the destination and must be scanned; excluding
-    /// it would let a push publish a tainted message unaudited.
+    /// A tracking ref claims nothing about what the destination holds: a
+    /// stale `refs/remotes/origin/*` entry can carry a commit the remote
+    /// dropped or never had. Excluding on it would omit a tainted commit the
+    /// push is about to publish - only remote tips this push itself proves
+    /// (the nonzero remote shas in the ref lines) may subtract from the scan.
     #[test]
-    fn a_push_scans_commits_only_another_remote_holds() {
+    fn a_stale_destination_tracking_ref_excludes_nothing() {
         let dir = Dir::new("push-remote-scope");
         dir.repo();
         dir.git(&["config", "user.email", "test@example.invalid"]);
@@ -886,10 +898,9 @@ mod tests {
         ]);
         let head = dir.git(&["rev-parse", "HEAD"]);
 
-        // `other` already tracks the tainted tip; the push goes to `origin`,
-        // which holds only the base. The commit is still outgoing to origin.
-        dir.git(&["update-ref", "refs/remotes/other/main", &head]);
-        dir.git(&["update-ref", "refs/remotes/origin/main", &base]);
+        // origin/deleted is the stale claim: the destination dropped that
+        // branch, so the tainted tip it still names locally is NOT held.
+        dir.git(&["update-ref", "refs/remotes/origin/deleted", &head]);
 
         let zeros = "0".repeat(40);
         let mut push = ctx(&dir, "pre-push", None);
@@ -899,10 +910,25 @@ mod tests {
         match outcome.outcome {
             OutcomeKind::Failed(_) => {}
             other => {
-                panic!("a commit another remote holds is still outgoing to origin; got {other:?}")
+                panic!("a stale tracking ref must not exempt the tainted commit; got {other:?}")
             }
         }
         assert!(outcome.stdout.contains("co-authored-by trailer"));
+
+        // Control: a remote sha the push itself proves still excludes - the
+        // destination advertises the tainted tip, so nothing new publishes
+        // and the gate passes.
+        let mut proven = ctx(&dir, "pre-push", None);
+        proven.push_remote = Some("origin".into());
+        proven.stdin = Some(format!(
+            "refs/heads/main {head} refs/heads/main {head}\n\
+             refs/heads/side {base} refs/heads/side {zeros}"
+        ));
+        let outcome = gate(&proven).unwrap();
+        assert!(
+            matches!(outcome.outcome, OutcomeKind::Passed),
+            "advertised tips still bound the scan: {outcome:?}"
+        );
     }
 
     // ------------------------------------------------- compose-time scrub

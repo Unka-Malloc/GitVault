@@ -67,25 +67,29 @@ impl Repo {
         }
     }
 
-    /// The remote for display only: `https://user:token@host/path` keeps its
-    /// scheme, host and path but never the userinfo - a credential-bearing URL
-    /// printed verbatim would land in terminal capture or CI logs.
+    /// The remote for display only: `https://user:token@host/path?x=y#z`
+    /// keeps its scheme, host and path but never the userinfo, query or
+    /// fragment - credential-bearing URL parts printed verbatim would land
+    /// in terminal capture or CI logs.
     pub fn remote_display(&self) -> Option<String> {
         let url = self.remote.as_deref()?;
         let Some((scheme, rest)) = url.split_once("://") else {
-            return Some(url.to_string());
+            // No authority to split out - still drop any query or fragment.
+            return Some(url.split(['?', '#']).next().unwrap_or_default().to_string());
         };
         let authority_end = rest.find('/').unwrap_or(rest.len());
         let authority = &rest[..authority_end];
-        let Some(at) = authority.rfind('@') else {
-            return Some(url.to_string());
+        // The host is what follows the last '@' in the authority; without
+        // userinfo it is the whole authority.
+        let host = match authority.rfind('@') {
+            Some(at) => &authority[at + 1..],
+            None => authority,
         };
-        Some(format!(
-            "{}://{}{}",
-            scheme,
-            &authority[at + 1..],
-            &rest[authority_end..]
-        ))
+        let mut tail = &rest[authority_end..];
+        if let Some(at) = tail.find(['?', '#']) {
+            tail = &tail[..at];
+        }
+        Some(format!("{scheme}://{host}{tail}"))
     }
 
     /// Owning account parsed out of the origin remote.
@@ -259,5 +263,38 @@ mod tests {
             Some("platform-org/engine")
         );
         assert_eq!(repo_for("https://github.com/acme").slug(), None);
+    }
+
+    /// Display never carries credentials or capture-worthy parameters:
+    /// userinfo, query and fragment are all dropped, whether or not the URL
+    /// has an authority section.
+    #[test]
+    fn remote_display_strips_userinfo_query_and_fragment() {
+        assert_eq!(
+            repo_for("https://oauth2:ghp_hidden@github.com/acme/launcher.git?token=secret#frag")
+                .remote_display()
+                .as_deref(),
+            Some("https://github.com/acme/launcher.git")
+        );
+        // No userinfo: the query and fragment still go.
+        assert_eq!(
+            repo_for("https://github.com/acme/launcher.git?token=secret")
+                .remote_display()
+                .as_deref(),
+            Some("https://github.com/acme/launcher.git")
+        );
+        // scp-style has no authority to strip; the query still goes.
+        assert_eq!(
+            repo_for("git@github.com:acme/launcher.git?x=1")
+                .remote_display()
+                .as_deref(),
+            Some("git@github.com:acme/launcher.git")
+        );
+        assert_eq!(
+            repo_for("git@github.com:acme/launcher.git")
+                .remote_display()
+                .as_deref(),
+            Some("git@github.com:acme/launcher.git")
+        );
     }
 }

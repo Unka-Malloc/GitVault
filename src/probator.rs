@@ -315,7 +315,11 @@ fn config_home(xdg: Option<&std::ffi::OsStr>, home: &Path, fixed: bool) -> PathB
 /// The engine's configuration root is pinned to the same resolver `gitvault
 /// install` uses; other XDG roots are honoured only while enforcement is
 /// unarmed (fixtures and a development tree).
-pub fn command(binary: &Path) -> Command {
+/// `repo` names the checkout under review when the caller has one: the
+/// scratch root is refused when it resolves inside that worktree or its git
+/// common directory, not merely when it happens to sit inside the process's
+/// own directory.
+pub fn command(binary: &Path, repo: Option<&Path>) -> Command {
     let armed = enforcement_armed();
     let mut command = Command::new(binary);
     command.env_clear();
@@ -332,7 +336,7 @@ pub fn command(binary: &Path) -> Command {
     // write scratch data inside the reviewed tree. When the private root
     // cannot be prepared, TMPDIR is simply unset - the platform's default is
     // per-user and outside the worktree.
-    if let Ok(tmp) = crate::tempsecret::private_temp_root() {
+    if let Ok(tmp) = crate::tempsecret::private_temp_root_at(repo) {
         command.env("TMPDIR", tmp);
     }
     for key in [
@@ -724,7 +728,7 @@ fn covers_hardening(rows: &Value, ctx: &Context, profiles: &Path, binary: &Path)
 /// empty policy must not bless a gate. Reading Probator's own machine
 /// form keeps GitVault from parsing the policy file itself.
 fn policy_covers(binary: &Path, ctx: &Context) -> Result<(), String> {
-    let output = command(binary)
+    let output = command(binary, Some(&ctx.repo_root))
         .args(["inspect", "--json"])
         .output()
         .map_err(|error| format!("probator inspect could not run: {error}"))?;
@@ -1181,12 +1185,13 @@ fn finding_outcome(finding: &Value, started: Instant) -> CheckerOutcome {
 /// the caller turns it into a blocking finding.
 fn run_gate(
     binary: &Path,
+    repo: &Path,
     action: &Value,
     ledger: Option<&Path>,
     anchor: Option<&Path>,
     shared: &[i32],
 ) -> Result<Vec<Value>, String> {
-    let mut engine = command(binary);
+    let mut engine = command(binary, Some(repo));
     engine
         .arg("gate-audit")
         .stdin(Stdio::piped())
@@ -1300,6 +1305,7 @@ pub fn gates(ctx: &Context) -> Vec<CheckerOutcome> {
     for action in actions {
         match run_gate(
             &binary,
+            &ctx.repo_root,
             &action,
             Some(&ledger),
             Some(&anchor),
@@ -2201,7 +2207,7 @@ mod tests {
     #[test]
     fn a_gate_that_answers_with_json_is_parsed() {
         let bin = stub("cat >/dev/null; printf '[{\"severity\":\"high\",\"message\":\"x: y\"}]'");
-        let findings = run_gate(&bin, &json!({}), None, None, &[]).unwrap();
+        let findings = run_gate(&bin, Path::new("."), &json!({}), None, None, &[]).unwrap();
         assert_eq!(findings.len(), 1);
         let _ = std::fs::remove_dir_all(bin.parent().unwrap());
     }
@@ -2211,6 +2217,7 @@ mod tests {
         assert!(
             run_gate(
                 Path::new("/nonexistent/probator"),
+                Path::new("."),
                 &json!({}),
                 None,
                 None,
@@ -2219,7 +2226,7 @@ mod tests {
             .is_err()
         );
         let bin = stub("cat >/dev/null; echo 'gate exploded' >&2; exit 1");
-        let err = run_gate(&bin, &json!({}), None, None, &[]).unwrap_err();
+        let err = run_gate(&bin, Path::new("."), &json!({}), None, None, &[]).unwrap_err();
         assert!(err.contains("gate exploded"), "{err}");
         let _ = std::fs::remove_dir_all(bin.parent().unwrap());
     }
@@ -2227,7 +2234,7 @@ mod tests {
     #[test]
     fn a_non_array_answer_is_an_error() {
         let bin = stub("cat >/dev/null; printf '{\"not\":\"an array\"}'");
-        let err = run_gate(&bin, &json!({}), None, None, &[]).unwrap_err();
+        let err = run_gate(&bin, Path::new("."), &json!({}), None, None, &[]).unwrap_err();
         assert!(err.contains("not a findings array"), "{err}");
         let _ = std::fs::remove_dir_all(bin.parent().unwrap());
     }
@@ -2236,7 +2243,7 @@ mod tests {
     fn empty_output_is_an_error_not_an_empty_pass() {
         // A gate that exits 0 but prints nothing has not produced evidence.
         let bin = stub("cat >/dev/null");
-        let err = run_gate(&bin, &json!({}), None, None, &[]).unwrap_err();
+        let err = run_gate(&bin, Path::new("."), &json!({}), None, None, &[]).unwrap_err();
         assert!(err.contains("not JSON"), "{err}");
         let _ = std::fs::remove_dir_all(bin.parent().unwrap());
     }

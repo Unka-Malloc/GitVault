@@ -88,6 +88,19 @@ pub fn check_store_location(cfg: &Config, repo_root: &Path) -> Result<()> {
          audit metadata that must never land inside a checkout",
         dir.display()
     );
+    // A `..` segment is a traversal the lenient canonicalizer would carry
+    // verbatim past a missing component: `outside/ghost/../repo/runs`
+    // canonicalizes no deeper than `outside`, reattaches the tail raw and
+    // compares as outside the checkout while resolving inside it. Refuse the
+    // spelling instead of normalizing it - a record store that cannot name
+    // its location directly is not trusted with audit metadata.
+    anyhow::ensure!(
+        !dir.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir)),
+        "the audit record directory {} contains a '..' component - it must \
+         name its location directly",
+        dir.display()
+    );
     let store = canonicalize_lenient(&dir).with_context(|| {
         format!(
             "cannot resolve the audit record directory {}",
@@ -629,6 +642,59 @@ mod tests {
         let text = capture(&long);
         assert!(text.contains("[truncated at"));
         assert!(text.len() < long.len() + 64);
+    }
+
+    /// A record directory spelled through a missing component plus `..` would
+    /// reconstruct inside the checkout while comparing outside it. The `..`
+    /// component is refused outright rather than normalized.
+    #[test]
+    fn a_record_dir_with_parent_segments_never_reaches_the_tree() {
+        use crate::config::Config;
+
+        let base = std::env::temp_dir().join(format!(
+            "gv-storeloc-{}-{:04x}",
+            std::process::id(),
+            rand::random::<u16>()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let canonical_repo = repo.canonicalize().unwrap();
+
+        // `side/ghost/../repo/runs`: `ghost` does not exist, so the lenient
+        // canonicalizer stops above it - without the `..` refusal this tail
+        // would reattach raw and resolve into the repository.
+        for spelling in [
+            base.join("side/ghost/../repo/runs"),
+            canonical_repo.join("ghost/../runs"),
+        ] {
+            let cfg = Config {
+                record_dir: Some(spelling),
+                ..Default::default()
+            };
+            let result = super::check_store_location(&cfg, &canonical_repo);
+            assert!(
+                result.is_err(),
+                "a '..' record_dir must refuse before the boundary check"
+            );
+        }
+
+        // A plainly in-tree store is still refused on the boundary itself,
+        // and a sibling outside the repo is the shape fixtures must use.
+        let cfg = Config {
+            record_dir: Some(canonical_repo.join("runs")),
+            ..Default::default()
+        };
+        assert!(super::check_store_location(&cfg, &canonical_repo).is_err());
+        let cfg = Config {
+            record_dir: Some(base.join("runs")),
+            ..Default::default()
+        };
+        assert!(
+            super::check_store_location(&cfg, &canonical_repo).is_ok(),
+            "a sibling store outside the repository is the supported shape"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The seal chain over real written records: Sound when untouched, Broken

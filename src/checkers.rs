@@ -266,10 +266,12 @@ pub fn identity_gate(ctx: &Context, routing_certified: bool) -> Option<CheckerOu
 
 /// `name@host` reduced to `n…@host`: enough to recognise which address was
 /// compared, not enough to carry a personal address into a stored record.
+/// The mask takes the first Unicode scalar - a non-ASCII local part must not
+/// slice mid-encoding and panic the gate.
 fn mask_email(address: &str) -> String {
     match address.split_once('@') {
         Some((local, domain)) if !local.is_empty() => {
-            format!("{}…@{domain}", &local[..1])
+            format!("{}…@{domain}", local.chars().next().unwrap_or('?'))
         }
         _ => "(unparseable address)".to_string(),
     }
@@ -389,5 +391,17 @@ mod tests {
         ctx.via_default = false;
         ctx.event = "pr".into();
         assert!(identity_gate(&ctx, true).is_none());
+    }
+
+    /// A non-ASCII local part masks on the first scalar, never mid-encoding:
+    /// slicing bytes would panic the gate on a valid address.
+    #[test]
+    fn the_email_mask_handles_multibyte_local_parts() {
+        assert_eq!(
+            super::mask_email("üser@example.invalid"),
+            "ü…@example.invalid"
+        );
+        assert_eq!(super::mask_email("a@example.invalid"), "a…@example.invalid");
+        assert_eq!(super::mask_email("not-an-address"), "(unparseable address)");
     }
 }
