@@ -528,14 +528,29 @@ pub fn sign(config_path: &Path, key_material: &str) -> Result<PathBuf> {
     let sig = sig_path(config_path);
     // A stale sidecar must not be read back as this signature.
     let _ = std::fs::remove_file(&sig);
-    let status = Command::new(crate::ssh::trusted_tool("ssh-keygen")?)
-        .arg("-Y")
-        .arg("sign")
-        .arg("-n")
-        .arg(NAMESPACE)
-        .arg("-f")
-        .arg(secret.path()?)
-        .arg(config_path)
+    // On unix the signer runs with its working directory bound to the
+    // secret's pinned scratch directory (fchdir in pre_exec): the relative
+    // -f name resolves through the pinned inode, so no path component a
+    // same-user process could reparent stands between the check and the
+    // open. ssh-keygen's -f/.pub sibling convention rules out /dev/fd for
+    // it, and config_path must be absolute for the re-bound cwd.
+    #[cfg(unix)]
+    let config_arg = config_path
+        .canonicalize()
+        .unwrap_or_else(|_| config_path.to_path_buf());
+    #[cfg(not(unix))]
+    let config_arg = config_path.to_path_buf();
+    let mut cmd = Command::new(crate::ssh::trusted_tool("ssh-keygen")?);
+    cmd.arg("-Y").arg("sign").arg("-n").arg(NAMESPACE).arg("-f");
+    #[cfg(unix)]
+    {
+        secret.fchdir_child(&mut cmd);
+        cmd.arg(secret.name());
+    }
+    #[cfg(not(unix))]
+    cmd.arg(secret.path()?);
+    let status = cmd
+        .arg(&config_arg)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .status()
@@ -562,18 +577,23 @@ pub fn keygen() -> Result<(String, String)> {
     // pinned directory at each use, so a mid-run relocation cannot write the
     // key into a moved root or hide that it did.
     let scratch = crate::tempsecret::private_temp_root()?;
-    let dir = scratch.path()?.join(format!(
+    let leaf = format!(
         "gitvault-keygen-{}-{:016x}",
         std::process::id(),
         rand::random::<u64>()
-    ));
+    );
+    let dir = scratch.path()?.join(&leaf);
     std::fs::create_dir_all(&dir)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     }
-    let out = keygen_in(&dir).and_then(|pair| {
+    // On unix the keygen child's cwd is the pinned root itself (fchdir in
+    // pre_exec): the relative leaf name resolves through the pinned inode,
+    // so a reparented scratch tree cannot redirect the write. Elsewhere the
+    // re-asserted absolute path stands.
+    let out = keygen_in(Path::new(&leaf), &scratch).and_then(|pair| {
         scratch
             .path()
             .map(|_| pair)
@@ -583,11 +603,21 @@ pub fn keygen() -> Result<(String, String)> {
     out
 }
 
-fn keygen_in(dir: &Path) -> Result<(String, String)> {
-    let key = dir.join("key");
-    let status = Command::new(crate::ssh::trusted_tool("ssh-keygen")?)
+fn keygen_in(dir: &Path, scratch: &crate::tempsecret::ScratchRoot) -> Result<(String, String)> {
+    // The relative leaf resolves against the pinned root when the child is
+    // fchdir'd into it; the absolute spelling is the non-unix fallback.
+    let key_arg = if cfg!(unix) {
+        PathBuf::from(dir).join("key")
+    } else {
+        scratch.path()?.join(dir).join("key")
+    };
+    let key = scratch.path()?.join(dir).join("key");
+    let mut cmd = Command::new(crate::ssh::trusted_tool("ssh-keygen")?);
+    #[cfg(unix)]
+    scratch.fchdir_child(&mut cmd);
+    let status = cmd
         .args(["-t", "ed25519", "-N", "", "-C", PRINCIPAL, "-f"])
-        .arg(&key)
+        .arg(&key_arg)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .status()

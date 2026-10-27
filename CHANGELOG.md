@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `gitvault api` gains `--follow`/`-L` and `gitvault run` gains `logs JOB_ID`
+  (job log text) and `logs --run RUN_ID` (run log archive). GitHub's log
+  endpoints answer `302` to a signed download URL; the broker now follows the
+  hop in-process: the signed URL reaches curl through a private stdin config
+  (`-K -`), never argv or the environment, and the second hop carries no
+  credential. The final response body streams to stdout with bounded memory,
+  so zip archives pass through unchanged. `--follow` is limited to GET.
 - `release create` accepts a repeatable `--asset PATH` and uploads each file
   onto the release it just created, naming the stored asset after the file's
   basename. Every asset path is checked before the create request so an

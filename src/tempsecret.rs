@@ -19,6 +19,11 @@ pub struct TempSecret {
     /// judged, wherever the scratch path happens to resolve by then.
     #[cfg(unix)]
     dir_fd: std::fs::File,
+    /// The secret's own descriptor, kept open: `fd_share` duplicates it for
+    /// a child so the consumer's open binds this file, not a re-resolvable
+    /// name.
+    #[cfg(unix)]
+    file: std::fs::File,
     #[cfg(unix)]
     root: PathBuf,
     #[cfg(unix)]
@@ -125,6 +130,25 @@ pub(crate) struct ScratchRoot {
 }
 
 impl ScratchRoot {
+    /// Bind a child's working directory to the pinned root: `fchdir` in
+    /// the child's `pre_exec` makes this descriptor - not a path spelling -
+    /// the lookup root, so a reparented scratch tree cannot redirect what
+    /// the child creates or opens.
+    #[cfg(unix)]
+    pub fn fchdir_child(&self, command: &mut std::process::Command) {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+        let fd = self.fd.as_raw_fd();
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fchdir(fd) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
     /// The validated root's path - re-verified against the pinned
     /// descriptor on every call. A relocation after the boundary check
     /// makes the descriptor's live path differ from the one that was
@@ -321,16 +345,21 @@ impl TempSecret {
             opts.open(&path)
                 .and_then(|mut f| f.write_all(contents.as_bytes()))
         };
-        if let Err(why) = written {
-            // A failed write must not leave a partial secret on disk: the
-            // name is gone before the error surfaces.
-            let _ = std::fs::remove_file(&path);
-            return Err(why).with_context(|| format!("could not create {}", path.display()));
-        }
+        let file = match written {
+            Ok(file) => file,
+            Err(why) => {
+                // A failed write must not leave a partial secret on disk:
+                // the name is gone before the error surfaces.
+                let _ = std::fs::remove_file(&path);
+                return Err(why).with_context(|| format!("could not create {}", path.display()));
+            }
+        };
         let secret = Self {
             path,
             #[cfg(unix)]
             dir_fd: root.fd,
+            #[cfg(unix)]
+            file,
             #[cfg(unix)]
             root: root.path,
             #[cfg(unix)]
@@ -340,6 +369,67 @@ impl TempSecret {
         Ok(secret)
     }
 
+    /// A `/dev/fd/N` spelling of the secret for a consumer inside a spawned
+    /// child: the returned descriptor is a duplicate of the secret's own
+    /// open file, rewound to its start, and the caller clears its
+    /// close-on-exec flag in the child's `pre_exec` so the reference rides
+    /// the exec boundary. What the tool opens is this description itself -
+    /// no directory component exists between the check and the open for a
+    /// same-user process to reparent or swap.
+    ///
+    /// The returned `File` owns the descriptor and must outlive the spawn;
+    /// the path is only valid while it (and this guard) live.
+    #[cfg(unix)]
+    pub fn fd_share(&self) -> Result<(PathBuf, std::fs::File)> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        let fd = unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 200) };
+        anyhow::ensure!(
+            fd >= 0,
+            "cannot share the secret descriptor: {}",
+            std::io::Error::last_os_error()
+        );
+        // The duplicate shares the description, offset included: the
+        // consumer's first read must meet the bytes, not their end.
+        anyhow::ensure!(
+            unsafe { libc::lseek(fd, 0, libc::SEEK_SET) } == 0,
+            "cannot rewind the shared secret descriptor: {}",
+            std::io::Error::last_os_error()
+        );
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        Ok((PathBuf::from(format!("/dev/fd/{fd}")), file))
+    }
+
+    /// Bind a child's working directory to this secret's pinned scratch
+    /// directory: `fchdir` in the child's `pre_exec` makes the descriptor -
+    /// not a path spelling - the lookup root, so a same-user reparent of
+    /// the scratch tree cannot redirect the consumer's opens. Pair with
+    /// `name()` for consumers that resolve a relative file name (as
+    /// `ssh-keygen -f` does with its `.pub` sibling convention). The
+    /// unguessable name inside a directory only this account can enter is
+    /// the remaining surface.
+    #[cfg(unix)]
+    pub fn fchdir_child(&self, command: &mut std::process::Command) {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::process::CommandExt as _;
+        let fd = self.dir_fd.as_raw_fd();
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fchdir(fd) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    /// The secret's own file name, for a consumer whose working directory
+    /// was pinned by `fchdir_child`: a relative name stays inside the
+    /// descriptor-bound directory where a path could have been reparented.
+    #[cfg(unix)]
+    pub fn name(&self) -> &std::ffi::OsStr {
+        &self.name
+    }
+
     /// The secret file's path for consumers that need one - re-validated
     /// on every call: on unix the pinned scratch descriptor is resolved
     /// again and must still name the directory the boundary check judged.
@@ -347,6 +437,8 @@ impl TempSecret {
     /// makes the descriptor's live path differ, and the consumer refuses
     /// rather than hand a moved path to a tool that re-resolves it. A
     /// descriptor whose path can no longer be established fails closed.
+    /// Children that open the secret themselves take `fd_share` instead:
+    /// a description reference carries no re-resolvable name at all.
     pub fn path(&self) -> Result<&Path> {
         #[cfg(unix)]
         {
@@ -358,6 +450,26 @@ impl TempSecret {
             );
         }
         Ok(&self.path)
+    }
+}
+
+/// Wire a shared descriptor into `command` so the spawned child can open
+/// its `/dev/fd/N` reference: the flag comes off inside the child's own
+/// `pre_exec` - after fork, before exec - which is also what lets a tool
+/// the child in turn runs (an askpass helper under ssh-add) inherit it.
+/// Call once per share; the owning `File` must outlive the spawn.
+#[cfg(unix)]
+pub fn share_with_child(command: &mut std::process::Command, share: &std::fs::File) {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::process::CommandExt as _;
+    let fd = share.as_raw_fd();
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
 }
 
@@ -466,5 +578,30 @@ mod tests {
             "a scratch root inside the checkout refuses despite hostile local config"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A descriptor share must serve the secret's own bytes at /dev/fd/N:
+    /// the child's open binds the description, not a re-resolvable name.
+    #[cfg(unix)]
+    #[test]
+    fn a_fd_share_serves_the_secret_through_dev_fd() {
+        let secret = TempSecret::write("the-secret-material", 0o600).unwrap();
+        let (fd_path, share) = secret.fd_share().unwrap();
+        assert!(
+            fd_path.starts_with("/dev/fd/"),
+            "the share names a descriptor, not a path: {fd_path:?}"
+        );
+        use std::io::Read as _;
+        let mut contents = String::new();
+        std::fs::File::open(&fd_path)
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
+        assert_eq!(contents, "the-secret-material");
+        drop(share);
+        assert!(
+            std::fs::File::open(&fd_path).is_err(),
+            "a dead share's reference must not resolve"
+        );
     }
 }

@@ -145,7 +145,21 @@ gitvault records show RUN_ID [--json]
 gitvault records verify                      # seal-chain integrity of the log
 gitvault hook pre-commit                     # wired as core.hooksPath
 gitvault push [git-push arguments]           # audit first, then push
+gitvault api [--follow] <path> [...]         # read-only GitHub API proxy
+gitvault run list [--json]                   # recent workflow runs
+gitvault run view RUN_ID [--json]            # one run's metadata
+gitvault run logs JOB_ID                     # a job's log text
+gitvault run logs --run RUN_ID               # a run's logs archive (zip)
 ```
+
+Log and download endpoints answer `302` rather than a body: GitHub hands the
+log to a signed URL on a download host. `gitvault api --follow` (and `gitvault
+run logs`, which follows by construction) performs that hop inside the
+broker — the signed URL travels to curl through a private config pipe, never
+argv or output, and the second hop carries no credential at all. `--follow`
+is GET-only and streams the final response body straight to stdout, so a log
+archive of any size moves with constant memory and zip bytes pass through
+unmangled.
 
 `gitvault push` exists because a bare `git push` connects to the remote
 before it runs `pre-push` — the hook's ref lines are built from the remote's

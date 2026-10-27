@@ -204,20 +204,41 @@ pub fn run(cfg: &Config, vault: &Vault, args: &[String], cwd: &Path) -> Result<i
     // were this signature.
     let _ = std::fs::remove_file(&sig_path);
 
-    let status = Command::new(crate::ssh::trusted_tool("ssh-keygen")?)
-        .arg("-Y")
+    // On unix the signer runs with its working directory bound to the
+    // secret's pinned scratch directory (fchdir in pre_exec): the relative
+    // -f name resolves through the pinned inode, so no path component a
+    // same-user process could reparent stands between the check and the
+    // open. ssh-keygen's -f/.pub sibling convention rules out /dev/fd for
+    // it. A relative buffer path must be made absolute first or the
+    // re-bound cwd would misread it.
+    #[cfg(unix)]
+    let buffer_arg = inv
+        .buffer
+        .canonicalize()
+        .unwrap_or_else(|_| inv.buffer.clone());
+    #[cfg(not(unix))]
+    let buffer_arg = inv.buffer.clone();
+    let mut cmd = Command::new(crate::ssh::trusted_tool("ssh-keygen")?);
+    cmd.arg("-Y")
         .arg("sign")
         .arg("-n")
         .arg(&inv.namespace)
-        .arg("-f")
-        .arg(pub_file.path()?)
-        .arg(&inv.buffer)
-        // No trailing "-". ssh-keygen rejects it alongside a buffer path
-        // ("Cannot sign mix of paths and standard input"), and it is not wanted
-        // anyway: with a path argument ssh-keygen writes "<buffer>.sig", which is
-        // exactly where git reads the signature from. Confirmed by spying on git's
-        // own invocation of ssh-keygen: it passes -f <pub> <buffer> and reads
-        // "<buffer>.sig" afterwards.
+        .arg("-f");
+    #[cfg(unix)]
+    {
+        pub_file.fchdir_child(&mut cmd);
+        cmd.arg(pub_file.name());
+    }
+    #[cfg(not(unix))]
+    cmd.arg(pub_file.path()?);
+    // No trailing "-". ssh-keygen rejects it alongside a buffer path
+    // ("Cannot sign mix of paths and standard input"), and it is not wanted
+    // anyway: with a path argument ssh-keygen writes "<buffer>.sig", which is
+    // exactly where git reads the signature from. Confirmed by spying on git's
+    // own invocation of ssh-keygen: it passes -f <pub> <buffer> and reads
+    // "<buffer>.sig" afterwards.
+    let status = cmd
+        .arg(&buffer_arg)
         .env("SSH_AUTH_SOCK", &agent.sock)
         .env_remove("SSH_AGENT_PID")
         .env_remove("GITVAULT_ASKPASS_VALUE")
@@ -255,10 +276,27 @@ pub fn public_key_of_material(private: &str, passphrase: Option<&str>) -> Result
         None => None,
     };
     let mut cmd = Command::new(crate::ssh::trusted_tool("ssh-keygen")?);
-    cmd.arg("-y").arg("-f").arg(secret.path()?);
+    cmd.arg("-y").arg("-f");
+    // The key material reaches ssh-keygen as a descriptor spelling on
+    // unix: -y opens /dev/fd/N fine (only -Y sign needs a named sibling
+    // for its .pub lookup), so between this point and the exec there is
+    // no name a same-user process can reparent or swap.
+    #[cfg(unix)]
+    let mut fd_shares: Vec<std::fs::File> = Vec::new();
+    #[cfg(unix)]
+    {
+        let (fd_path, share) = secret.fd_share()?;
+        crate::tempsecret::share_with_child(&mut cmd, &share);
+        fd_shares.push(share);
+        cmd.arg(fd_path);
+    }
+    #[cfg(not(unix))]
+    cmd.arg(secret.path()?);
     if let (Some(guard), Some(p)) = (&askpass, passphrase) {
-        cmd.env("SSH_ASKPASS", guard.path()?)
-            .env("SSH_ASKPASS_REQUIRE", "force")
+        // execve needs a real path for the askpass helper - /dev/fd cannot
+        // be exec'd - so the script keeps its re-asserted path.
+        cmd.env("SSH_ASKPASS", guard.path()?);
+        cmd.env("SSH_ASKPASS_REQUIRE", "force")
             .env("DISPLAY", ":0")
             .env("GITVAULT_ASKPASS_VALUE", p);
     }

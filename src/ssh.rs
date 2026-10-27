@@ -299,6 +299,9 @@ pub fn load_key(
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     if let (Some(guard), Some(p)) = (&askpass, passphrase) {
+        // execve needs a real path - a /dev/fd spelling cannot be exec'd -
+        // so the script keeps its re-asserted path under the pinned root;
+        // it carries no secret, only the fixed `print the variable` body.
         cmd.env("SSH_ASKPASS", guard.path()?)
             .env("SSH_ASKPASS_REQUIRE", "force")
             .env("DISPLAY", ":0")

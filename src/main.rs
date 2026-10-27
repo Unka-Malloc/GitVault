@@ -758,7 +758,7 @@ fn cmd_checkers(config: Option<&PathBuf>, json: bool) -> anyhow::Result<ExitCode
         eprintln!("warning: audit policy is uncertified - {reason}");
     }
     let bin = probator::engine().map_err(anyhow::Error::msg)?;
-    let (mut command, _scratch) = probator::command(&bin, None);
+    let (mut command, scratch) = probator::command(&bin, None)?;
     command.arg("inspect");
     if json {
         command.arg("--json");
@@ -769,6 +769,11 @@ fn cmd_checkers(config: Option<&PathBuf>, json: bool) -> anyhow::Result<ExitCode
             bin.display()
         )
     })?;
+    if let Some(share) = &scratch {
+        share
+            .reassert()
+            .context("the scratch root moved during the inspect run")?;
+    }
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!(
@@ -3356,9 +3361,15 @@ fn publication_surface(method: &str, path: &str) -> Option<String> {
         // pages build publishes a site; deploy keys, hooks and deployments
         // move trust or publish refs. None of it passes through an audited
         // push, so every mutating verb on any of these surfaces refuses.
+        // `repository_dispatch` and `workflow_dispatch` fire privileged
+        // workflows on a caller-chosen ref with caller-shaped payloads;
+        // every other `actions` write (rerun, approve, cancel, secrets,
+        // variables, cache) steers CI authority too. All refuse: a workflow
+        // that runs unaudited code under CI credentials IS a publication.
+        Some("dispatches" | "actions") => true,
         Some(
-            "dispatches" | "actions" | "forks" | "generate" | "import" | "transfer" | "branches"
-            | "pages" | "keys" | "hooks" | "deployments",
+            "forks" | "generate" | "import" | "transfer" | "branches" | "pages" | "keys" | "hooks"
+            | "deployments",
         ) => true,
         // The repository root itself: only mutating verbs reach this arm,
         // and they are the widest publication surface of all - PATCH flips
@@ -4145,20 +4156,36 @@ struct ReleaseAudit {
     assets: StagedAssets,
 }
 
+/// How the staged bytes are held between the audit and the upload.
+/// Linux/Android use a sealed `memfd`: an inode no path can name, whose
+/// write refusal is enforced by the kernel on every open description.
+/// Other unix targets have no primitive that revokes writes through
+/// already-open descriptors (Darwin `uchg` is judged at open, not write),
+/// so there the bytes live in private process memory: no inode exists to
+/// capture, no description to race, and the audited bytes and the uploaded
+/// bytes are literally the same image read twice. Non-unix keeps a named
+/// snapshot in the staging directory.
+#[derive(Debug)]
+enum AssetImage {
+    #[cfg(any(target_os = "linux", target_os = "android", not(unix)))]
+    File(std::fs::File),
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    Bytes(std::sync::Arc<Vec<u8>>),
+}
+
 /// What the release audit binds: the asset's upload name, size and content
 /// digest, computed before the audit so the evidence names the exact bytes
-/// that may be published. The open `fd` is the binding object: the scan
-/// inherits a share of it and the upload streams it, so no filesystem path
-/// between staging and publish can redirect either side to different bytes.
+/// that may be published. The held `image` is the binding object: the scan
+/// reads through a descriptor of it and the upload streams it, so no
+/// filesystem path between staging and publish can redirect either side to
+/// different bytes.
 #[derive(Debug)]
 struct ReleaseAsset {
     /// The operator's original path - diagnostics only, never read at upload
     /// time.
     path: PathBuf,
-    /// The private snapshot's open descriptor, held from staging to publish.
-    /// The seal and every byte access bind this inode - never a path a
-    /// same-user process could swap.
-    fd: std::fs::File,
+    /// The staged bytes' binding image, held from staging to publish.
+    image: AssetImage,
     /// The `/dev/fd/N` reference the audit evidence names, once the
     /// descriptor share for the audit child exists.
     audit_ref: Option<String>,
@@ -4170,6 +4197,66 @@ struct ReleaseAsset {
     name: String,
     size: u64,
     sha256: String,
+}
+
+impl ReleaseAsset {
+    /// A fresh reader over the staged bytes. A sealed memfd is duplicated
+    /// and rewound; an in-memory image is served through an anonymous pipe
+    /// a writer thread feeds - in both cases what the consumer opens is a
+    /// descriptor, never a path a same-user process could swap.
+    #[cfg(unix)]
+    fn open_bytes(&self) -> anyhow::Result<std::fs::File> {
+        match &self.image {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            AssetImage::File(file) => {
+                use std::io::Seek as _;
+                let mut clone = file.try_clone().context("cannot clone the staged image")?;
+                clone.rewind()?;
+                Ok(clone)
+            }
+            #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+            AssetImage::Bytes(bytes) => {
+                use std::io::Write as _;
+                use std::os::fd::FromRawFd as _;
+                let mut pipes = [0i32; 2];
+                anyhow::ensure!(
+                    unsafe { libc::pipe(pipes.as_mut_ptr()) } == 0,
+                    "cannot open the staged image's pipe: {}",
+                    std::io::Error::last_os_error()
+                );
+                for fd in pipes {
+                    unsafe {
+                        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                    }
+                }
+                let image = bytes.clone();
+                // Detached: a consumer that stops early gives the writer
+                // EPIPE and it ends; closing the shared read ends at drop
+                // releases any writer still parked on a full pipe.
+                std::thread::spawn(move || {
+                    let mut writer = unsafe { std::fs::File::from_raw_fd(pipes[1]) };
+                    let _ = writer.write_all(&image);
+                });
+                Ok(unsafe { std::fs::File::from_raw_fd(pipes[0]) })
+            }
+        }
+    }
+
+    /// Whether the staged bytes still cannot be altered before upload:
+    /// the kernel answers for a sealed memfd; an in-memory image needs no
+    /// kernel answer because nothing outside this process can reach it.
+    /// Checked again at publish - a lost seal means the audit-to-upload
+    /// binding cannot be proven and the release refuses.
+    fn sealed_now(&self) -> bool {
+        match &self.image {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            AssetImage::File(file) => asset_is_sealed(file),
+            #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+            AssetImage::Bytes(_) => true,
+            #[cfg(not(unix))]
+            AssetImage::File(_) => false,
+        }
+    }
 }
 
 /// GitHub's documented ceilings: a release carries at most 1000 assets and
@@ -4232,19 +4319,18 @@ impl StagedAssets {
     /// Reserve one descriptor number per asset for the audit child to
     /// inherit. `F_DUPFD_CLOEXEC` keeps the duplicate out of unrelated
     /// spawns until the gate's pre-exec clears the flag; the `/dev/fd/N`
-    /// reference it yields is inode-bound, so the scanner reads exactly the
-    /// bytes the upload will send, whatever happens to the staged path.
+    /// reference it yields is image-bound, so the scanner reads exactly
+    /// the bytes the upload will send, whatever happens to the staged
+    /// path.
     #[cfg(unix)]
     fn share_with_audit(&mut self) -> anyhow::Result<()> {
-        use std::io::Seek as _;
         use std::os::unix::io::AsRawFd as _;
         for (index, asset) in self.assets.iter_mut().enumerate() {
-            // The share duplicates the description, offset included: rewind
-            // before it is reserved so the scanner's first read starts the
-            // bytes, not the end of them.
-            asset.fd.rewind()?;
-            let fd =
-                unsafe { libc::fcntl(asset.fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 100 + index) };
+            // The share is a fresh reader positioned at the first byte -
+            // a dup'd description of the sealed inode, or the read end of
+            // the pipe an image writer feeds.
+            let reader = asset.open_bytes()?;
+            let fd = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 100 + index) };
             anyhow::ensure!(
                 fd >= 0,
                 "cannot share the staged asset '{}' with the audit",
@@ -4457,18 +4543,15 @@ fn check_release_assets(
 
 /// A staged snapshot must be a truly anonymous inode: a named file carries
 /// a link/rename surface for the whole instant it exists. Linux and
-/// Android hand back a `memfd` - an inode with no name anywhere, sealed by
-/// the kernel itself. Every other Unix target creates the name inside the
-/// pinned staging root, and `seal_staged` retires it: the writable
-/// description is traded for a fresh read-only one, the name is unlinked,
-/// and `st_nlink == 0` then proves no link captured the inode during the
-/// named instant - a captured link surfaces as a refusal, never silently.
-/// The returned name is what `seal_staged` reopens and unlinks through the
-/// pinned directory descriptor.
+/// Android hand back a `memfd` - an inode with no name anywhere, which the
+/// kernel itself then seals. Other unix targets hold the staged bytes in
+/// private process memory instead (see `AssetImage::Bytes`): no macOS or
+/// BSD primitive revokes writes through already-open descriptions - uchg
+/// is checked at open time, not write time - so an inode could never be
+/// trusted there, and private memory answers the same guarantee by
+/// construction.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn anonymous_snapshot(
-    _root: &std::fs::File,
-) -> anyhow::Result<(std::fs::File, Option<std::ffi::CString>)> {
+fn anonymous_snapshot() -> anyhow::Result<std::fs::File> {
     use std::os::fd::FromRawFd as _;
     let name = std::ffi::CString::new("gitvault-release").expect("an ASCII name");
     let fd =
@@ -4478,38 +4561,16 @@ fn anonymous_snapshot(
         "cannot create an anonymous staged snapshot: {}",
         std::io::Error::last_os_error()
     );
-    Ok((unsafe { std::fs::File::from_raw_fd(fd) }, None))
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-fn anonymous_snapshot(
-    root: &std::fs::File,
-) -> anyhow::Result<(std::fs::File, Option<std::ffi::CString>)> {
-    // The name exists only between create and unlink - inside the pinned,
-    // owner-only staging root, and unguessable in that window.
-    let name =
-        std::ffi::CString::new(format!("s{:016x}", rand::random::<u64>())).expect("an ASCII name");
-    let file = create_pinned_file(root, &name, 0o600)
-        .context("cannot create a snapshot under the pinned directory")?;
-    Ok((file, Some(name)))
-}
-
-/// Seal a staged snapshot so no write can reach the audited bytes again.
-/// A `memfd` takes inode-level seals: every description, including this
-/// one, refuses writes from then on - even a same-user process reaching
-/// it through /proc. On the other unix targets the snapshot is reopened
-/// through its name inside the pinned root with `O_RDONLY` after the mode
-/// drops to 0400 - a fresh file description whose access mode cannot be
-/// widened - the name unlinks, and `st_nlink == 0` proves the inode held
-/// exactly one name for its whole named life: any earlier link() capture
-/// would leave a surviving link count, and the operation refuses instead
-/// of trusting a contaminated inode.
+/// Seal a memfd's inode: F_SEAL_WRITE plus the grow/shrink/seal seals make
+/// every description - including this one and any a same-user process
+/// could open through /proc - refuse writes from then on. The audit and
+/// the upload both read through descriptions of this inode, and none can
+/// mutate what the other judged.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn seal_staged(
-    file: &mut std::fs::File,
-    _root: &std::fs::File,
-    _shm: Option<&std::ffi::CStr>,
-) -> anyhow::Result<()> {
+fn seal_staged(file: &mut std::fs::File) -> anyhow::Result<()> {
     use std::os::fd::AsRawFd as _;
     let seals = libc::F_SEAL_SEAL | libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK;
     anyhow::ensure!(
@@ -4519,94 +4580,15 @@ fn seal_staged(
     Ok(())
 }
 
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-fn seal_staged(
-    file: &mut std::fs::File,
-    root: &std::fs::File,
-    shm: Option<&std::ffi::CStr>,
-) -> anyhow::Result<()> {
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
-    let name = shm.context("an unnamed snapshot cannot be reopened read-only")?;
-    // Mode 0400 first: the read-only open below is judged against these
-    // bits, and a same-user open for write fails on them from here on.
-    anyhow::ensure!(
-        unsafe { libc::fchmod(file.as_raw_fd(), 0o400) } == 0,
-        "cannot drop write permission on the staged snapshot: {}",
-        std::io::Error::last_os_error()
-    );
-    // A fresh O_RDONLY description - a new open file description, not a
-    // widened duplicate - becomes the retained handle; the writable one
-    // drops with it.
-    let ro = unsafe {
-        libc::openat(
-            root.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if ro < 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("cannot reopen the staged snapshot read-only");
-    }
-    anyhow::ensure!(
-        unsafe { libc::unlinkat(root.as_raw_fd(), name.as_ptr(), 0) } == 0,
-        "cannot retire the staged snapshot's name: {}",
-        std::io::Error::last_os_error()
-    );
-    let ro = unsafe { std::fs::File::from_raw_fd(ro) };
-    // The inode must have exactly zero names now: one was ours, one unlink
-    // removed it, so a surviving link count means a watcher captured the
-    // inode during the named instant - the bytes cannot be trusted.
-    use std::os::unix::fs::MetadataExt as _;
-    anyhow::ensure!(
-        ro.metadata().map(|m| m.nlink())? == 0,
-        "the staged snapshot was linked during its named instant - refusing"
-    );
-    *file = ro;
-    Ok(())
-}
-
-/// A platform without an anonymous snapshot cannot seal one; the staged
-/// asset reports unsealed and publication refuses at the release boundary.
-#[cfg(not(unix))]
-fn seal_staged(
-    _file: &mut std::fs::File,
-    _root: &std::fs::File,
-    _shm: Option<&std::ffi::CStr>,
-) -> anyhow::Result<()> {
-    anyhow::bail!("staged snapshots cannot be sealed on this platform")
-}
-
 /// Whether the staged descriptor still cannot be written: a `memfd` asks
-/// the kernel for its seals; a reopened snapshot proves its retained
-/// handle is a read-only description of an object with no write
-/// permission left. Checked again at publish: a seal that vanished
-/// between the audit and the upload means the binding cannot be proven.
+/// the kernel for its seals. Checked again at publish: a seal that
+/// vanished between the audit and the upload means the binding cannot be
+/// proven.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn asset_is_sealed(file: &std::fs::File) -> bool {
     use std::os::fd::AsRawFd as _;
     let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
     seals >= 0 && seals & libc::F_SEAL_SEAL != 0 && seals & libc::F_SEAL_WRITE != 0
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-fn asset_is_sealed(file: &std::fs::File) -> bool {
-    use std::os::fd::AsRawFd as _;
-    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
-    flags >= 0
-        && flags & libc::O_ACCMODE == libc::O_RDONLY
-        && file
-            .metadata()
-            .map(|meta| {
-                use std::os::unix::fs::PermissionsExt as _;
-                meta.permissions().mode() & 0o222 == 0
-            })
-            .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn asset_is_sealed(_file: &std::fs::File) -> bool {
-    false
 }
 
 fn stage_release_assets(
@@ -4728,35 +4710,10 @@ fn stage_release_assets(
             declared: meta.len(),
         });
     }
-    // Snapshots are born inside a staging root pinned on a descriptor: on
-    // unix the pin is what binds the create/reopen/unlink calls to the
-    // directory inode the boundary check judged - a path swapped after
-    // validation can never redirect them. The pin's live path must equal
-    // the canonical one, or the directory was relocated and the operation
-    // refuses.
-    #[cfg(unix)]
-    let root_fd = {
-        use std::os::unix::ffi::OsStrExt as _;
-        // Pin the CANONICAL path - the spelling the caller gave may be a
-        // link, and O_NOFOLLOW would refuse it before the boundary check
-        // ever judged the real directory.
-        let croot = std::ffi::CString::new(root_canonical.as_os_str().as_bytes())
-            .context("the staging root is not an encodable path")?;
-        let root = open_pinned_dir(libc::AT_FDCWD, &croot).with_context(|| {
-            format!(
-                "cannot pin the staging root {}",
-                crate::records::redact(&staging_root.display().to_string())
-            )
-        })?;
-        let live = fd_canonical_path(&root)
-            .context("cannot establish the pinned staging root's live path")?;
-        anyhow::ensure!(
-            live == root_canonical,
-            "the staging root pinned on a descriptor is not the validated \
-             directory - the path was swapped; refusing"
-        );
-        root
-    };
+    // Unix snapshots never touch the staging directory at all - a sealed
+    // memfd or an in-memory image has no path to pin. The boundary check
+    // above still judged the root, which is what the named-snapshot
+    // fallback below writes under on other platforms.
     #[cfg(not(unix))]
     let dir = {
         let dir = staging_root.join(format!(
@@ -4809,29 +4766,32 @@ fn stage_release_assets(
         // or leave behind. Only the held descriptor addresses the bytes,
         // and sealing below trades the writable description for one that
         // provably cannot mutate them.
-        #[cfg(unix)]
-        let (mut file, shm_name) = {
-            let _ = index;
-            anonymous_snapshot(&root_fd)
-                .with_context(|| format!("cannot stage asset '{}'", path.display()))?
-        };
-        #[cfg(not(unix))]
-        let (mut file, shm_name) = {
-            let mut options = std::fs::OpenOptions::new();
-            options.read(true).write(true).create_new(true);
-            (
-                options
-                    .open(dir.join(format!("{index:04}")))
-                    .with_context(|| format!("cannot stage asset '{}'", path.display()))?,
-                None::<std::ffi::CString>,
-            )
-        };
         // One pass does the copy and the digest together: the hash describes
         // the bytes that actually landed in the snapshot, so the staged
         // digest is the audited digest by construction. The read is bounded
         // twice - by the per-asset cap and by the aggregate budget's
         // remainder: a source that grew after preflight is cut off at the
         // budget line rather than discovered over it at the end.
+        //
+        let _ = index;
+        // Where the bytes land depends on what the platform can prove:
+        // Linux/Android stream into a `memfd` (constant memory, then kernel
+        // seals); other unix collects into private memory, which needs no
+        // seal because no same-user process can name or reach it; non-unix
+        // keeps the named-snapshot fallback under the staging directory.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let mut sink: std::fs::File = anonymous_snapshot()
+            .with_context(|| format!("cannot stage asset '{}'", path.display()))?;
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+        let mut sink: Vec<u8> = Vec::new();
+        #[cfg(not(unix))]
+        let mut sink: std::fs::File = {
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create_new(true);
+            options
+                .open(dir.join(format!("{index:04}")))
+                .with_context(|| format!("cannot stage asset '{}'", path.display()))?
+        };
         let (sha256, total) = {
             use sha2::Digest as _;
             use std::io::Read as _;
@@ -4858,7 +4818,7 @@ fn stage_release_assets(
                     path.display()
                 );
                 use std::io::Write as _;
-                file.write_all(&buffer[..read])
+                sink.write_all(&buffer[..read])
                     .with_context(|| format!("cannot stage asset '{}'", path.display()))?;
                 hasher.update(&buffer[..read]);
             }
@@ -4871,8 +4831,6 @@ fn stage_release_assets(
                 total,
             )
         };
-        file.sync_all()
-            .with_context(|| format!("cannot stage asset '{}'", path.display()))?;
         // The staged size is the measured copy, not the source's earlier
         // metadata: a file that changed length mid-staging produced a torn
         // snapshot whose declared Content-Length would misframe the upload.
@@ -4886,18 +4844,22 @@ fn stage_release_assets(
         staged_bytes += total;
         // Seal the snapshot the moment its digest exists: nothing - not a
         // same-user rename and not an in-place write - may alter the staged
-        // bytes between the audit's read and the upload's stream. Sealing
-        // is structural here: it trades the writable description for a
-        // provably read-only one (memfd seals, or a fresh O_RDONLY shm
-        // description), and a platform without that primitive refuses
-        // rather than relying on detection alone.
-        seal_staged(&mut file, &root_fd, shm_name.as_deref())
-            .with_context(|| format!("cannot seal the staged asset '{}'", path.display()))?;
-        let sealed = true;
-        std::io::Seek::rewind(&mut file)?;
+        // bytes between the audit's read and the upload's stream. The seal
+        // is structural on every supported unix: the kernel seals the
+        // memfd, or the bytes never become an inode at all.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let (image, sealed) = {
+            seal_staged(&mut sink)
+                .with_context(|| format!("cannot seal the staged asset '{}'", path.display()))?;
+            (AssetImage::File(sink), true)
+        };
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+        let (image, sealed) = (AssetImage::Bytes(std::sync::Arc::new(sink)), true);
+        #[cfg(not(unix))]
+        let (image, sealed) = (AssetImage::File(sink), false);
         staged.assets.push(ReleaseAsset {
             path: path.clone(),
-            fd: file,
+            image,
             audit_ref: None,
             sealed,
             name: name.to_string(),
@@ -4941,7 +4903,7 @@ fn create_release_staged(
     // prove the published bytes will be the audited ones.
     for asset in staged.assets {
         anyhow::ensure!(
-            asset.sealed && asset_is_sealed(&asset.fd),
+            asset.sealed && asset.sealed_now(),
             "staged asset '{}' is not sealed - refusing before the release exists",
             asset.path.display()
         );
@@ -4977,11 +4939,9 @@ fn create_release_staged(
             // path swap and not a write to the staged inode - can publish
             // bytes the scan did not judge. The rewind matters: the audit's
             // descriptor share leaves the offset wherever the scan ended.
-            let mut file = asset
-                .fd
-                .try_clone()
+            let file = asset
+                .open_bytes()
                 .with_context(|| format!("cannot read staged asset '{}'", asset.path.display()))?;
-            std::io::Seek::rewind(&mut file)?;
             let mut up = get(
                 format!(
                     "{}/repos/{slug}/releases/{id}/assets?name={}",
@@ -5770,13 +5730,11 @@ mod tests {
             leftover_names.is_empty(),
             "anonymous snapshots leave no names behind: {leftover_names:?}"
         );
-        // The seal is provable on the held descriptor: reads pass, writes
-        // are refused by the kernel on every sealed platform.
+        // The seal is provable on the held image: a sealed memfd answers
+        // the kernel; private bytes are unreachable by construction.
         assert!(staged.assets[0].sealed);
-        assert!(super::asset_is_sealed(&staged.assets[0].fd));
-        let mut file = staged.assets[0].fd.try_clone().unwrap();
-        use std::io::Seek as _;
-        file.rewind().unwrap();
+        assert!(staged.assets[0].sealed_now());
+        let file = staged.assets[0].open_bytes().unwrap();
         assert_eq!(sha256_reader(&file).unwrap(), digest);
         // The audit's own share reaches the same inode through /dev/fd.
         staged.share_with_audit().unwrap();
@@ -5790,41 +5748,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A write to the staged inode itself - the shape a concurrent-writer
-    /// attack takes - is refused outright on every sealed platform: the
-    /// retained description is read-only (a sealed memfd, or a fresh
-    /// O_RDONLY shm description), so the digest is unchanged and unchanged
-    /// by construction. Where no seal exists, a mutation instead lands on
-    /// the same descriptor the upload streams and hashes - the sent digest
-    /// can never quietly match the audited one.
+    /// A write to the staged bytes - the shape a concurrent-writer attack
+    /// takes - cannot move the audited digest on any sealed platform. A
+    /// sealed memfd refuses the write in the kernel; an in-memory image
+    /// offers no writable surface at all: a same-user process can neither
+    /// name it nor open it, and every reader gets the same bytes.
     #[cfg(unix)]
     #[test]
     fn staged_inode_writes_change_the_streamed_digest() {
-        use std::io::{Seek as _, Write as _};
         let root = scratch("release-asset-write");
         let file = root.join("app-v1.0.zip");
         std::fs::write(&file, b"zip").unwrap();
         let staged = check_release_assets(&cfg(), std::slice::from_ref(&file), &root).unwrap();
         let digest = staged.assets[0].sha256.clone();
-        let mut dup = staged.assets[0].fd.try_clone().unwrap();
-        if super::asset_is_sealed(&staged.assets[0].fd) {
-            dup.rewind().unwrap();
+        assert!(staged.assets[0].sealed_now());
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use std::io::Write as _;
+            let mut dup = match &staged.assets[0].image {
+                super::AssetImage::File(file) => file.try_clone().unwrap(),
+            };
             assert!(
                 dup.write_all(b"mutated").is_err(),
                 "a sealed snapshot must refuse writes through any descriptor"
             );
-            dup.rewind().unwrap();
-            assert_eq!(
-                sha256_reader(&dup).unwrap(),
-                digest,
-                "a sealed snapshot's digest cannot move"
-            );
-        } else {
-            dup.rewind().unwrap();
-            let _ = dup.write_all(b"mutated");
-            dup.rewind().unwrap();
-            assert_ne!(sha256_reader(&dup).unwrap(), digest);
         }
+        // Whichever image holds the bytes, two readers see the audited
+        // digest: that is the immutability the audit binds.
+        let first = staged.assets[0].open_bytes().unwrap();
+        let second = staged.assets[0].open_bytes().unwrap();
+        assert_eq!(sha256_reader(first).unwrap(), digest);
+        assert_eq!(sha256_reader(second).unwrap(), digest);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5846,13 +5800,11 @@ mod tests {
         let digest = staged.assets[0].sha256.clone();
         let moved = base.join("staging-moved");
         std::fs::rename(&staging, &moved).unwrap();
-        let mut file = staged.assets[0].fd.try_clone().unwrap();
-        use std::io::Seek as _;
-        file.rewind().unwrap();
+        let file = staged.assets[0].open_bytes().unwrap();
         assert_eq!(
-            sha256_reader(&file).unwrap(),
+            sha256_reader(file).unwrap(),
             digest,
-            "the descriptor still serves the audited inode after relocation"
+            "the descriptor still serves the audited image after relocation"
         );
         drop(staged);
         let leftovers = std::fs::read_dir(&moved).map(|e| e.count()).unwrap_or(0);

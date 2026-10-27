@@ -382,11 +382,52 @@ fn signed_redirect_target(url: &str) -> Result<String> {
 
 /// Fetch a redirect target with no credential at all: the signed URL is
 /// self-authenticating, and sending the account token - or any header -
-/// to a download host would hand a credential where none is needed. Runs
-/// the same trusted curl under the same cleared environment and HTTPS
-/// protocol lock as the authenticated hop.
-fn fetch_signed_target(url: &str) -> Result<(Vec<u8>, i32, String)> {
-    let out = Command::new(curl_program()?)
+/// to a download host would hand a credential where none is needed.
+///
+/// The URL rides to curl inside an anonymous `-K -` config fed through a
+/// private pipe, so it never appears in argv, the environment or a
+/// diagnostic: a same-user process reading another process's arguments
+/// cannot lift the download credential it encodes. Response headers reach
+/// the broker through a second private descriptor (`-D /dev/fd/N`), so
+/// the body stream is clean bytes all the way to the caller's stdout -
+/// nothing holds the whole archive in memory, and no trailer parsing has
+/// to guess where the download ended. Only the final response's body is
+/// written to `sink`; an intermediate redirect's stub is drained and
+/// dropped because its Location is read from the headers first.
+///
+/// Returns `(status, next_redirect)`.
+#[cfg(unix)]
+fn stream_signed_target(url: &str, sink: &mut impl std::io::Write) -> Result<(i32, String)> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    anyhow::ensure!(
+        !url.contains(['"', '\\', '\n', '\r']),
+        "the redirect URL cannot be expressed in curl's config format"
+    );
+    // The response-header channel: curl writes `-D` output through an
+    // inherited descriptor, so status and Location are read without
+    // touching the body stream at all.
+    let mut header_pipe = [0i32; 2];
+    anyhow::ensure!(
+        unsafe { libc::pipe(header_pipe.as_mut_ptr()) } == 0,
+        "cannot create the redirect hop's header pipe: {}",
+        std::io::Error::last_os_error()
+    );
+    let (header_read, header_write) = unsafe {
+        (
+            std::fs::File::from_raw_fd(header_pipe[0]),
+            std::fs::File::from_raw_fd(header_pipe[1]),
+        )
+    };
+    // CLOEXEC on our copy keeps the descriptor out of unrelated spawns;
+    // the child's own pre_exec clears it after fork, so it is exactly this
+    // request's curl that can write the headers it collects.
+    let header_fd = header_write.as_raw_fd();
+    anyhow::ensure!(
+        unsafe { libc::fcntl(header_fd, libc::F_SETFD, libc::FD_CLOEXEC) } != -1,
+        "cannot mark the header pipe close-on-exec"
+    );
+    let mut request = Command::new(curl_program()?);
+    request
         .args([
             "-q",
             "-sS",
@@ -395,16 +436,92 @@ fn fetch_signed_target(url: &str) -> Result<(Vec<u8>, i32, String)> {
             "=https",
             "-X",
             "GET",
-            "-w",
-            "\n%{http_code}\n%{redirect_url}",
-            url,
+            "-D",
+            &format!("/dev/fd/{header_fd}"),
+            "-K",
+            "-",
         ])
         .env_clear()
-        .stdin(Stdio::null())
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    use std::os::unix::process::CommandExt as _;
+    unsafe {
+        request.pre_exec(move || {
+            if libc::fcntl(header_fd, libc::F_SETFD, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = request
+        .spawn()
         .context("failed to run curl for the redirect hop")?;
+    drop(header_write);
+    use std::io::{Read as _, Write as _};
+    child
+        .stdin
+        .take()
+        .context("no stdin for the redirect hop")?
+        .write_all(format!("url = \"{url}\"\n").as_bytes())
+        .context("could not hand the signed URL to curl")?;
+    let mut headers = String::new();
+    header_read
+        .take(64 * 1024)
+        .read_to_string(&mut headers)
+        .context("could not read the redirect hop's headers")?;
+    let status = headers
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("HTTP/")
+                .and_then(|rest| rest.split_whitespace().nth(1))
+                .and_then(|code| code.parse::<i32>().ok())
+        })
+        .unwrap_or(0);
+    let redirect = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("location")
+                .then(|| value.trim().to_string())
+        })
+        .unwrap_or_default();
+    if status >= 400 {
+        let out = child
+            .wait_with_output()
+            .context("the redirect hop did not finish")?;
+        let detail = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("the download host refused ({status}): {}", detail.trim());
+    }
+    if (300..400).contains(&status) && !redirect.is_empty() {
+        // An intermediate hop: its stub body is drained (curl blocks when
+        // the pipe fills), never written to the caller.
+        let mut body = child.stdout.take().expect("piped stdout");
+        std::io::copy(&mut body, &mut std::io::sink()).ok();
+        let out = child
+            .wait_with_output()
+            .context("the redirect hop did not finish")?;
+        anyhow::ensure!(out.status.success(), "the redirect hop did not run");
+        return Ok((status, redirect));
+    }
+    // The final hop: its body is the log or archive the caller asked for.
+    // Pump it through with a fixed buffer - an archive of any size moves
+    // with constant memory, and the bytes reach the sink unmangled.
+    let mut body = child.stdout.take().expect("piped stdout");
+    std::io::copy(&mut body, sink).context("could not stream the response body")?;
+    let out = child
+        .wait_with_output()
+        .context("the redirect hop did not finish")?;
     anyhow::ensure!(out.status.success(), "the redirect hop did not run");
-    Ok(split_transport_output(&out.stdout))
+    Ok((status, String::new()))
+}
+
+/// Redirect hops need descriptor passing that only unix provides; a follow
+/// request there refuses before the first hop rather than after it.
+#[cfg(not(unix))]
+fn stream_signed_target(_url: &str, _sink: &mut impl std::io::Write) -> Result<(i32, String)> {
+    anyhow::bail!("--follow needs descriptor inheritance, which this platform lacks")
 }
 
 /// The trailer `-w` appends: body bytes, then a newline, the HTTP code,
@@ -435,15 +552,17 @@ fn split_transport_output(stdout: &[u8]) -> (Vec<u8>, i32, String) {
 /// Authorize, send the request and return the HTTP status and response body.
 /// Output policy (printing, jq, error reporting) is the caller's choice.
 fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, Vec<u8>, Option<String>)> {
-    // Redirect following exists for read endpoints: a mutating request's
-    // 3xx answer would otherwise re-fire its body at a download host.
+    // Redirect following exists for the log/archive GETs it was built
+    // for: a second hop cannot carry a different method's contract, and a
+    // body that streams straight to the caller's stdout cannot be
+    // re-shaped by a jq expression afterwards.
     anyhow::ensure!(
-        !req.follow
-            || matches!(
-                req.method.to_ascii_uppercase().as_str(),
-                "GET" | "HEAD" | "OPTIONS"
-            ),
-        "--follow is only valid on read requests"
+        !req.follow || req.method.eq_ignore_ascii_case("GET"),
+        "--follow is only valid on GET requests"
+    );
+    anyhow::ensure!(
+        !req.follow || req.jq.is_none(),
+        "--follow streams raw response bytes; a jq selection cannot apply"
     );
     // The request path is validated before any credential is touched: an
     // absolute URL under a different origin would carry the account token to a
@@ -697,15 +816,23 @@ fn perform(cfg: &Config, vault: &Vault, req: &Request) -> Result<(i32, Vec<u8>, 
     // The redirect hop: a 3xx answer the caller asked to follow is re-sent
     // by the broker itself against the signed download URL - the account
     // token exists only in this request's pipe and never in the second
-    // hop, which carries no credential at all. At most four hops, each
-    // judged against the download-host allowlist before it is fetched.
+    // hop, which carries no credential at all. The signed URL rides to
+    // curl through a stdin config, so it is never in argv either. The
+    // final hop's body streams straight to the caller's stdout through a
+    // bounded pump, so a log archive of any size moves with constant
+    // memory; the returned body stays empty for that path. At most four
+    // hops, each judged against the download-host allowlist before it is
+    // fetched.
     let mut hops = 0;
     while req.follow && hops < 4 && (300..400).contains(&status) && !redirect.is_empty() {
         let target = signed_redirect_target(&redirect)?;
-        let (next_body, next_status, next_redirect) = fetch_signed_target(&target)?;
-        body = next_body;
+        let mut sink = std::io::stdout().lock();
+        let (next_status, next_redirect) = stream_signed_target(&target, &mut sink)?;
+        use std::io::Write as _;
+        sink.flush()?;
         status = next_status;
         redirect = next_redirect;
+        body = Vec::new();
         hops += 1;
     }
     Ok((status, body, sent_digest))
@@ -1019,6 +1146,25 @@ mod tests {
             "",
         ] {
             assert!(signed_redirect_target(bad).is_err(), "must refuse {bad}");
+        }
+    }
+
+    /// The signed URL rides to curl inside a `-K -` stdin config - never
+    /// argv - so a character that would break out of curl's quoting is a
+    /// hard refusal before any process spawns.
+    #[cfg(unix)]
+    #[test]
+    fn a_signed_url_that_breaks_config_quoting_never_reaches_curl() {
+        for bad in [
+            "https://objects.githubusercontent.com/x\"-k evil",
+            "https://objects.githubusercontent.com/x.zip?sig=a\\\nurl = \"http://evil\"",
+            "https://objects.githubusercontent.com/x.zip?sig=a\rb",
+        ] {
+            let mut sink = Vec::new();
+            assert!(
+                stream_signed_target(bad, &mut sink).is_err(),
+                "must refuse {bad}"
+            );
         }
         // A refusal names the host, never the signed URL's query - the
         // signature inside it is a download credential.
