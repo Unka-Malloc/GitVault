@@ -917,12 +917,12 @@ mod tests {
     /// to a substitute directory between "open" and "accept". `reassert`
     /// must refuse (the name no longer resolves to the pinned inode), the
     /// leaf's own descriptor still serves the REAL directory's contents,
-    /// and drop must leave the stand-in's contents untouched - removal is
-    /// conditional on the recorded inode, not on the name. Unix-only like
-    /// every test that exercises descriptor-bound handoff; on non-unix
-    /// none of these primitives exists and the production path refuses.
-    #[test]
+    /// and drop must leave the stand-in alone - removal compares the
+    /// recorded inode, not the name. Unix-only like every test that
+    /// exercises descriptor-bound handoff; on non-unix none of these
+    /// primitives exists and the production path refuses.
     #[cfg(unix)]
+    #[test]
     fn a_renamed_and_replanted_leaf_is_refused_and_never_removed() {
         let root = private_temp_root().unwrap();
         let root_path = crate::fd_canonical_path(&root.fd).unwrap();
