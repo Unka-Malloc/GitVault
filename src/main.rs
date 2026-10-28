@@ -5172,15 +5172,17 @@ fn create_release_staged(
     match verify_remote_tag(staged.repo_root, slug, staged.tag, staged.audited) {
         Ok(true) => {}
         Ok(false) => {
-            delete_release_quietly(cfg, vault, slug, &id);
             anyhow::bail!(
-                "the remote tag {} vanished while the draft was created - the draft was deleted",
+                "the remote tag {} vanished while the draft was created - draft {id} \
+                 was left unpublished; remove it through GitHub if it should go",
                 staged.tag
             );
         }
         Err(why) => {
-            delete_release_quietly(cfg, vault, slug, &id);
-            return Err(why.context("the draft bound unaudited content and was deleted"));
+            return Err(why.context(format!(
+                "the draft bound unaudited content; draft {id} was left unpublished \
+                 for inspection"
+            )));
         }
     }
     let upload = (|| -> anyhow::Result<()> {
@@ -5222,8 +5224,9 @@ fn create_release_staged(
         Ok(())
     })();
     if let Err(why) = upload {
-        delete_release_quietly(cfg, vault, slug, &id);
-        return Err(why.context("the draft release was deleted after the staged publish failed"));
+        return Err(why.context(format!(
+            "the staged publish failed; draft {id} was left unpublished for inspection"
+        )));
     }
     // A tag move past this point cannot retarget the bound draft, but it
     // would publish a release naming a tag that now points at unaudited
@@ -5269,24 +5272,6 @@ fn create_release_staged(
         .raw_fields
         .push(("draft".into(), "false".to_string()));
     emit(cfg, vault, publish)
-}
-
-/// Best-effort cleanup of a draft that must not be published: a failure here
-/// is reported but cannot hide the original error.
-fn delete_release_quietly(cfg: &config::Config, vault: &vault::Vault, slug: &str, id: &str) {
-    let mut delete = get(
-        format!("/repos/{slug}/releases/{id}"),
-        slug.to_string(),
-        None,
-    );
-    delete.method = "DELETE".into();
-    delete.silent = true;
-    delete.mutation = api::Mutation::Containment;
-    if let Err(why) = api::run(cfg, vault, &delete) {
-        eprintln!(
-            "gitvault: warning - the failed draft release {id} could not be deleted: {why:#}"
-        );
-    }
 }
 
 fn cmd_run(

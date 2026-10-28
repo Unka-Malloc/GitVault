@@ -777,6 +777,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&moved);
     }
 
+    /// Keygen, signing and the tamper refusal round-trip all need the
+    /// descriptor-bound handoff - on platforms without it both operations
+    /// refuse, so the round-trip only runs where it can succeed.
+    #[cfg(unix)]
     #[test]
     fn sign_verify_roundtrip_and_tamper_refusal() {
         if !have_ssh_keygen() {

@@ -22,6 +22,13 @@ table on the same footing the vault itself accepts below, so hardening aimed
 only at that actor is defense-in-depth — welcome, but never the gate's
 measure.
 
+**Platform boundary.** The descriptor-bound handoffs this model relies on
+exist only on unix. On other platforms GitVault refuses rather than
+approximates: key generation, config signing, secret-to-child handoffs and
+release-asset staging all refuse, because a pathname can be relocated
+between any check and the consumer's open — a check-then-open the platform
+cannot close.
+
 ## What the vault is
 
 `vault.enc` is a ChaCha20-Poly1305 blob holding API tokens and SSH key material,
