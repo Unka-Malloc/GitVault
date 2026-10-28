@@ -162,13 +162,9 @@ impl ScratchRoot {
         // O_CLOEXEC keeps the pinned descriptor out of child fd tables; a
         // consumer binds the leaf's cwd through `fchdir` in pre_exec, which
         // runs before the flag would matter.
-        let dir = unsafe {
-            libc::openat(
-                self.fd.as_raw_fd(),
-                cname.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
+        const LEAF_FLAGS: libc::c_int =
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let dir = unsafe { libc::openat(self.fd.as_raw_fd(), cname.as_ptr(), LEAF_FLAGS) };
         anyhow::ensure!(
             dir >= 0,
             "cannot pin the scratch leaf: {}",
@@ -688,7 +684,7 @@ impl TempSecret {
     /// open - a check-then-open this platform cannot close, so the handoff
     /// refuses rather than lend a raceable spelling to a consumer.
     #[cfg(not(unix))]
-    pub fn path(&self) -> Result<&Path> {
+    pub fn path(&self) -> anyhow::Result<&Path> {
         anyhow::bail!(
             "this platform cannot hand a checked secret to a consumer atomically - \
              the descriptor-bound handoff (fd_share, fchdir-bound cwd) unix \
@@ -925,8 +921,8 @@ mod tests {
     /// conditional on the recorded inode, not on the name. Unix-only like
     /// every test that exercises descriptor-bound handoff; on non-unix
     /// none of these primitives exists and the production path refuses.
-    #[cfg(unix)]
     #[test]
+    #[cfg(unix)]
     fn a_renamed_and_replanted_leaf_is_refused_and_never_removed() {
         let root = private_temp_root().unwrap();
         let root_path = crate::fd_canonical_path(&root.fd).unwrap();

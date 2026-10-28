@@ -3354,7 +3354,7 @@ fn cmd_pr(
     };
 
     let merge_audited = matches!(command, PrCommand::Merge { .. });
-    let (method, path, fields, raw_fields, jq, expected_head) = match command {
+    let (method, path, fields, raw_fields, jq, expected_refs) = match command {
         PrCommand::Create {
             title,
             body,
@@ -3614,7 +3614,7 @@ fn cmd_pr(
     // the span of one request. The merge arm holds the same discipline: its
     // publication gate and post-audit head/base re-verify are why it alone
     // may mint Audited in the request above.
-    if let Some((expected_head, expected_base)) = expected_head {
+    if let Some((expected_head, expected_base)) = expected_refs {
         req.mutation = api::Mutation::Audited;
         req.jq = Some(".html_url, .head.sha, .base.sha, .number".to_string());
         let body = api::run_value(&cfg, &vault, &req)?;
@@ -4315,15 +4315,6 @@ fn bytes_writer() -> &'static std::sync::mpsc::Sender<ImageJob> {
                 offset: usize,
                 ack: std::sync::mpsc::Sender<bool>,
             }
-            /// The receipt a finished writer sends exactly once: `true`
-            /// only when every staged byte went into the pipe. A writer
-            /// that dies mid-image or never ran drops the sender instead,
-            /// which `verify_delivered` reads the same as `false`.
-            impl Drop for Job {
-                fn drop(&mut self) {
-                    let _ = self.ack.send(self.offset >= self.image.len());
-                }
-            }
             /// `None` on a failed `F_SETFL`: a pipe that could not be made
             /// nonblocking is never queued - a blocking write to a stalled
             /// reader would stop this one worker. Closing the write end
@@ -4355,8 +4346,18 @@ fn bytes_writer() -> &'static std::sync::mpsc::Sender<ImageJob> {
                         unsafe {
                             libc::close(fd);
                         }
-                        return None;
+                        // No Job exists, so no ack is ever sent.
+                        return None; // the missing receipt refuses downstream
                     }
+                }
+            }
+            /// The receipt a finished writer sends exactly once: `true`
+            /// only when every staged byte went into the pipe. A writer
+            /// that dies mid-image or never ran drops the sender instead,
+            /// which `verify_delivered` reads the same as `false`.
+            impl Drop for Job {
+                fn drop(&mut self) {
+                    let _ = self.ack.send(self.offset >= self.image.len());
                 }
             }
             let mut jobs: Vec<Job> = Vec::new();
@@ -5203,14 +5204,12 @@ fn create_release_staged(
     // never deleted from inside the tool.
     match verify_remote_tag(staged.repo_root, slug, staged.tag, staged.audited) {
         Ok(true) => {}
-        Ok(false) => {
-            anyhow::bail!(
-                "the remote tag {} vanished while the draft was created - draft {id} \
-                 holds no assets yet and was left unpublished; remove it through \
-                 GitHub if it should go",
-                staged.tag
-            );
-        }
+        Ok(false) => anyhow::bail!(
+            "the remote tag {} vanished while the draft was created - draft {id} \
+             holds no assets yet and was left unpublished; remove it through \
+             GitHub if it should go",
+            staged.tag
+        ),
         Err(why) => {
             return Err(why.context(format!(
                 "the draft bound unaudited content; draft {id} was left unpublished \
@@ -5307,7 +5306,7 @@ fn create_release_staged(
         .raw_fields
         .push(("draft".into(), "false".to_string()));
     emit(cfg, vault, publish).with_context(|| {
-        format!("publishing failed; draft {id} was left unpublished for inspection")
+        format!("the publish call failed - whether release {id} is live is unknown; check GitHub before retrying")
     })
 }
 
