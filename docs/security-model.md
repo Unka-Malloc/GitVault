@@ -5,6 +5,23 @@ credential cannot run without first passing the gates, and the credential itself
 never reaches the caller.** Everything in the design serves one of those two
 halves.
 
+## Adversary model
+
+The boundary this design claims has named hostile principals:
+
+- remote callers of brokered operations and the paths their requests can take;
+- the upstream GitHub service (redirects, signed URLs, event hooks it emits);
+- checked-in content and untrusted inputs reaching a privileged context;
+- the children the vault spawns for audits — their environment is rebuilt
+  and they receive no credentials, so what they can reach is bounded by the
+  descriptors and scratch they are handed.
+
+A process already running with the operator's own local privileges is **not**
+part of the claimed boundary: it can read the keychain item and the process
+table on the same footing the vault itself accepts below, so hardening aimed
+only at that actor is defense-in-depth — welcome, but never the gate's
+measure.
+
 ## What the vault is
 
 `vault.enc` is a ChaCha20-Poly1305 blob holding API tokens and SSH key material,

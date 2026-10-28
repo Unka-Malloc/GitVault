@@ -3350,6 +3350,7 @@ fn cmd_pr(
             .ok_or_else(|| anyhow::anyhow!("no origin remote; pass --repo OWNER/NAME"))?,
     };
 
+    let merge_audited = matches!(command, PrCommand::Merge { .. });
     let (method, path, fields, raw_fields, jq, expected_head) = match command {
         PrCommand::Create {
             title,
@@ -3590,6 +3591,13 @@ fn cmd_pr(
         jq,
         silent: false,
     };
+    if merge_audited {
+        // The merge arm already ran `run_publication_gate` and re-verified
+        // the request's head and base after it: the PUT lands exactly what
+        // the audit judged, which is what Audited means at the credential
+        // boundary.
+        req.mutation = api::Mutation::Audited;
+    }
     // A created pull request carries the head and base the API actually used.
     // If either advanced between the last read and the POST, the request
     // contains a commit or a diff base the audit never saw: close it and
@@ -4087,22 +4095,43 @@ fn cmd_release(
             );
         }
         ReleaseCommand::Delete { tag } => {
-            // Deleting a release needs its numeric id, so resolve it first. Two
-            // requests, but it spares the caller from knowing that.
-            let id_req = get(
-                format!("/repos/{slug}/releases/tags/{tag}"),
-                slug.clone(),
-                Some(".id".into()),
+            // Only a draft may be removed: deleting a published release emits
+            // `release:deleted`, which triggers workflows outside the audited
+            // path. Drafts are not reachable through the tags endpoint, so the
+            // id and draft state resolve from the release listing. The tag is
+            // validated before it enters the jq program.
+            anyhow::ensure!(
+                !tag.is_empty()
+                    && tag
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/')),
+                "release tag '{tag}' contains characters the delete resolver cannot safely use"
             );
-            let id = api::run_value(&cfg, &vault, &id_req)?;
+            let id_req = get(
+                format!("/repos/{slug}/releases?per_page=100"),
+                slug.clone(),
+                Some(format!(
+                    ".[] | select(.tag_name == \"{tag}\") | .id, .draft"
+                )),
+            );
+            let resolved = api::run_value(&cfg, &vault, &id_req)?;
+            let mut lines = resolved.lines();
+            let id = lines.next().unwrap_or_default().trim().to_string();
+            let draft = lines.next().unwrap_or_default().trim();
+            anyhow::ensure!(!id.is_empty(), "no release named '{tag}'");
+            anyhow::ensure!(
+                draft == "true",
+                "release '{tag}' is published; deleting it emits events that can \
+                 trigger privileged workflows - only drafts may be removed"
+            );
             let mut r = get(
                 format!("/repos/{slug}/releases/{}", id.trim()),
                 slug.clone(),
                 None,
             );
             r.method = "DELETE".into();
-            // Containment: the action only removes server-side state -
-            // nothing is published or added by deleting a release.
+            // Containment: the action only removes an unpublished draft -
+            // state that never passed an audit and emits no public events.
             r.mutation = api::Mutation::Containment;
             r
         }
@@ -4169,18 +4198,31 @@ impl ReleaseAsset {
     /// descriptor, never a path a same-user process could swap.
     #[cfg(unix)]
     fn open_bytes(&self) -> anyhow::Result<std::fs::File> {
-        self.open_image().map(|(file, _)| file)
+        let (file, evidence) = self.open_image()?;
+        // Upload readers carry no delivery question; drop the drain check
+        // rather than leak the parent's copy of the read end.
+        #[cfg(unix)]
+        if let Some((_receipt, drain)) = evidence {
+            unsafe {
+                libc::close(drain);
+            }
+        }
+        Ok(file)
     }
 
-    /// A reader plus, on in-memory images, the delivery receipt proving the
-    /// writer pushed every staged byte into the pipe: the audit side can
-    /// tell a truncated stream (receipt reports `false`) from a complete
-    /// one, where a bare EOF could not. `None` on kernel-bound images -
-    /// a duplicated descriptor carries no delivery question.
+    /// A reader plus, on in-memory images, the delivery evidence pair: the
+    /// receipt proving the writer pushed every staged byte into the pipe and
+    /// a parent-held read descriptor proving the consumer drained it - the
+    /// audit side can tell a truncated stream (unwritten bytes, or bytes left
+    /// unread in the buffer) from a complete one, where a bare EOF could not.
+    /// `None` on kernel-bound images - a duplicated descriptor carries no
+    /// delivery question.
     #[cfg(unix)]
-    fn open_image(
-        &self,
-    ) -> anyhow::Result<(std::fs::File, Option<std::sync::mpsc::Receiver<bool>>)> {
+    #[cfg_attr(
+        not(all(unix, not(any(target_os = "linux", target_os = "android")))),
+        allow(dead_code)
+    )]
+    fn open_image(&self) -> anyhow::Result<(std::fs::File, Option<DeliveryEvidence>)> {
         match &self.image {
             #[cfg(any(target_os = "linux", target_os = "android"))]
             AssetImage::File(file) => {
@@ -4203,13 +4245,23 @@ impl ReleaseAsset {
                         libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
                     }
                 }
+                // The parent keeps its own read end: after the audit children
+                // exit, the bytes still sitting in this pipe are exactly what
+                // the consumer never read. It is CLOEXEC so no child inherits
+                // a second reader that would hide an undrained buffer.
+                let drain = unsafe { libc::fcntl(pipes[0], libc::F_DUPFD_CLOEXEC, 0) };
+                anyhow::ensure!(
+                    drain >= 0,
+                    "cannot keep a drain check on the staged image's pipe: {}",
+                    std::io::Error::last_os_error()
+                );
                 let (ack, delivered) = std::sync::mpsc::channel();
                 bytes_writer()
                     .send((bytes.clone(), pipes[1], ack))
                     .map_err(|_| anyhow::anyhow!("the staged-image writer is gone"))?;
                 Ok((
                     unsafe { std::fs::File::from_raw_fd(pipes[0]) },
-                    Some(delivered),
+                    Some((delivered, drain)),
                 ))
             }
         }
@@ -4231,6 +4283,14 @@ impl ReleaseAsset {
         }
     }
 }
+
+/// The consumer-side delivery proof a pipe-fed staged image hands back:
+/// the writer's completion receipt and the parent's own read descriptor,
+/// whose leftover bytes after the audit are exactly what the consumer
+/// never drained. Only in-memory images need it - a sealed kernel inode
+/// cannot truncate silently.
+#[cfg_attr(not(unix), allow(dead_code))]
+type DeliveryEvidence = (std::sync::mpsc::Receiver<bool>, i32);
 
 /// GitHub's documented ceilings: a release carries at most 1000 assets and
 /// each asset must stay under 2 GiB. Both refuse before any byte is read,
@@ -4415,10 +4475,11 @@ struct StagedAssets {
     /// Descriptor numbers reserved for the audit child's inheritance; closed
     /// when the staged set drops.
     shared: Vec<i32>,
-    /// One delivery receipt per audit share on in-memory images: the pipe
-    /// writer reports `true` only when every staged byte reached the pipe.
+    /// One delivery evidence pair per audit share on in-memory images: the
+    /// pipe writer's completion receipt and a parent-held read descriptor
+    /// whose leftover bytes are exactly what the consumer never drained.
     /// Empty on kernel-bound images and before sharing.
-    delivery: Vec<std::sync::mpsc::Receiver<bool>>,
+    delivery: Vec<DeliveryEvidence>,
 }
 
 impl Drop for StagedAssets {
@@ -4460,17 +4521,17 @@ impl StagedAssets {
             // The share is a fresh reader positioned at the first byte -
             // a dup'd description of the sealed inode, or the read end of
             // the pipe an image writer feeds. In-memory images also hand
-            // back the delivery receipt: a truncated or failed stream must
+            // back the delivery evidence: a truncated or unread stream must
             // read differently from a complete one after the gate.
-            let (reader, delivered) = asset.open_image()?;
+            let (reader, evidence) = asset.open_image()?;
             let fd = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 100 + index) };
             anyhow::ensure!(
                 fd >= 0,
                 "cannot share the staged asset '{}' with the audit",
                 asset.name
             );
-            if let Some(delivered) = delivered {
-                self.delivery.push(delivered);
+            if let Some(evidence) = evidence {
+                self.delivery.push(evidence);
             }
             self.shared.push(fd);
             asset.audit_ref = Some(format!("/dev/fd/{fd}"));
@@ -4478,13 +4539,17 @@ impl StagedAssets {
         Ok(())
     }
 
-    /// Called once the audit child has finished: every pipe-fed share must
-    /// have delivered its whole staged image, or the scan may have judged
-    /// a truncated stream while the upload later serves the full asset -
-    /// a silent EOF cannot distinguish those. The parent's inherited-fd
-    /// copies are spent too: closing them leaves the child's end the only
-    /// reader, so a still-parked writer reports failure promptly instead
-    /// of waiting on a reader that will never come.
+    /// Called once the audit children have finished: every pipe-fed share
+    /// must prove its whole staged image was *consumed*, not merely written.
+    /// A writer's completion receipt alone is not enough - a consumer that
+    /// read a prefix and exited leaves the tail undrained in the pipe, which
+    /// a bare EOF or a producer-side ack cannot distinguish from a full
+    /// read. The parent's own read end answers that: whatever still sits in
+    /// it after the children exit was never consumed. The parent's
+    /// inherited-fd copies are spent first, then each drain descriptor is
+    /// measured and closed - closing the last reader turns a still-parked
+    /// writer's EPIPE into a failed receipt rather than a wait on a reader
+    /// that will never come.
     #[cfg(unix)]
     fn verify_delivered(&mut self) -> anyhow::Result<()> {
         for fd in self.shared.drain(..) {
@@ -4492,13 +4557,22 @@ impl StagedAssets {
                 libc::close(fd);
             }
         }
-        for delivered in self.delivery.drain(..) {
-            anyhow::ensure!(
-                delivered.recv().unwrap_or(false),
-                "an audited asset stream ended before its bytes were fully \
-                 delivered - the gate may have read a truncated image; refusing"
-            );
+        let mut complete = true;
+        for (delivered, drain) in self.delivery.drain(..) {
+            let mut left = 0i32;
+            let undrained =
+                unsafe { libc::ioctl(drain, libc::FIONREAD, &mut left) } == 0 && left > 0;
+            unsafe {
+                libc::close(drain);
+            }
+            complete &= delivered.recv().unwrap_or(false) && !undrained;
         }
+        anyhow::ensure!(
+            complete,
+            "an audited asset stream was not consumed to its end - the gate \
+             may have judged a truncated image while the upload would serve \
+             the full asset; refusing"
+        );
         Ok(())
     }
 
@@ -6066,6 +6140,48 @@ mod tests {
         staged
             .verify_delivered()
             .expect("a fully drained share must verify");
+        drop(staged);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An image smaller than the pipe's capacity is the case a producer-side
+    /// receipt cannot judge: the writer completes before the consumer ever
+    /// reads, so `true` from the ack alone would pass a share the audit
+    /// closed after a prefix - or never opened. The parent's drain
+    /// descriptor reports the bytes still sitting unread.
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    #[test]
+    fn a_prefix_read_of_a_small_image_fails_delivery_verification() {
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        // Prefix read: the consumer drains part of the small image then
+        // closes; the writer long since reported success.
+        let root = scratch("release-asset-prefix");
+        let file = root.join("app-v1.0.zip");
+        std::fs::write(&file, &payload).unwrap();
+        let mut staged = check_release_assets(&cfg(), std::slice::from_ref(&file), &root).unwrap();
+        staged.share_with_audit().unwrap();
+        {
+            use std::io::Read as _;
+            let mut partial = std::fs::File::open(format!("/dev/fd/{}", staged.shared[0])).unwrap();
+            let mut buf = [0u8; 1024];
+            partial.read_exact(&mut buf).unwrap();
+        }
+        assert!(
+            staged.verify_delivered().is_err(),
+            "a prefix-only read of a small image must fail delivery verification"
+        );
+        drop(staged);
+        let _ = std::fs::remove_dir_all(&root);
+        // Never read: the consumer closed without taking a byte.
+        let root = scratch("release-asset-unread");
+        let file = root.join("app-v1.0.zip");
+        std::fs::write(&file, &payload).unwrap();
+        let mut staged = check_release_assets(&cfg(), std::slice::from_ref(&file), &root).unwrap();
+        staged.share_with_audit().unwrap();
+        assert!(
+            staged.verify_delivered().is_err(),
+            "an unread share must fail delivery verification"
+        );
         drop(staged);
         let _ = std::fs::remove_dir_all(&root);
     }

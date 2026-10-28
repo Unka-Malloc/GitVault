@@ -229,6 +229,20 @@ pub struct Request {
     pub silent: bool,
 }
 
+/// One shared mutation policy at the credential moment. A read spends a
+/// token on a read; a mutating method spends it on a change the local audit
+/// never saw, unless the command marked the request after its gate
+/// (`Audited`) or the action only removes unaudited server-side state
+/// (`Containment`). Comments, labels, state flips and every other
+/// event-emitting write - through `api` or through `issue`/`pr` subcommands -
+/// refuse here rather than spending the vault.
+fn mutation_permitted(req: &Request) -> bool {
+    matches!(
+        req.method.to_ascii_uppercase().as_str(),
+        "GET" | "HEAD" | "OPTIONS"
+    ) || !matches!(req.mutation, Mutation::Read)
+}
+
 /// Decide which account may perform this request, and hand back its token.
 ///
 /// Both halves matter. Resolving the identity says who *should* act; the account
@@ -242,18 +256,8 @@ pub struct Request {
 /// unsigned or tampered table spend the vault on a metadata read before the
 /// gate refuses.
 fn authorize(cfg: &Config, req: &Request, vault: &Vault) -> Result<String> {
-    // One shared mutation policy at the credential moment. A read spends a
-    // token on a read; a mutating method spends it on a change the local
-    // audit never saw, unless the command marked the request after its gate
-    // (`Audited`) or the action only removes unaudited server-side state
-    // (`Containment`). Comments, labels, state flips and every other
-    // event-emitting write - through `api` or through `issue`/`pr`
-    // subcommands - refuse here rather than spending the vault.
     anyhow::ensure!(
-        matches!(
-            req.method.to_ascii_uppercase().as_str(),
-            "GET" | "HEAD" | "OPTIONS"
-        ) || !matches!(req.mutation, Mutation::Read),
+        mutation_permitted(req),
         "{} {} mutates outside an audited command - refusing to spend vault credentials",
         req.method,
         req.path
@@ -1255,6 +1259,51 @@ mod tests {
             .to_string();
         assert!(err.contains("evil.example"), "{err}");
         assert!(!err.contains("SECRET"), "{err}");
+    }
+
+    /// The one mutation policy every user-facing request inherits at the
+    /// credential moment: a write the command never marked refuses by
+    /// default, so an `issue create` or `pr comment` cannot spend vault
+    /// credentials outside the audit, while the paths that ran their own
+    /// gate - the merge PUT, the release create and uploads - spend theirs.
+    #[test]
+    fn unmarked_mutations_refuse_while_gated_and_containment_paths_spend() {
+        let mut req = Request {
+            method: "POST".into(),
+            path: "/repos/o/r/issues".into(),
+            target: Target::Repo("o/r".into()),
+            fields: vec![],
+            raw_fields: vec![],
+            headers: vec![],
+            body: None,
+            body_stream: None,
+            follow: false,
+            mutation: Mutation::Read,
+            jq: None,
+            silent: false,
+        };
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            req.method = method.into();
+            assert!(
+                !mutation_permitted(&req),
+                "an unmarked {method} must refuse credentials"
+            );
+            req.mutation = Mutation::Audited;
+            assert!(
+                mutation_permitted(&req),
+                "a gated {method} (merge, release create, uploads) must spend"
+            );
+            req.mutation = Mutation::Containment;
+            assert!(
+                mutation_permitted(&req),
+                "a containment {method} (draft delete, moved-head PR close) must spend"
+            );
+            req.mutation = Mutation::Read;
+        }
+        for method in ["GET", "HEAD", "OPTIONS"] {
+            req.method = method.into();
+            assert!(mutation_permitted(&req), "a {method} always reads");
+        }
     }
 
     /// The response head is complete at the CRLF blank line - that bound
