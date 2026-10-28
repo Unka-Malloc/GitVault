@@ -591,7 +591,8 @@ pub fn keygen() -> Result<(String, String)> {
     #[cfg(unix)]
     {
         let leaf_dir = scratch.mkdir_leaf(std::ffi::OsStr::new(&leaf), 0o700)?;
-        let out = keygen_in_leaf(&leaf_dir);
+        let out =
+            keygen_in_leaf(&leaf_dir).and_then(|pair| accept_keypair(&scratch, &leaf_dir, pair));
         leaf_dir.unlink(std::ffi::OsStr::new("key"));
         leaf_dir.unlink(std::ffi::OsStr::new("key.pub"));
         out
@@ -609,6 +610,24 @@ pub fn keygen() -> Result<(String, String)> {
         let _ = std::fs::remove_dir_all(&dir);
         out
     }
+}
+
+/// The pair is accepted only while both pins still judge what the boundary
+/// judged: the scratch root must not have moved mid-run, and the leaf's
+/// name must still resolve to the inode keygen was bound to - otherwise
+/// the key material could have been exposed outside the scratch the check
+/// trusted, or be read back from a stand-in.
+#[cfg(unix)]
+fn accept_keypair(
+    scratch: &crate::tempsecret::ScratchRoot,
+    leaf: &crate::tempsecret::PinnedLeaf,
+    pair: (String, String),
+) -> Result<(String, String)> {
+    scratch
+        .reassert()
+        .and_then(|()| leaf.reassert())
+        .map(|()| pair)
+        .context("the signing-key scratch moved during keygen - refusing the pair")
 }
 
 /// Unix: the leaf descriptor is the whole lookup root - ssh-keygen writes
@@ -740,6 +759,43 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&redirected);
+    }
+
+    /// The relocation check that guards `keygen` acceptance, exercised
+    /// under control: generate a real pair inside a pinned leaf, move the
+    /// leaf's name to a substitute, then run the same acceptance chain -
+    /// it must refuse the pair rather than accept material whose scratch
+    /// stopped being the judged one mid-run.
+    #[cfg(unix)]
+    #[test]
+    fn a_pair_is_refused_when_its_leaf_relocates_before_acceptance() {
+        if !have_ssh_keygen() {
+            return;
+        }
+        let scratch = crate::tempsecret::private_temp_root().unwrap();
+        let name = format!(
+            "keygen-move-{}-{:04x}",
+            std::process::id(),
+            rand::random::<u16>()
+        );
+        let leaf = scratch
+            .mkdir_leaf(std::ffi::OsStr::new(&name), 0o700)
+            .unwrap();
+        let pair = keygen_in_leaf(&leaf).expect("keygen inside the pinned leaf failed");
+        let leaf_path = scratch.path().unwrap().join(&name);
+        let moved = leaf_path.with_file_name(format!("{name}-moved"));
+        std::fs::rename(&leaf_path, &moved).unwrap();
+        std::fs::create_dir(&leaf_path).unwrap();
+        let refused = accept_keypair(&scratch, &leaf, pair);
+        assert!(
+            refused.is_err(),
+            "a pair must be refused once its leaf's name was replanted"
+        );
+        leaf.unlink(std::ffi::OsStr::new("key"));
+        leaf.unlink(std::ffi::OsStr::new("key.pub"));
+        drop(leaf);
+        let _ = std::fs::remove_dir_all(&leaf_path);
+        let _ = std::fs::remove_dir_all(&moved);
     }
 
     #[test]

@@ -167,6 +167,25 @@ impl ScratchRoot {
             "cannot pin the scratch leaf: {}",
             std::io::Error::last_os_error()
         );
+        // The open happened after the name existed, so a replant between
+        // mkdirat and openat is possible. Pin what we actually opened and
+        // refuse unless the name still resolves to that same inode right
+        // now: fstat the descriptor, fstatat the name, then prove the
+        // opened directory is the fresh one by requiring it to be empty -
+        // a substitute carrying planted entries cannot claim the inode a
+        // just-created directory would have had.
+        let mut opened: libc::stat = unsafe { std::mem::zeroed() };
+        let mut named: libc::stat = unsafe { std::mem::zeroed() };
+        let pinned = unsafe {
+            libc::fstat(dir, &mut opened) == 0
+                && libc::fstatat(self.fd.as_raw_fd(), cname.as_ptr(), &mut named, 0) == 0
+                && opened.st_dev == named.st_dev
+                && opened.st_ino == named.st_ino
+        };
+        anyhow::ensure!(
+            pinned && leaf_is_empty(dir),
+            "the pinned scratch leaf was replaced during creation - refusing"
+        );
         Ok(PinnedLeaf {
             dir: unsafe { std::fs::File::from_raw_fd(dir) },
             root: self
@@ -174,6 +193,7 @@ impl ScratchRoot {
                 .try_clone()
                 .context("cannot pin the scratch root twice")?,
             name: leaf.to_os_string(),
+            ident: (opened.st_dev, opened.st_ino),
         })
     }
 
@@ -201,6 +221,16 @@ impl ScratchRoot {
         );
         Ok(())
     }
+
+    /// Tests arrange relocations by path (renames of roots and leaves);
+    /// production unix code has no accessor at all, and even this test
+    /// spelling re-judges the pin before answering. `cfg(test)` keeps the
+    /// spelling out of shipped binaries.
+    #[cfg(all(unix, test))]
+    pub(crate) fn path(&self) -> Result<&Path> {
+        self.reassert()?;
+        Ok(&self.path)
+    }
 }
 
 /// A leaf directory inside the pinned scratch root, pinned itself by
@@ -218,6 +248,40 @@ pub(crate) struct PinnedLeaf {
     root: std::fs::File,
     /// The leaf's single-component name under the root.
     name: std::ffi::OsString,
+    /// (dev, ino) of the directory the pin was proven to hold at create:
+    /// later name re-lookups and removal compare against it rather than
+    /// trusting that `name` still resolves to this descriptor's inode.
+    ident: (libc::dev_t, libc::ino_t),
+}
+
+/// Whether an opened directory descriptor lists nothing but `.`/`..`:
+/// a directory `mkdirat` just made is empty, so a replanted stand-in
+/// carrying entries cannot claim to be the freshly created leaf.
+#[cfg(unix)]
+fn leaf_is_empty(dir: std::os::fd::RawFd) -> bool {
+    let dup = unsafe { libc::fcntl(dir, libc::F_DUPFD_CLOEXEC, 0) };
+    if dup < 0 {
+        return false;
+    }
+    let stream = unsafe { libc::fdopendir(dup) };
+    if stream.is_null() {
+        unsafe { libc::close(dup) };
+        return false;
+    }
+    let mut empty = true;
+    loop {
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            empty = false;
+            break;
+        }
+    }
+    unsafe { libc::closedir(stream) };
+    empty
 }
 
 #[cfg(unix)]
@@ -268,18 +332,43 @@ impl PinnedLeaf {
             }
         }
     }
+
+    /// Whether `name` under the pinned root still resolves to the inode
+    /// this leaf was proven to hold at creation. A same-user rename or
+    /// replant after open shows up as a mismatch and fails the use.
+    #[cfg(unix)]
+    pub fn reassert(&self) -> Result<()> {
+        use std::os::fd::AsRawFd as _;
+        let cname = std::ffi::CString::new(self.name.as_encoded_bytes())
+            .context("leaf name is not encodable")?;
+        let mut named: libc::stat = unsafe { std::mem::zeroed() };
+        anyhow::ensure!(
+            unsafe { libc::fstatat(self.root.as_raw_fd(), cname.as_ptr(), &mut named, 0) } == 0
+                && (named.st_dev, named.st_ino) == self.ident,
+            "the pinned scratch leaf moved after the boundary check - refusing"
+        );
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
 impl Drop for PinnedLeaf {
-    /// The leaf's own name is removed relative to the pinned root: the
-    /// rmdir can only take out the directory this run created, never a
-    /// same-named directory a replanted path could stand in for.
+    /// The leaf's own name is removed relative to the pinned root, and only
+    /// while the name still resolves to the inode this run created and
+    /// proved at open: a replanted name now naming a substitute is left
+    /// alone rather than rmdir'd from under a stand-in.
     fn drop(&mut self) {
         use std::os::fd::AsRawFd as _;
         if let Ok(cname) = std::ffi::CString::new(self.name.as_encoded_bytes()) {
-            unsafe {
-                libc::unlinkat(self.root.as_raw_fd(), cname.as_ptr(), libc::AT_REMOVEDIR);
+            let mut named: libc::stat = unsafe { std::mem::zeroed() };
+            let ours = unsafe {
+                libc::fstatat(self.root.as_raw_fd(), cname.as_ptr(), &mut named, 0) == 0
+                    && (named.st_dev, named.st_ino) == self.ident
+            };
+            if ours {
+                unsafe {
+                    libc::unlinkat(self.root.as_raw_fd(), cname.as_ptr(), libc::AT_REMOVEDIR);
+                }
             }
         }
     }
@@ -568,9 +657,12 @@ impl TempSecret {
 
     /// Tests still inspect the recorded path directly (uniqueness,
     /// privacy bits); production consumers on unix get no accessor at
-    /// all. `cfg(test)` keeps the spelling out of shipped binaries.
+    /// all - even the test spelling is gated by the same mid-operation
+    /// reassert production checkpoints use. `cfg(test)` keeps the
+    /// spelling out of shipped binaries.
     #[cfg(all(unix, test))]
     pub(crate) fn path(&self) -> Result<&Path> {
+        self.reassert()?;
         Ok(&self.path)
     }
 
@@ -782,5 +874,71 @@ mod tests {
         leaf.unlink(std::ffi::OsStr::new("kept"));
         drop(leaf);
         assert!(!root_path.join(&tag).exists());
+    }
+
+    /// The rename/replant race the pin exists for: the leaf's name is moved
+    /// to a substitute directory between "open" and "accept". `reassert`
+    /// must refuse (the name no longer resolves to the pinned inode), the
+    /// leaf's own descriptor still serves the REAL directory's contents,
+    /// and drop must leave the stand-in's contents untouched - removal is
+    /// conditional on the recorded inode, not on the name.
+    #[test]
+    fn a_renamed_and_replanted_leaf_is_refused_and_never_removed() {
+        let root = private_temp_root().unwrap();
+        let root_path = crate::fd_canonical_path(&root.fd).unwrap();
+        let pid = std::process::id();
+        let tag = format!("leaf-{pid}-{:04x}", rand::random::<u16>());
+        let moved = format!("{tag}-moved");
+        let leaf = root.mkdir_leaf(std::ffi::OsStr::new(&tag), 0o700).unwrap();
+        std::fs::write(root_path.join(&tag).join("k"), b"secret").unwrap();
+
+        // Rename the real leaf away, then plant a different directory under
+        // its name - the shape a same-UID replant takes.
+        std::fs::rename(root_path.join(&tag), root_path.join(&moved)).unwrap();
+        std::fs::create_dir(root_path.join(&tag)).unwrap();
+        std::fs::write(root_path.join(&tag).join("stand-in"), b"x").unwrap();
+
+        assert!(
+            leaf.reassert().is_err(),
+            "a leaf whose name was replanted must fail closed"
+        );
+        // The pinned descriptor is unaffected: it still reads the original
+        // inode, wherever the name now points.
+        assert_eq!(leaf.read(std::ffi::OsStr::new("k")).unwrap(), b"secret");
+
+        drop(leaf);
+        // Conditional removal: the substitute keeps its contents and name.
+        assert_eq!(
+            std::fs::read(root_path.join(&tag).join("stand-in")).unwrap(),
+            b"x",
+            "cleanup must never remove a replanted stand-in's contents"
+        );
+        // But the renamed REAL leaf is gone only by its own path - nothing
+        // descriptor-relative could have removed it under a foreign name.
+        assert!(root_path.join(&moved).exists());
+        let _ = std::fs::remove_dir_all(root_path.join(&tag));
+        let _ = std::fs::remove_dir_all(root_path.join(&moved));
+    }
+
+    /// The scratch root moving mid-operation is the relocation the
+    /// post-keygen acceptance check exists to catch: `reassert` compares
+    /// the pinned descriptor's live path with the validated one and fails
+    /// closed when they diverge.
+    #[test]
+    fn a_relocated_scratch_root_fails_the_post_operation_reassert() {
+        let home = std::env::temp_dir().join(format!(
+            "gv-scratch-move-{}-{:04x}",
+            std::process::id(),
+            rand::random::<u16>()
+        ));
+        let root = scratch_root(&home, &home).unwrap();
+        let judged = crate::fd_canonical_path(&root.fd).unwrap();
+        let moved = home.join(".local/state/gitvault/tmp-moved");
+        std::fs::rename(&judged, &moved).unwrap();
+        assert!(
+            root.reassert().is_err(),
+            "a relocated scratch root must refuse the acceptance check"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

@@ -3373,15 +3373,35 @@ fn publication_surface(method: &str, path: &str) -> Option<String> {
             "dispatches" | "actions" | "forks" | "generate" | "import" | "migrations" | "transfer"
             | "branches" | "pages" | "keys" | "hooks" | "deployments",
         ) => true,
+        // CI check, ruleset and environment-secret controls: a created
+        // check run or suite spends CI authority on a chosen ref exactly
+        // like a dispatch; a ruleset write rewrites ref protection; an
+        // environment write rewrites secrets, variables and protection
+        // gates. None passes through an audited push - every mutating
+        // verb refuses, named so the deny survives future edits of the
+        // allowlist below.
+        Some("check-runs" | "check-suites" | "rulesets" | "rules" | "environments") => true,
         // The repository root itself: only mutating verbs reach this arm,
         // and they are the widest publication surface of all - PATCH flips
         // `visibility` to public (exposing every private byte without an
         // audited push), renames or archives the home, DELETE removes it.
         // A read of repo metadata was returned open above.
         None => true,
-        // Writes the table did not name (metadata edits, comments,
-        // labels) publish no code - they stay open to the broker.
-        Some(_) => false,
+        // The verified metadata allowlist: these writes publish no code,
+        // move no trust or credential, spend no CI authority and expose
+        // no secret - issues and their labels and assignees, milestones,
+        // issue/commit comments, topics and classic project boards.
+        Some(
+            "issues" | "labels" | "milestones" | "comments" | "commit_comments" | "assignees"
+            | "topics" | "projects",
+        ) => false,
+        // Every other mutating repository route fails closed: an
+        // unmodelled surface refuses rather than inheriting write
+        // authorization - collaborators, invitations, installations,
+        // security-advisory workspaces, tag protection and whatever
+        // GitHub adds next all land here until a reviewer proves them
+        // metadata-only and names them above.
+        Some(_) => true,
     };
     hit.then(|| format!("{verb} /{route}"))
 }
@@ -4270,37 +4290,114 @@ const MAX_ASSET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
 const MAX_MEMORY_STAGING_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// In-memory staged images are served through anonymous pipes by a small
-/// bounded worker pool, not one writer per open and not a single FIFO:
-/// a reader that stalls mid-image (a consumer killed mid-audit) can hold
-/// one worker at most, and the remaining workers keep later assets
-/// moving. A reader that ends early gives EPIPE and frees its worker.
+/// In-memory staged images are served through anonymous pipes by a single
+/// multiplexed writer: every pipe's write end is `O_NONBLOCK` and a `poll`
+/// loop feeds whichever reader has room. A reader that stalls mid-image -
+/// a consumer killed mid-audit - parks only its own slot: the writer never
+/// blocks on any single pipe, so any number of stalled readers cannot
+/// starve the next consumer, and a reader that ends early reports
+/// `EPIPE`/`POLLERR` and frees its slot.
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
 fn bytes_writer() -> &'static std::sync::mpsc::Sender<(std::sync::Arc<Vec<u8>>, i32)> {
-    use std::io::Write as _;
-    use std::os::fd::FromRawFd as _;
     static WRITER: std::sync::OnceLock<std::sync::mpsc::Sender<(std::sync::Arc<Vec<u8>>, i32)>> =
         std::sync::OnceLock::new();
     WRITER.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::channel::<(std::sync::Arc<Vec<u8>>, i32)>();
-        let shared = std::sync::Arc::new(std::sync::Mutex::new(rx));
-        // Bounded concurrency: four stalled readers can never starve the
-        // fifth open, and the pool stays small however many assets stage.
-        for _ in 0..4 {
-            let shared = shared.clone();
-            std::thread::spawn(move || {
+        std::thread::spawn(move || {
+            use std::os::fd::{AsRawFd as _, FromRawFd as _};
+            struct Job {
+                image: std::sync::Arc<Vec<u8>>,
+                file: std::fs::File,
+                offset: usize,
+            }
+            fn take(item: (std::sync::Arc<Vec<u8>>, i32)) -> Job {
+                let (image, fd) = item;
+                unsafe {
+                    libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+                }
+                Job {
+                    image,
+                    file: unsafe { std::fs::File::from_raw_fd(fd) },
+                    offset: 0,
+                }
+            }
+            let mut jobs: Vec<Job> = Vec::new();
+            loop {
+                // Admit every queued job before polling: a stalled pipe parks
+                // its own slot and never delays the admission of new work.
                 loop {
-                    let item = shared.lock().expect("staged-image queue poisoned").recv();
-                    match item {
-                        Ok((image, fd)) => {
-                            let mut writer = unsafe { std::fs::File::from_raw_fd(fd) };
-                            let _ = writer.write_all(&image);
-                        }
-                        Err(_) => return,
+                    match rx.try_recv() {
+                        Ok(item) => jobs.push(take(item)),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
                     }
                 }
-            });
-        }
+                if jobs.is_empty() {
+                    match rx.recv() {
+                        Ok(item) => jobs.push(take(item)),
+                        Err(_) => return,
+                    }
+                    continue;
+                }
+                let mut polled: Vec<libc::pollfd> = jobs
+                    .iter()
+                    .map(|job| libc::pollfd {
+                        fd: job.file.as_raw_fd(),
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    })
+                    .collect();
+                // The poll quantum bounds how long a newly queued job waits
+                // for its first write cycle - it is no reader's deadline.
+                if unsafe { libc::poll(polled.as_mut_ptr(), polled.len() as libc::nfds_t, 100) } < 0
+                {
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return;
+                }
+                let mut keep = vec![true; jobs.len()];
+                for (i, job) in jobs.iter_mut().enumerate() {
+                    let re = polled[i].revents;
+                    if re & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                        keep[i] = false;
+                        continue;
+                    }
+                    if re & libc::POLLOUT == 0 {
+                        continue;
+                    }
+                    while job.offset < job.image.len() {
+                        let written = unsafe {
+                            libc::write(
+                                job.file.as_raw_fd(),
+                                job.image[job.offset..].as_ptr().cast(),
+                                (job.image.len() - job.offset).min(64 * 1024),
+                            )
+                        };
+                        if written > 0 {
+                            job.offset += written as usize;
+                        } else if written < 0
+                            && std::io::Error::last_os_error().kind()
+                                == std::io::ErrorKind::WouldBlock
+                        {
+                            break;
+                        } else {
+                            keep[i] = false;
+                            break;
+                        }
+                    }
+                    if job.offset >= job.image.len() {
+                        keep[i] = false;
+                    }
+                }
+                let mut i = 0;
+                jobs.retain(|_| {
+                    let alive = keep[i];
+                    i += 1;
+                    alive
+                });
+            }
+        });
         tx
     })
 }
@@ -5847,6 +5944,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Readers that never drain their pipes park only their own slots: the
+    /// multiplexed writer keeps feeding any later consumer to completion.
+    /// (Only platforms whose staged image lives in memory serve pipes;
+    /// sealed memfds duplicate descriptors and never stall a sibling.)
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    #[test]
+    fn stalled_asset_readers_cannot_starve_a_later_consumer() {
+        let root = scratch("release-asset-stall");
+        let file = root.join("app-v1.0.zip");
+        // Larger than any platform's pipe buffer, so an undrained reader
+        // guarantees a mid-image stall rather than a quick full write.
+        let payload: Vec<u8> = (0..1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&file, &payload).unwrap();
+        let staged = check_release_assets(&cfg(), std::slice::from_ref(&file), &root).unwrap();
+        let stalled: Vec<std::fs::File> = (0..4)
+            .map(|_| staged.assets[0].open_bytes().unwrap())
+            .collect();
+        let mut fifth = staged.assets[0].open_bytes().unwrap();
+        // Each poll waits on kernel readiness inside a bounded assertion:
+        // a starved pipe would fail here instead of hanging the suite.
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd as _;
+        let mut got = Vec::with_capacity(payload.len());
+        let mut buf = [0u8; 8192];
+        while got.len() < payload.len() {
+            let mut pfd = libc::pollfd {
+                fd: fifth.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(
+                unsafe { libc::poll(&mut pfd, 1, 15_000) },
+                1,
+                "stalled sibling readers must not starve a later consumer"
+            );
+            let read = fifth.read(&mut buf).unwrap();
+            assert!(read > 0, "the staged pipe closed before the image drained");
+            got.extend_from_slice(&buf[..read]);
+        }
+        assert_eq!(got, payload);
+        drop(stalled);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Relocating the staging root mid-flight loses nothing and gains the
     /// attacker nothing: the snapshots are anonymous inodes addressed only
     /// by their open descriptors, so the rename moves an empty directory
@@ -6148,6 +6289,34 @@ mod tests {
             ("POST", "/repos/o/r/keys"),
             ("POST", "/repos/o/r/hooks"),
             ("POST", "/repos/o/r/deployments"),
+            // CI check, ruleset and environment-secret controls: a check
+            // run spends CI authority, a ruleset rewrites ref protection,
+            // an environment write rewrites secrets - all named refuses.
+            ("POST", "/repos/o/r/check-runs"),
+            ("POST", "/repos/o/r/check-suites"),
+            ("PATCH", "/repos/o/r/check-runs/9"),
+            ("POST", "/repos/o/r/rulesets"),
+            ("PUT", "/repos/o/r/rulesets/5"),
+            ("DELETE", "/repos/o/r/rules/branch/main"),
+            ("PUT", "/repos/o/r/environments/prod"),
+            ("PUT", "/repos/o/r/environments/prod/secrets/K"),
+            // The repository root's mutating verbs are the widest surface:
+            // visibility flips, renames, archives and deletion.
+            ("PATCH", "/repos/o/r"),
+            ("DELETE", "/repos/o/r"),
+            ("PUT", "/repos/o/r"),
+            // Trust-moving surfaces fail closed without being named:
+            // collaborators, invitations, app installation, advisory
+            // workspaces and tag protection all land on the deny default.
+            ("PUT", "/repos/o/r/collaborators/bob"),
+            ("POST", "/repos/o/r/security-advisories"),
+            ("POST", "/repos/o/r/tags/protection"),
+            ("PUT", "/repos/o/r/installation"),
+            ("POST", "/repos/o/r/invitations/3"),
+            ("PUT", "/repos/o/r/automated-security-fixes"),
+            ("PUT", "/repos/o/r/vulnerability-alerts"),
+            // An unmodelled surface GitHub adds tomorrow fails closed too.
+            ("POST", "/repos/o/r/whatever-comes-next"),
             // Repo and migration creation outside repos/* publishes new
             // homes without the gate ever seeing a push.
             ("POST", "/user/repos"),
@@ -6169,9 +6338,21 @@ mod tests {
             ("POST", "/repos/o/r/issues/%31"), // encoded digit, not a surface
             ("PATCH", "/repos/o/r/pulls/7"),   // metadata edit, not publication
             ("POST", "/repos/o/r/labels"),
+            // The rest of the verified metadata allowlist: milestones,
+            // commit comments, assignees, topics and classic project
+            // boards publish no code and move no trust or CI authority.
+            ("POST", "/repos/o/r/milestones"),
+            ("PATCH", "/repos/o/r/issues/9"),
+            ("PUT", "/repos/o/r/topics"),
+            ("POST", "/repos/o/r/issues/9/assignees"),
+            ("POST", "/repos/o/r/projects"),
+            ("PATCH", "/repos/o/r/comments/4"),
+            ("POST", "/repos/o/r/commit_comments"),
             ("POST", "/repos/o/r/pulls/7/merge-ish"), // not the merge endpoint
             ("GET", "/repos/o/r/actions/runs"),       // an Actions read stays open
             ("GET", "/repos/o/r/actions/runs/42/logs"), // logs are metadata reads
+            ("GET", "/repos/o/r/check-runs"),         // checks read fine
+            ("GET", "/repos/o/r/environments/prod/secrets/K"), // so do secrets' names
             // Query parameters on a non-surface write stay open.
             ("POST", "/repos/o/r/issues?milestone=1"),
         ] {
