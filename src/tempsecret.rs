@@ -677,10 +677,19 @@ impl TempSecret {
     /// again and must still name the directory the boundary check judged.
     /// On unix there is no path accessor at all: every consumer is bound
     /// by descriptor (fd_share / fchdir-bound cwd), so a rename or
-    /// reparent has nothing left to redirect. Non-unix consumers still
-    /// resolve the recorded path.
+    /// reparent has nothing left to redirect. Non-unix has no descriptor
+    /// pin, so the best available check runs at every use: the recorded
+    /// path must still canonically resolve to itself before a consumer
+    /// opens it - a relocated or reparented secret refuses there instead
+    /// of lending a stale spelling to a check-then-open.
     #[cfg(not(unix))]
     pub fn path(&self) -> Result<&Path> {
+        let live = std::fs::canonicalize(&self.path)
+            .context("the secret's path no longer resolves - refusing")?;
+        anyhow::ensure!(
+            live == self.path,
+            "the secret's path moved after the boundary check - refusing"
+        );
         Ok(&self.path)
     }
 
@@ -911,6 +920,7 @@ mod tests {
     /// leaf's own descriptor still serves the REAL directory's contents,
     /// and drop must leave the stand-in's contents untouched - removal is
     /// conditional on the recorded inode, not on the name.
+    #[cfg(unix)]
     #[test]
     fn a_renamed_and_replanted_leaf_is_refused_and_never_removed() {
         let root = private_temp_root().unwrap();
@@ -955,6 +965,7 @@ mod tests {
     /// accept an out-of-root directory; the no-follow identity check must
     /// see the LINK's own inode and refuse, and cleanup must neither
     /// follow the link nor remove its target.
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_leaf_name_is_never_the_leaf() {
         let root = private_temp_root().unwrap();
@@ -999,6 +1010,7 @@ mod tests {
     /// post-keygen acceptance check exists to catch: `reassert` compares
     /// the pinned descriptor's live path with the validated one and fails
     /// closed when they diverge.
+    #[cfg(unix)]
     #[test]
     fn a_relocated_scratch_root_fails_the_post_operation_reassert() {
         let home = std::env::temp_dir().join(format!(

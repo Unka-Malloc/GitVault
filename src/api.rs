@@ -180,6 +180,28 @@ pub enum Target {
     Identity(String),
 }
 
+/// Whether a request's mutating method may spend vault credentials. Every
+/// repository mutation emits events (`issues`, `label`, `pull_request`,
+/// `repository`...) that can trigger privileged Actions workflows, so a
+/// write is never "safe metadata": the broker applies one shared policy
+/// at the credential moment and every user-facing request path inherits
+/// it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mutation {
+    /// The default for reads AND for any write a command forgot to mark:
+    /// a mutating method here refuses before a credential is spent.
+    #[default]
+    Read,
+    /// The operation ran its publication audit before this request was
+    /// minted (push, pr create/merge, release create and its uploads).
+    Audited,
+    /// A narrowly justified removal of unaudited server-side state:
+    /// deleting a draft release that never published, or closing a pull
+    /// request whose head moved past the audited commit. The operation
+    /// shrinks the unaudited surface instead of adding to it.
+    Containment,
+}
+
 pub struct Request {
     pub method: String,
     pub path: String,
@@ -200,6 +222,9 @@ pub struct Request {
     /// unauthenticated request restricted to the download-host allowlist.
     /// The account token exists only inside the first request's pipe.
     pub follow: bool,
+    /// The shared mutation policy marker - see `Mutation`. Commands mint
+    /// `Audited`/`Containment` only after their gate has passed.
+    pub mutation: Mutation,
     pub jq: Option<String>,
     pub silent: bool,
 }
@@ -216,7 +241,24 @@ pub struct Request {
 /// table without its signature so the audit can run first; that must not let an
 /// unsigned or tampered table spend the vault on a metadata read before the
 /// gate refuses.
-fn authorize(cfg: &Config, target: &Target, vault: &Vault) -> Result<String> {
+fn authorize(cfg: &Config, req: &Request, vault: &Vault) -> Result<String> {
+    // One shared mutation policy at the credential moment. A read spends a
+    // token on a read; a mutating method spends it on a change the local
+    // audit never saw, unless the command marked the request after its gate
+    // (`Audited`) or the action only removes unaudited server-side state
+    // (`Containment`). Comments, labels, state flips and every other
+    // event-emitting write - through `api` or through `issue`/`pr`
+    // subcommands - refuse here rather than spending the vault.
+    anyhow::ensure!(
+        matches!(
+            req.method.to_ascii_uppercase().as_str(),
+            "GET" | "HEAD" | "OPTIONS"
+        ) || !matches!(req.mutation, Mutation::Read),
+        "{} {} mutates outside an audited command - refusing to spend vault credentials",
+        req.method,
+        req.path
+    );
+    let target = &req.target;
     if let Some(path) = cfg.path.as_deref() {
         // The signature is checked against the bytes this `Config` was parsed
         // from, not a fresh read of the path: a file swapped between the gate
@@ -603,7 +645,7 @@ fn perform(
     // host the caller chose. Relative paths always resolve under API_ROOT.
     let mut url = request_url(&req.path)?;
 
-    let token = authorize(cfg, &req.target, vault)?;
+    let token = authorize(cfg, req, vault)?;
 
     // A streamed body is piped into curl: the read end becomes its
     // `--data-binary` source, the write end is where we feed and hash the

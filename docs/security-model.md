@@ -251,9 +251,14 @@ selected ref, so the whole subtree is closed to writes while reads such as
 percent-decoded and matched on the route the server will see; an encoded
 separator, an encoded route name, or a percent escape that survives one decode
 refuses anywhere in the path, including owner/repo. A token
-is issued only after the routing signature verifies. Reads and
-metadata writes (issues, comments, labels) still pass as credential-broker
-operations.
+is issued only after the routing signature verifies. Generic API access is
+read-only: every mutating method refuses at the credential moment, because
+any repository write - comments, labels, state flips included - emits
+events that can trigger privileged workflows outside the audited path. The
+only mutating requests the broker honors are marked by commands whose own
+audit already ran (`pr create/merge`, `release create`) or by narrowly
+justified removals of unaudited server-side state (draft-release and
+moved-head pull-request cleanup).
 
 ## Concurrent audits
 

@@ -3235,6 +3235,7 @@ fn cmd_api(
         body,
         body_stream: None,
         follow,
+        mutation: api::Mutation::Read,
         jq,
         silent,
     };
@@ -3250,11 +3251,14 @@ fn cmd_api(
     }
 }
 
-/// The write surfaces that publish repository content or move refs. Matching
-/// is on the API path after the `/repos/{owner}/{repo}` prefix: anything that
-/// lands content (file writes, git objects, merges, release artifacts) or moves
-/// refs belongs to the audited commands. Reads and non-publication writes
-/// (issues, comments, labels, PR metadata) stay open.
+/// The generic `api` broker's verdict: every mutating method refuses and
+/// only reads stay open. No repository write is verified-safe metadata -
+/// issues, labels, comments, state flips and the rest all emit events that
+/// can trigger privileged Actions workflows, which is CI authority spent
+/// outside the audited path. The few mutating operations the product keeps
+/// (the audited commands' POSTs and the narrowly justified removals of
+/// unaudited state) never reach this classifier: they are marked at the
+/// credential moment instead (see `api::Mutation`).
 fn publication_surface(method: &str, path: &str) -> Option<String> {
     if matches!(
         method.to_ascii_uppercase().as_str(),
@@ -3582,6 +3586,7 @@ fn cmd_pr(
         body: None,
         body_stream: None,
         follow: false,
+        mutation: api::Mutation::Read,
         jq,
         silent: false,
     };
@@ -3595,6 +3600,7 @@ fn cmd_pr(
     // post-create verify is the containment, so the residual race is only
     // the span of one request.
     if let Some((expected_head, expected_base)) = expected_head {
+        req.mutation = api::Mutation::Audited;
         req.jq = Some(".html_url, .head.sha, .base.sha, .number".to_string());
         let body = api::run_value(&cfg, &vault, &req)?;
         let mut lines = body.lines();
@@ -3635,6 +3641,9 @@ fn close_pull_request(cfg: &config::Config, vault: &vault::Vault, slug: &str, nu
     request.method = "PATCH".into();
     request.fields.push(("state".into(), "closed".into()));
     request.silent = true;
+    // Containment: the mutation removes a pull request the audit judged
+    // unaudited - it shrinks unaudited server-side state, never adds to it.
+    request.mutation = api::Mutation::Containment;
     match api::run(cfg, vault, &request) {
         Ok(0) => eprintln!(
             "gitvault: closed pull request #{number} because its head moved past the audit"
@@ -3689,6 +3698,7 @@ fn get(path: String, slug: String, jq: Option<String>) -> api::Request {
         body: None,
         body_stream: None,
         follow: false,
+        mutation: api::Mutation::Read,
         jq,
         silent: false,
     }
@@ -3916,6 +3926,7 @@ fn create_remote_tag_ref(
     req.method = "POST".into();
     req.fields.push(("ref".into(), format!("refs/tags/{tag}")));
     req.fields.push(("sha".into(), audited.to_string()));
+    req.mutation = api::Mutation::Audited;
     if let Err(why) = api::run_value(cfg, vault, &req) {
         // The only conflict worth continuing past is an already-existing
         // tag that names the audited commit: whoever won the race still
@@ -3987,6 +3998,10 @@ fn cmd_release(
             .ok_or_else(|| anyhow::anyhow!("the release audit has no commit"))?;
         let (policy, _policy_path, policy_sig) = config::Policy::load_state(&cfg_path, &cfg)?;
         run_publication_gate(&cfg, &cfg_sig, &policy, &policy_sig, &ctx, "release")?;
+        // The gate passed on whatever the scan saw - now prove it saw the
+        // whole staged image: a pipe-fed share that stopped short would
+        // have blessed bytes the upload later sends unaudited.
+        staged.verify_delivered()?;
         release_audit = Some(ReleaseAudit {
             repo_root,
             audited,
@@ -4043,6 +4058,7 @@ fn cmd_release(
             // A new tag is created at the commit the audit reviewed, not at
             // whatever the target repository's default branch happens to be.
             r.fields.push(("target_commitish".into(), audited.clone()));
+            r.mutation = api::Mutation::Audited;
             // Every release is created as a draft: assets upload while it is
             // invisible, the tag is re-verified against the audited commit,
             // and only then is the release published. A failure deletes the
@@ -4085,6 +4101,9 @@ fn cmd_release(
                 None,
             );
             r.method = "DELETE".into();
+            // Containment: the action only removes server-side state -
+            // nothing is published or added by deleting a release.
+            r.mutation = api::Mutation::Containment;
             r
         }
     };
@@ -4150,13 +4169,25 @@ impl ReleaseAsset {
     /// descriptor, never a path a same-user process could swap.
     #[cfg(unix)]
     fn open_bytes(&self) -> anyhow::Result<std::fs::File> {
+        self.open_image().map(|(file, _)| file)
+    }
+
+    /// A reader plus, on in-memory images, the delivery receipt proving the
+    /// writer pushed every staged byte into the pipe: the audit side can
+    /// tell a truncated stream (receipt reports `false`) from a complete
+    /// one, where a bare EOF could not. `None` on kernel-bound images -
+    /// a duplicated descriptor carries no delivery question.
+    #[cfg(unix)]
+    fn open_image(
+        &self,
+    ) -> anyhow::Result<(std::fs::File, Option<std::sync::mpsc::Receiver<bool>>)> {
         match &self.image {
             #[cfg(any(target_os = "linux", target_os = "android"))]
             AssetImage::File(file) => {
                 use std::io::Seek as _;
                 let mut clone = file.try_clone().context("cannot clone the staged image")?;
                 clone.rewind()?;
-                Ok(clone)
+                Ok((clone, None))
             }
             #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
             AssetImage::Bytes(bytes) => {
@@ -4172,10 +4203,14 @@ impl ReleaseAsset {
                         libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
                     }
                 }
+                let (ack, delivered) = std::sync::mpsc::channel();
                 bytes_writer()
-                    .send((bytes.clone(), pipes[1]))
+                    .send((bytes.clone(), pipes[1], ack))
                     .map_err(|_| anyhow::anyhow!("the staged-image writer is gone"))?;
-                Ok(unsafe { std::fs::File::from_raw_fd(pipes[0]) })
+                Ok((
+                    unsafe { std::fs::File::from_raw_fd(pipes[0]) },
+                    Some(delivered),
+                ))
             }
         }
     }
@@ -4218,30 +4253,46 @@ const MAX_MEMORY_STAGING_BYTES: u64 = 1024 * 1024 * 1024;
 /// starve the next consumer, and a reader that ends early reports
 /// `EPIPE`/`POLLERR` and frees its slot.
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-fn bytes_writer() -> &'static std::sync::mpsc::Sender<(std::sync::Arc<Vec<u8>>, i32)> {
-    static WRITER: std::sync::OnceLock<std::sync::mpsc::Sender<(std::sync::Arc<Vec<u8>>, i32)>> =
+type ImageJob = (std::sync::Arc<Vec<u8>>, i32, std::sync::mpsc::Sender<bool>);
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+fn bytes_writer() -> &'static std::sync::mpsc::Sender<ImageJob> {
+    static WRITER: std::sync::OnceLock<std::sync::mpsc::Sender<ImageJob>> =
         std::sync::OnceLock::new();
     WRITER.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<(std::sync::Arc<Vec<u8>>, i32)>();
+        let (tx, rx) = std::sync::mpsc::channel::<ImageJob>();
         std::thread::spawn(move || {
             use std::os::fd::{AsRawFd as _, FromRawFd as _};
+            /// `ack` reports exactly once when the job leaves the queue:
+            /// `true` only if every staged byte reached the pipe - a
+            /// short, failed or abandoned stream reports `false`, so the
+            /// audit side can tell a truncated image from a complete one.
             struct Job {
                 image: std::sync::Arc<Vec<u8>>,
                 file: std::fs::File,
                 offset: usize,
+                ack: std::sync::mpsc::Sender<bool>,
+            }
+            impl Drop for Job {
+                fn drop(&mut self) {
+                    let _ = self.ack.send(self.offset >= self.image.len());
+                }
             }
             /// `None` on a failed `F_SETFL`: a pipe that could not be made
             /// nonblocking is never queued - a blocking write to a stalled
             /// reader would stop this one worker. Closing the write end
             /// instead gives the consumer an immediate EOF, fail-closed.
-            fn take(item: (std::sync::Arc<Vec<u8>>, i32)) -> Option<Job> {
-                let (image, fd) = item;
+            /// (The untouched `ack` then drops unanswered, which the audit
+            /// side also reads as not-delivered.)
+            fn take(item: ImageJob) -> Option<Job> {
+                let (image, fd, ack) = item;
                 loop {
                     if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } == 0 {
                         return Some(Job {
                             image,
                             file: unsafe { std::fs::File::from_raw_fd(fd) },
                             offset: 0,
+                            ack,
                         });
                     }
                     if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
@@ -4364,6 +4415,10 @@ struct StagedAssets {
     /// Descriptor numbers reserved for the audit child's inheritance; closed
     /// when the staged set drops.
     shared: Vec<i32>,
+    /// One delivery receipt per audit share on in-memory images: the pipe
+    /// writer reports `true` only when every staged byte reached the pipe.
+    /// Empty on kernel-bound images and before sharing.
+    delivery: Vec<std::sync::mpsc::Receiver<bool>>,
 }
 
 impl Drop for StagedAssets {
@@ -4404,16 +4459,45 @@ impl StagedAssets {
         for (index, asset) in self.assets.iter_mut().enumerate() {
             // The share is a fresh reader positioned at the first byte -
             // a dup'd description of the sealed inode, or the read end of
-            // the pipe an image writer feeds.
-            let reader = asset.open_bytes()?;
+            // the pipe an image writer feeds. In-memory images also hand
+            // back the delivery receipt: a truncated or failed stream must
+            // read differently from a complete one after the gate.
+            let (reader, delivered) = asset.open_image()?;
             let fd = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 100 + index) };
             anyhow::ensure!(
                 fd >= 0,
                 "cannot share the staged asset '{}' with the audit",
                 asset.name
             );
+            if let Some(delivered) = delivered {
+                self.delivery.push(delivered);
+            }
             self.shared.push(fd);
             asset.audit_ref = Some(format!("/dev/fd/{fd}"));
+        }
+        Ok(())
+    }
+
+    /// Called once the audit child has finished: every pipe-fed share must
+    /// have delivered its whole staged image, or the scan may have judged
+    /// a truncated stream while the upload later serves the full asset -
+    /// a silent EOF cannot distinguish those. The parent's inherited-fd
+    /// copies are spent too: closing them leaves the child's end the only
+    /// reader, so a still-parked writer reports failure promptly instead
+    /// of waiting on a reader that will never come.
+    #[cfg(unix)]
+    fn verify_delivered(&mut self) -> anyhow::Result<()> {
+        for fd in self.shared.drain(..) {
+            unsafe {
+                libc::close(fd);
+            }
+        }
+        for delivered in self.delivery.drain(..) {
+            anyhow::ensure!(
+                delivered.recv().unwrap_or(false),
+                "an audited asset stream ended before its bytes were fully \
+                 delivered - the gate may have read a truncated image; refusing"
+            );
         }
         Ok(())
     }
@@ -4427,6 +4511,11 @@ impl StagedAssets {
             return Ok(());
         }
         anyhow::bail!("release assets need descriptor-bound staging, which this platform lacks")
+    }
+
+    #[cfg(not(unix))]
+    fn verify_delivered(&mut self) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 
@@ -4689,6 +4778,7 @@ fn stage_release_assets(
             root: PathBuf::new(),
             assets: Vec::new(),
             shared: Vec::new(),
+            delivery: Vec::new(),
         });
     }
     // Every asset is snapshotted into a private copy before the audit and
@@ -4840,6 +4930,7 @@ fn stage_release_assets(
         root: root_canonical,
         assets: Vec::with_capacity(paths.len()),
         shared: Vec::with_capacity(paths.len()),
+        delivery: Vec::new(),
     };
     let mut staged_bytes = 0u64;
     for (index, prepared) in prepared.into_iter().enumerate() {
@@ -5053,6 +5144,7 @@ fn create_release_staged(
                 Some(".browser_download_url".into()),
             );
             up.method = "POST".into();
+            up.mutation = api::Mutation::Audited;
             up.headers
                 .push("Content-Type: application/octet-stream".into());
             up.headers.push(format!("Content-Length: {}", asset.size));
@@ -5112,6 +5204,7 @@ fn create_release_staged(
         Some(".html_url".into()),
     );
     publish.method = "PATCH".into();
+    publish.mutation = api::Mutation::Audited;
     publish
         .raw_fields
         .push(("draft".into(), "false".to_string()));
@@ -5128,6 +5221,7 @@ fn delete_release_quietly(cfg: &config::Config, vault: &vault::Vault, slug: &str
     );
     delete.method = "DELETE".into();
     delete.silent = true;
+    delete.mutation = api::Mutation::Containment;
     if let Err(why) = api::run(cfg, vault, &delete) {
         eprintln!(
             "gitvault: warning - the failed draft release {id} could not be deleted: {why:#}"
@@ -5924,6 +6018,55 @@ mod tests {
         }
         assert_eq!(got, payload);
         drop(stalled);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The delivery receipt makes a truncated audit stream refuse: a
+    /// consumer that reads part of the image and closes cannot pass as a
+    /// fully delivered share, where a bare EOF looked identical to a
+    /// complete one. A drained share still verifies.
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    #[test]
+    fn a_truncated_audit_stream_fails_delivery_verification() {
+        let payload: Vec<u8> = (0..512 * 1024u32).map(|i| (i % 251) as u8).collect();
+        // Truncated: the "audit child" reads a few bytes then closes.
+        let root = scratch("release-asset-trunc");
+        let file = root.join("app-v1.0.zip");
+        std::fs::write(&file, &payload).unwrap();
+        let mut staged = check_release_assets(&cfg(), std::slice::from_ref(&file), &root).unwrap();
+        staged.share_with_audit().unwrap();
+        {
+            use std::io::Read as _;
+            let mut partial = std::fs::File::open(format!("/dev/fd/{}", staged.shared[0])).unwrap();
+            let mut buf = [0u8; 4096];
+            partial.read_exact(&mut buf).unwrap();
+        }
+        assert!(
+            staged.verify_delivered().is_err(),
+            "a partially read share must fail delivery verification"
+        );
+        drop(staged);
+        let _ = std::fs::remove_dir_all(&root);
+        // Complete: a fully drained share passes the same check.
+        let root = scratch("release-asset-full");
+        let file = root.join("app-v1.0.zip");
+        std::fs::write(&file, &payload).unwrap();
+        let mut staged = check_release_assets(&cfg(), std::slice::from_ref(&file), &root).unwrap();
+        staged.share_with_audit().unwrap();
+        {
+            use std::io::Read as _;
+            let mut full = std::fs::File::open(format!("/dev/fd/{}", staged.shared[0])).unwrap();
+            let mut drained = Vec::new();
+            full.read_to_end(&mut drained).unwrap();
+            assert_eq!(drained, payload);
+            drop(full);
+        }
+        // verify closes the parent's copies (the "child" is done) and then
+        // collects the receipt the writer reported when it finished.
+        staged
+            .verify_delivered()
+            .expect("a fully drained share must verify");
+        drop(staged);
         let _ = std::fs::remove_dir_all(&root);
     }
 
