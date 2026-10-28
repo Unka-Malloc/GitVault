@@ -1222,7 +1222,8 @@ mod tests {
     /// up to the head) never reach the parser.
     #[test]
     fn a_response_head_is_complete_at_the_blank_line() {
-        let raw = b"HTTP/2 200\r\ncontent-type: application/zip\r\nlocation: https://x.blob.core.windows.net/a\r\n\r\nBODY-BYTES-CONTINUE";
+        // Every complete head ends AT the CRLF blank line.
+        let raw = b"HTTP/2 200\r\ncontent-type: application/zip\r\nlocation: https://x.blob.core.windows.net/a\r\n\r\n";
         let (status, redirect) = parse_response_head(raw).expect("a complete head");
         assert_eq!(status, 200);
         assert_eq!(redirect, "https://x.blob.core.windows.net/a");
@@ -1233,12 +1234,23 @@ mod tests {
         assert_eq!(status, 302);
         assert_eq!(redirect, "https://objects.githubusercontent.com/y?sig=z");
 
-        // An unterminated head is no head at all - refuse instead of
-        // parsing a truncated block.
-        assert!(parse_response_head(b"HTTP/2 200\r\ncontent-type: text/plain\r\n").is_none());
         // Location matching is case-insensitive per HTTP.
         let raw = b"HTTP/1.1 301\r\nLocation: https://github.com/a\r\n\r\n";
         assert_eq!(parse_response_head(raw).unwrap().1, "https://github.com/a");
+    }
+
+    /// Bytes that arrive after the blank line are the body, not the head:
+    /// the parser cuts at the terminator and never reads them - that is
+    /// what lets a still-streaming body not deadlock the hop.
+    #[test]
+    fn a_response_head_ignores_body_bytes_after_the_cut() {
+        let raw = b"HTTP/2 200\r\ncontent-length: 999\r\n\r\nBODY-BYTES-CONTINUE\r\nlocation: https://decoy.example/\r\n";
+        let (status, redirect) = parse_response_head(raw).expect("a complete head");
+        assert_eq!(status, 200);
+        assert_eq!(redirect, "");
+        // An unterminated head is no head at all - refuse instead of
+        // parsing a truncated block.
+        assert!(parse_response_head(b"HTTP/2 200\r\ncontent-type: text/plain\r\n").is_none());
     }
 
     #[test]

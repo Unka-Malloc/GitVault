@@ -130,15 +130,105 @@ pub(crate) struct ScratchRoot {
 }
 
 impl ScratchRoot {
-    /// Bind a child's working directory to the pinned root: `fchdir` in
-    /// the child's `pre_exec` makes this descriptor - not a path spelling -
-    /// the lookup root, so a reparented scratch tree cannot redirect what
-    /// the child creates or opens.
+    /// Create a subdirectory bound to the pinned root AND pinned itself:
+    /// `mkdirat` creates under the judged inode, then the leaf is reopened
+    /// `O_DIRECTORY|O_NOFOLLOW` through the same descriptor - the returned
+    /// `PinnedLeaf` is a descriptor pair (leaf, root) so a rename or
+    /// replant of anything in between can no longer redirect a child's
+    /// writes, a read-back, or the final unlink. A leaf name that is not
+    /// a single plain component refuses before any syscall.
     #[cfg(unix)]
+    pub fn mkdir_leaf(&self, leaf: &std::ffi::OsStr, mode: libc::mode_t) -> Result<PinnedLeaf> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        let leaf_path = Path::new(leaf);
+        anyhow::ensure!(
+            leaf_path.components().count() == 1
+                && leaf_path
+                    .file_name()
+                    .is_some_and(|name| name == leaf && name != ".." && name != "."),
+            "scratch leaf names must be a single component"
+        );
+        let cname = std::ffi::CString::new(leaf.as_encoded_bytes())
+            .context("leaf name is not encodable")?;
+        anyhow::ensure!(
+            unsafe { libc::mkdirat(self.fd.as_raw_fd(), cname.as_ptr(), mode) } == 0,
+            "cannot create the pinned scratch leaf: {}",
+            std::io::Error::last_os_error()
+        );
+        let dir = unsafe {
+            libc::openat(
+                self.fd.as_raw_fd(),
+                cname.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            )
+        };
+        anyhow::ensure!(
+            dir >= 0,
+            "cannot pin the scratch leaf: {}",
+            std::io::Error::last_os_error()
+        );
+        Ok(PinnedLeaf {
+            dir: unsafe { std::fs::File::from_raw_fd(dir) },
+            root: self
+                .fd
+                .try_clone()
+                .context("cannot pin the scratch root twice")?,
+            name: leaf.to_os_string(),
+        })
+    }
+
+    /// On unix no consumer may resolve the root by path at all - children
+    /// bind by descriptor (fchdir, /dev/fd TMPDIR, mkdirat/openat) so a
+    /// rename or reparent has nothing left to redirect. Non-unix callers
+    /// still need the path spelling.
+    #[cfg(not(unix))]
+    pub fn path(&self) -> Result<&Path> {
+        Ok(&self.path)
+    }
+
+    /// Prove the pinned descriptor still names the directory the boundary
+    /// check judged: `fd_canonical_path` answers the inode's live path,
+    /// and a relocation makes it differ from the judged one. A descriptor
+    /// whose path can no longer be established fails closed. Unix-only;
+    /// this is a checkpoint, never a path handed to a consumer.
+    #[cfg(unix)]
+    pub(crate) fn reassert(&self) -> Result<()> {
+        let live = crate::fd_canonical_path(&self.fd)
+            .context("cannot re-establish the scratch root's path - refusing")?;
+        anyhow::ensure!(
+            live == self.path,
+            "the secret scratch root moved after the boundary check - refusing"
+        );
+        Ok(())
+    }
+}
+
+/// A leaf directory inside the pinned scratch root, pinned itself by
+/// descriptor: creation, child working-directory binding, file reads and
+/// the final cleanup all resolve through `dir` (leaf) and `root`
+/// (rmdir of the leaf's name), never through a re-resolved path. Dropping
+/// removes the leaf directory itself from the root - a caller that wants
+/// files gone unlinks them through the leaf descriptor first.
+#[cfg(unix)]
+pub(crate) struct PinnedLeaf {
+    /// O_DIRECTORY descriptor on the leaf itself.
+    dir: std::fs::File,
+    /// A duplicate of the scratch root descriptor, kept for the leaf's
+    /// own removal at drop.
+    root: std::fs::File,
+    /// The leaf's single-component name under the root.
+    name: std::ffi::OsString,
+}
+
+#[cfg(unix)]
+impl PinnedLeaf {
+    /// Bind a child's working directory to the leaf descriptor: the
+    /// relative names the child opens resolve inside this inode, so a
+    /// reparented or replanted leaf cannot redirect where secrets land.
     pub fn fchdir_child(&self, command: &mut std::process::Command) {
         use std::os::fd::AsRawFd as _;
         use std::os::unix::process::CommandExt as _;
-        let fd = self.fd.as_raw_fd();
+        let fd = self.dir.as_raw_fd();
         unsafe {
             command.pre_exec(move || {
                 if libc::fchdir(fd) == -1 {
@@ -149,62 +239,49 @@ impl ScratchRoot {
         }
     }
 
-    /// Create a subdirectory relative to the pinned descriptor itself:
-    /// `mkdirat` binds the create to the inode the boundary check judged,
-    /// so no path component - swapped, moved or replanted - can redirect
-    /// where the key directory lands.
-    #[cfg(unix)]
-    pub fn mkdir_pinned(&self, leaf: &std::ffi::OsStr, mode: libc::mode_t) -> Result<PathBuf> {
-        use std::os::fd::AsRawFd as _;
-        let cname = std::ffi::CString::new(leaf.as_encoded_bytes())
-            .context("leaf name is not encodable")?;
+    /// Read a file inside the leaf through the pinned descriptor -
+    /// `openat` relative to `dir`, never through a path the caller could
+    /// have replanted between creation and use.
+    pub fn read(&self, name: &std::ffi::OsStr) -> Result<Vec<u8>> {
+        use std::io::Read as _;
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        let cname = std::ffi::CString::new(name.as_encoded_bytes())
+            .context("file name is not encodable")?;
+        let fd = unsafe { libc::openat(self.dir.as_raw_fd(), cname.as_ptr(), libc::O_RDONLY) };
         anyhow::ensure!(
-            unsafe { libc::mkdirat(self.fd.as_raw_fd(), cname.as_ptr(), mode) } == 0,
-            "cannot create the pinned scratch leaf: {}",
+            fd >= 0,
+            "cannot read the pinned leaf file: {}",
             std::io::Error::last_os_error()
         );
-        Ok(self.path.join(leaf))
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
     }
 
-    /// Remove a leaf created by `mkdir_pinned` along with the file names
-    /// `keygen` leaves in it - each `unlinkat` resolves inside the pinned
-    /// inode, so a reparented scratch root cannot redirect the delete to
-    /// names outside it.
-    #[cfg(unix)]
-    pub fn remove_leaf_pinned(&self, leaf: &std::ffi::OsStr, files: &[&str]) {
+    /// Remove a file name inside the leaf through its own descriptor.
+    pub fn unlink(&self, name: &std::ffi::OsStr) {
         use std::os::fd::AsRawFd as _;
-        for file in files {
-            let composite = Path::new(leaf).join(file);
-            if let Ok(name) = std::ffi::CString::new(composite.as_os_str().as_encoded_bytes()) {
-                unsafe {
-                    libc::unlinkat(self.fd.as_raw_fd(), name.as_ptr(), 0);
-                }
-            }
-        }
-        if let Ok(name) = std::ffi::CString::new(leaf.as_encoded_bytes()) {
+        if let Ok(cname) = std::ffi::CString::new(name.as_encoded_bytes()) {
             unsafe {
-                libc::unlinkat(self.fd.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR);
+                libc::unlinkat(self.dir.as_raw_fd(), cname.as_ptr(), 0);
             }
         }
     }
+}
 
-    /// The validated root's path - re-verified against the pinned
-    /// descriptor on every call. A relocation after the boundary check
-    /// makes the descriptor's live path differ from the one that was
-    /// judged, and the consumer refuses instead of writing through a
-    /// moved path. A descriptor whose path cannot be re-established fails
-    /// closed.
-    pub fn path(&self) -> Result<&Path> {
-        #[cfg(unix)]
-        {
-            let live = crate::fd_canonical_path(&self.fd)
-                .context("cannot re-establish the scratch root's path - refusing")?;
-            anyhow::ensure!(
-                live == self.path,
-                "the secret scratch root moved after the boundary check - refusing"
-            );
+#[cfg(unix)]
+impl Drop for PinnedLeaf {
+    /// The leaf's own name is removed relative to the pinned root: the
+    /// rmdir can only take out the directory this run created, never a
+    /// same-named directory a replanted path could stand in for.
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd as _;
+        if let Ok(cname) = std::ffi::CString::new(self.name.as_encoded_bytes()) {
+            unsafe {
+                libc::unlinkat(self.root.as_raw_fd(), cname.as_ptr(), libc::AT_REMOVEDIR);
+            }
         }
-        Ok(&self.path)
     }
 }
 
@@ -226,10 +303,17 @@ pub(crate) struct ScratchShare {
 
 impl ScratchShare {
     /// Fail when the pinned directory is no longer where the boundary
-    /// check judged it: `path()` re-resolves the descriptor and refuses
-    /// on any divergence.
+    /// check judged it: the descriptor is re-resolved and any divergence
+    /// refuses.
     pub fn reassert(&self) -> Result<()> {
-        self.root.path().map(|_| ())
+        #[cfg(unix)]
+        {
+            self.root.reassert()
+        }
+        #[cfg(not(unix))]
+        {
+            self.root.path().map(|_| ())
+        }
     }
 }
 
@@ -404,7 +488,8 @@ impl TempSecret {
             #[cfg(unix)]
             name,
         };
-        secret.path()?;
+        #[cfg(unix)]
+        secret.reassert()?;
         Ok(secret)
     }
 
@@ -472,23 +557,36 @@ impl TempSecret {
     /// The secret file's path for consumers that need one - re-validated
     /// on every call: on unix the pinned scratch descriptor is resolved
     /// again and must still name the directory the boundary check judged.
-    /// A same-user rename or reparenting between the write and this use
-    /// makes the descriptor's live path differ, and the consumer refuses
-    /// rather than hand a moved path to a tool that re-resolves it. A
-    /// descriptor whose path can no longer be established fails closed.
-    /// Children that open the secret themselves take `fd_share` instead:
-    /// a description reference carries no re-resolvable name at all.
+    /// On unix there is no path accessor at all: every consumer is bound
+    /// by descriptor (fd_share / fchdir-bound cwd), so a rename or
+    /// reparent has nothing left to redirect. Non-unix consumers still
+    /// resolve the recorded path.
+    #[cfg(not(unix))]
     pub fn path(&self) -> Result<&Path> {
-        #[cfg(unix)]
-        {
-            let live = crate::fd_canonical_path(&self.dir_fd)
-                .context("cannot re-establish the scratch root's path - refusing")?;
-            anyhow::ensure!(
-                live == self.root,
-                "the secret scratch root moved after the boundary check - refusing"
-            );
-        }
         Ok(&self.path)
+    }
+
+    /// Tests still inspect the recorded path directly (uniqueness,
+    /// privacy bits); production consumers on unix get no accessor at
+    /// all. `cfg(test)` keeps the spelling out of shipped binaries.
+    #[cfg(all(unix, test))]
+    pub(crate) fn path(&self) -> Result<&Path> {
+        Ok(&self.path)
+    }
+
+    /// Prove the scratch root's descriptor still names the directory the
+    /// boundary check judged. Called after construction and available to
+    /// flows that need a mid-operation checkpoint; a descriptor whose
+    /// path moved - or can no longer be established - fails closed.
+    #[cfg(unix)]
+    pub(crate) fn reassert(&self) -> Result<()> {
+        let live = crate::fd_canonical_path(&self.dir_fd)
+            .context("cannot re-establish the scratch root's path - refusing")?;
+        anyhow::ensure!(
+            live == self.root,
+            "the secret scratch root moved after the boundary check - refusing"
+        );
+        Ok(())
     }
 }
 
@@ -642,5 +740,47 @@ mod tests {
             std::fs::File::open(&fd_path).is_err(),
             "a dead share's reference must not resolve"
         );
+    }
+
+    /// A pinned leaf is a descriptor pair: single-component names only,
+    /// reads resolve through the leaf inode, and dropping removes the
+    /// leaf's own name from the root - never a replanted stand-in.
+    #[cfg(unix)]
+    #[test]
+    fn a_pinned_leaf_is_bound_by_descriptor_for_its_whole_life() {
+        let root = private_temp_root().unwrap();
+        let root_path = crate::fd_canonical_path(&root.fd).unwrap();
+
+        // Composite names - including traversal - refuse before mkdirat.
+        for bad in ["a/b", "../x", ".", "..", ""] {
+            assert!(
+                root.mkdir_leaf(std::ffi::OsStr::new(bad), 0o700).is_err(),
+                "leaf name {bad:?} must refuse"
+            );
+        }
+
+        let tag = format!("leaf-{}-a", std::process::id());
+        let leaf = root.mkdir_leaf(std::ffi::OsStr::new(&tag), 0o700).unwrap();
+        assert!(root_path.join(&tag).is_dir());
+        // A file written through the leaf's own directory entry reads
+        // back through its descriptor.
+        std::fs::write(root_path.join(&tag).join("k"), b"secret").unwrap();
+        assert_eq!(leaf.read(std::ffi::OsStr::new("k")).unwrap(), b"secret");
+        leaf.unlink(std::ffi::OsStr::new("k"));
+        assert!(!root_path.join(&tag).join("k").exists());
+        // Dropping removes exactly this leaf's name from the root.
+        drop(leaf);
+        assert!(!root_path.join(&tag).exists());
+
+        // A same-named directory replanted between create and drop is a
+        // different inode - the drop's unlinkat names it under the root,
+        // but the earlier leaf's files were unlinked through the leaf fd,
+        // so nothing of a stand-in's contents is touched.
+        let tag = format!("leaf-{}-b", std::process::id());
+        let leaf = root.mkdir_leaf(std::ffi::OsStr::new(&tag), 0o700).unwrap();
+        std::fs::write(root_path.join(&tag).join("kept"), b"1").unwrap();
+        leaf.unlink(std::ffi::OsStr::new("kept"));
+        drop(leaf);
+        assert!(!root_path.join(&tag).exists());
     }
 }

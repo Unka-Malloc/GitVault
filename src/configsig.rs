@@ -582,30 +582,25 @@ pub fn keygen() -> Result<(String, String)> {
         std::process::id(),
         rand::random::<u64>()
     );
-    // On unix the leaf is created and removed relative to the pinned
-    // descriptor (mkdirat/unlinkat), and the keygen child's cwd is that
-    // same descriptor (fchdir in pre_exec): no path component - swapped,
-    // moved or replanted - can redirect where the private key is written
-    // or what cleanup removes. The boundary check above already proved
-    // the root sits outside every checkout.
+    // On unix the leaf is pinned by descriptor from creation: the keygen
+    // child's cwd IS the leaf inode (fchdir in pre_exec), the keypair is
+    // read back through openat on that same descriptor, and cleanup is
+    // unlinkat relative to it plus the root's rmdir - no path a same-user
+    // process could swap, move or replant stands between "where the key
+    // lands" and "what cleanup removes".
     #[cfg(unix)]
     {
-        let leaf_os = std::ffi::OsStr::new(&leaf);
-        scratch.mkdir_pinned(leaf_os, 0o700)?;
-        let out = keygen_in(Path::new(&leaf), &scratch).and_then(|pair| {
-            scratch
-                .path()
-                .map(|_| pair)
-                .context("the signing-key scratch root moved during keygen - refusing")
-        });
-        scratch.remove_leaf_pinned(leaf_os, &["key", "key.pub"]);
+        let leaf_dir = scratch.mkdir_leaf(std::ffi::OsStr::new(&leaf), 0o700)?;
+        let out = keygen_in_leaf(&leaf_dir);
+        leaf_dir.unlink(std::ffi::OsStr::new("key"));
+        leaf_dir.unlink(std::ffi::OsStr::new("key.pub"));
         out
     }
     #[cfg(not(unix))]
     {
         let dir = scratch.path()?.join(&leaf);
         std::fs::create_dir_all(&dir)?;
-        let out = keygen_in(Path::new(&dir), &scratch).and_then(|pair| {
+        let out = keygen_in_path(&dir, &scratch).and_then(|pair| {
             scratch
                 .path()
                 .map(|_| pair)
@@ -616,21 +611,50 @@ pub fn keygen() -> Result<(String, String)> {
     }
 }
 
-fn keygen_in(dir: &Path, scratch: &crate::tempsecret::ScratchRoot) -> Result<(String, String)> {
-    // The relative leaf resolves against the pinned root when the child is
-    // fchdir'd into it; the absolute spelling is the non-unix fallback.
-    let key_arg = if cfg!(unix) {
-        PathBuf::from(dir).join("key")
-    } else {
-        scratch.path()?.join(dir).join("key")
-    };
-    let key = scratch.path()?.join(dir).join("key");
+/// Unix: the leaf descriptor is the whole lookup root - ssh-keygen writes
+/// `key`/`key.pub` inside it (child cwd bound by fchdir), and both halves
+/// are read back through openat on that descriptor.
+#[cfg(unix)]
+fn keygen_in_leaf(leaf: &crate::tempsecret::PinnedLeaf) -> Result<(String, String)> {
     let mut cmd = Command::new(crate::ssh::trusted_tool("ssh-keygen")?);
-    #[cfg(unix)]
-    scratch.fchdir_child(&mut cmd);
+    leaf.fchdir_child(&mut cmd);
     let status = cmd
+        .args(["-t", "ed25519", "-N", "", "-C", PRINCIPAL, "-f", "key"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .status()
+        .context("failed to run ssh-keygen -t ed25519")?;
+    if !status.success() {
+        bail!("ssh-keygen could not generate the configuration signing key");
+    }
+    let private = leaf
+        .read(std::ffi::OsStr::new("key"))
+        .context("private key was not produced")?;
+    let public = leaf
+        .read(std::ffi::OsStr::new("key.pub"))
+        .context("public key was not produced")?;
+    let private = String::from_utf8(private).context("private key is not utf-8")?;
+    let public_line = String::from_utf8(public).context("public key is not utf-8")?;
+    // `<type> <key> <comment>` -> `<principal> <type> <key>` (allowed-signers).
+    let mut fields = public_line.split_whitespace();
+    let (Some(kind), Some(body)) = (fields.next(), fields.next()) else {
+        bail!("ssh-keygen produced a malformed public key");
+    };
+    Ok((private, format!("{PRINCIPAL} {kind} {body}\n")))
+}
+
+/// Non-unix fallback: no descriptor-relative API exists, so the leaf is
+/// path-based inside the pinned scratch root (itself re-asserted after
+/// the child returns).
+#[cfg(not(unix))]
+fn keygen_in_path(
+    dir: &Path,
+    _scratch: &crate::tempsecret::ScratchRoot,
+) -> Result<(String, String)> {
+    let key = dir.join("key");
+    let status = Command::new(crate::ssh::trusted_tool("ssh-keygen")?)
         .args(["-t", "ed25519", "-N", "", "-C", PRINCIPAL, "-f"])
-        .arg(&key_arg)
+        .arg(&key)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .status()

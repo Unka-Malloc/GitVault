@@ -3379,7 +3379,9 @@ fn publication_surface(method: &str, path: &str) -> Option<String> {
         // audited push), renames or archives the home, DELETE removes it.
         // A read of repo metadata was returned open above.
         None => true,
-        _ => false,
+        // Writes the table did not name (metadata edits, comments,
+        // labels) publish no code - they stay open to the broker.
+        Some(_) => false,
     };
     hit.then(|| format!("{verb} /{route}"))
 }
@@ -4268,10 +4270,11 @@ const MAX_ASSET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
 const MAX_MEMORY_STAGING_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// One writer thread serves every in-memory staged image's pipe, FIFO, so a
-/// release's openers never multiply threads with the asset count. A reader
-/// that stops early gives EPIPE and the item ends; the channel is unbounded
-/// in count but each item is one cheap (Arc, fd) pair.
+/// In-memory staged images are served through anonymous pipes by a small
+/// bounded worker pool, not one writer per open and not a single FIFO:
+/// a reader that stalls mid-image (a consumer killed mid-audit) can hold
+/// one worker at most, and the remaining workers keep later assets
+/// moving. A reader that ends early gives EPIPE and frees its worker.
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
 fn bytes_writer() -> &'static std::sync::mpsc::Sender<(std::sync::Arc<Vec<u8>>, i32)> {
     use std::io::Write as _;
@@ -4280,12 +4283,24 @@ fn bytes_writer() -> &'static std::sync::mpsc::Sender<(std::sync::Arc<Vec<u8>>, 
         std::sync::OnceLock::new();
     WRITER.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::channel::<(std::sync::Arc<Vec<u8>>, i32)>();
-        std::thread::spawn(move || {
-            for (image, fd) in rx {
-                let mut writer = unsafe { std::fs::File::from_raw_fd(fd) };
-                let _ = writer.write_all(&image);
-            }
-        });
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        // Bounded concurrency: four stalled readers can never starve the
+        // fifth open, and the pool stays small however many assets stage.
+        for _ in 0..4 {
+            let shared = shared.clone();
+            std::thread::spawn(move || {
+                loop {
+                    let item = shared.lock().expect("staged-image queue poisoned").recv();
+                    match item {
+                        Ok((image, fd)) => {
+                            let mut writer = unsafe { std::fs::File::from_raw_fd(fd) };
+                            let _ = writer.write_all(&image);
+                        }
+                        Err(_) => return,
+                    }
+                }
+            });
+        }
         tx
     })
 }
@@ -4854,6 +4869,18 @@ fn stage_release_assets(
                     "--asset '{}' grew past the {budget} byte release budget \
                      while staging - refusing before the write",
                     path.display()
+                );
+                // A source that grows mid-copy must not outrun the RAM
+                // ceiling either: on platforms whose staged image is a
+                // Vec, every chunk is checked against the hard memory cap
+                // before it lands, not just the preflight's declared sum.
+                #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+                anyhow::ensure!(
+                    staged_bytes + total <= MAX_MEMORY_STAGING_BYTES,
+                    "--asset '{}' grew past the {} byte in-memory staging \
+                     limit while staging - refusing before the write",
+                    path.display(),
+                    MAX_MEMORY_STAGING_BYTES
                 );
                 use std::io::Write as _;
                 sink.write_all(&buffer[..read])
