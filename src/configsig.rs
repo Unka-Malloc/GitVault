@@ -597,18 +597,17 @@ pub fn keygen() -> Result<(String, String)> {
         leaf_dir.unlink(std::ffi::OsStr::new("key.pub"));
         out
     }
+    // Non-unix has no descriptor pin: a path-based leaf can be relocated
+    // between the check and the child's writes, so key generation - a
+    // secret operation - refuses here rather than land a private key in a
+    // directory this platform cannot prove.
     #[cfg(not(unix))]
     {
-        let dir = scratch.path()?.join(&leaf);
-        std::fs::create_dir_all(&dir)?;
-        let out = keygen_in_path(&dir, &scratch).and_then(|pair| {
-            scratch
-                .path()
-                .map(|_| pair)
-                .context("the signing-key scratch root moved during keygen - refusing")
-        });
-        let _ = std::fs::remove_dir_all(&dir);
-        out
+        let _ = (scratch, leaf);
+        anyhow::bail!(
+            "this platform cannot bind key generation to a checked directory \
+             atomically - descriptor-bound scratch is required, refusing"
+        )
     }
 }
 
@@ -654,36 +653,6 @@ fn keygen_in_leaf(leaf: &crate::tempsecret::PinnedLeaf) -> Result<(String, Strin
         .context("public key was not produced")?;
     let private = String::from_utf8(private).context("private key is not utf-8")?;
     let public_line = String::from_utf8(public).context("public key is not utf-8")?;
-    // `<type> <key> <comment>` -> `<principal> <type> <key>` (allowed-signers).
-    let mut fields = public_line.split_whitespace();
-    let (Some(kind), Some(body)) = (fields.next(), fields.next()) else {
-        bail!("ssh-keygen produced a malformed public key");
-    };
-    Ok((private, format!("{PRINCIPAL} {kind} {body}\n")))
-}
-
-/// Non-unix fallback: no descriptor-relative API exists, so the leaf is
-/// path-based inside the pinned scratch root (itself re-asserted after
-/// the child returns).
-#[cfg(not(unix))]
-fn keygen_in_path(
-    dir: &Path,
-    _scratch: &crate::tempsecret::ScratchRoot,
-) -> Result<(String, String)> {
-    let key = dir.join("key");
-    let status = Command::new(crate::ssh::trusted_tool("ssh-keygen")?)
-        .args(["-t", "ed25519", "-N", "", "-C", PRINCIPAL, "-f"])
-        .arg(&key)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .status()
-        .context("failed to run ssh-keygen -t ed25519")?;
-    if !status.success() {
-        bail!("ssh-keygen could not generate the configuration signing key");
-    }
-    let private = std::fs::read_to_string(&key).context("private key was not produced")?;
-    let public_line = std::fs::read_to_string(key.with_extension("pub"))
-        .context("public key was not produced")?;
     // `<type> <key> <comment>` -> `<principal> <type> <key>` (allowed-signers).
     let mut fields = public_line.split_whitespace();
     let (Some(kind), Some(body)) = (fields.next(), fields.next()) else {

@@ -4095,45 +4095,18 @@ fn cmd_release(
             );
         }
         ReleaseCommand::Delete { tag } => {
-            // Only a draft may be removed: deleting a published release emits
-            // `release:deleted`, which triggers workflows outside the audited
-            // path. Drafts are not reachable through the tags endpoint, so the
-            // id and draft state resolve from the release listing. The tag is
-            // validated before it enters the jq program.
-            anyhow::ensure!(
-                !tag.is_empty()
-                    && tag
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/')),
-                "release tag '{tag}' contains characters the delete resolver cannot safely use"
+            // Release deletion is not an audited path and cannot be made one
+            // from here: the API offers no atomic draft-only precondition,
+            // `release:deleted` fires webhooks even for drafts, and a
+            // collaborator publishing in the check/delete window would make
+            // the same request emit an event that triggers privileged
+            // workflows. Failed-transaction drafts are cleaned up internally
+            // by the release flow itself.
+            anyhow::bail!(
+                "release '{tag}' was not deleted: deleting a release emits events \
+                 that can trigger workflows, and no atomic draft-only check \
+                 exists - remove it through GitHub if it is really meant to go"
             );
-            let id_req = get(
-                format!("/repos/{slug}/releases?per_page=100"),
-                slug.clone(),
-                Some(format!(
-                    ".[] | select(.tag_name == \"{tag}\") | .id, .draft"
-                )),
-            );
-            let resolved = api::run_value(&cfg, &vault, &id_req)?;
-            let mut lines = resolved.lines();
-            let id = lines.next().unwrap_or_default().trim().to_string();
-            let draft = lines.next().unwrap_or_default().trim();
-            anyhow::ensure!(!id.is_empty(), "no release named '{tag}'");
-            anyhow::ensure!(
-                draft == "true",
-                "release '{tag}' is published; deleting it emits events that can \
-                 trigger privileged workflows - only drafts may be removed"
-            );
-            let mut r = get(
-                format!("/repos/{slug}/releases/{}", id.trim()),
-                slug.clone(),
-                None,
-            );
-            r.method = "DELETE".into();
-            // Containment: the action only removes an unpublished draft -
-            // state that never passed an audit and emits no public events.
-            r.mutation = api::Mutation::Containment;
-            r
         }
     };
     emit(&cfg, &vault, req)
@@ -4286,9 +4259,9 @@ impl ReleaseAsset {
 
 /// The consumer-side delivery proof a pipe-fed staged image hands back:
 /// the writer's completion receipt and the parent's own read descriptor,
-/// whose leftover bytes after the audit are exactly what the consumer
-/// never drained. Only in-memory images need it - a sealed kernel inode
-/// cannot truncate silently.
+/// which is read to EOF after the audit - whatever it yields is exactly
+/// what the consumer never drained. Only in-memory images need it - a
+/// sealed kernel inode cannot truncate silently.
 #[cfg_attr(not(unix), allow(dead_code))]
 type DeliveryEvidence = (std::sync::mpsc::Receiver<bool>, i32);
 
@@ -4544,14 +4517,16 @@ impl StagedAssets {
     /// A writer's completion receipt alone is not enough - a consumer that
     /// read a prefix and exited leaves the tail undrained in the pipe, which
     /// a bare EOF or a producer-side ack cannot distinguish from a full
-    /// read. The parent's own read end answers that: whatever still sits in
-    /// it after the children exit was never consumed. The parent's
-    /// inherited-fd copies are spent first, then each drain descriptor is
-    /// measured and closed - closing the last reader turns a still-parked
-    /// writer's EPIPE into a failed receipt rather than a wait on a reader
-    /// that will never come.
+    /// read. The parent's own read end answers that without a raceable
+    /// sample: it reads to EOF, and whatever arrives is exactly the bytes
+    /// the consumer never took - the writer keeps pumping as space frees,
+    /// so the count is a stable post-exit measurement, not a snapshot the
+    /// producer could outrun. The parent's inherited-fd copies are spent
+    /// first so only this drain remains a reader.
     #[cfg(unix)]
     fn verify_delivered(&mut self) -> anyhow::Result<()> {
+        use std::io::Read as _;
+        use std::os::fd::FromRawFd as _;
         for fd in self.shared.drain(..) {
             unsafe {
                 libc::close(fd);
@@ -4559,13 +4534,24 @@ impl StagedAssets {
         }
         let mut complete = true;
         for (delivered, drain) in self.delivery.drain(..) {
-            let mut left = 0i32;
-            let undrained =
-                unsafe { libc::ioctl(drain, libc::FIONREAD, &mut left) } == 0 && left > 0;
-            unsafe {
-                libc::close(drain);
+            // Owning the descriptor as a File closes it on every path. A
+            // read error refuses too: a drain that cannot be measured is
+            // a consumption that cannot be proven.
+            let mut file = unsafe { std::fs::File::from_raw_fd(drain) };
+            let mut drained = 0u64;
+            let mut buf = [0u8; 8192];
+            loop {
+                match file.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => drained += n as u64,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => {
+                        complete = false;
+                        break;
+                    }
+                }
             }
-            complete &= delivered.recv().unwrap_or(false) && !undrained;
+            complete &= delivered.recv().unwrap_or(false) && drained == 0;
         }
         anyhow::ensure!(
             complete,

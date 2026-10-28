@@ -672,25 +672,19 @@ impl TempSecret {
         &self.name
     }
 
-    /// The secret file's path for consumers that need one - re-validated
-    /// on every call: on unix the pinned scratch descriptor is resolved
-    /// again and must still name the directory the boundary check judged.
-    /// On unix there is no path accessor at all: every consumer is bound
-    /// by descriptor (fd_share / fchdir-bound cwd), so a rename or
-    /// reparent has nothing left to redirect. Non-unix has no descriptor
-    /// pin, so the best available check runs at every use: the recorded
-    /// path must still canonically resolve to itself before a consumer
-    /// opens it - a relocated or reparented secret refuses there instead
-    /// of lending a stale spelling to a check-then-open.
+    /// The secret file's path for consumers that need one. On unix there
+    /// is no path accessor at all: every consumer is bound by descriptor
+    /// (fd_share / fchdir-bound cwd), so a rename or reparent has nothing
+    /// left to redirect. Non-unix has no descriptor pin, and a path can be
+    /// relocated between any check and the child's open - a check-then-open
+    /// this platform cannot close, so the handoff refuses rather than lend
+    /// a raceable spelling to a consumer.
     #[cfg(not(unix))]
     pub fn path(&self) -> Result<&Path> {
-        let live = std::fs::canonicalize(&self.path)
-            .context("the secret's path no longer resolves - refusing")?;
-        anyhow::ensure!(
-            live == self.path,
-            "the secret's path moved after the boundary check - refusing"
-        );
-        Ok(&self.path)
+        anyhow::bail!(
+            "this platform cannot hand a checked secret to a consumer atomically - \
+             descriptor-bound handoff is required, refusing"
+        )
     }
 
     /// Tests still inspect the recorded path directly (uniqueness,
