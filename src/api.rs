@@ -196,9 +196,11 @@ pub enum Mutation {
     /// minted (push, pr create/merge, release create and its uploads).
     Audited,
     /// A narrowly justified removal of unaudited server-side state:
-    /// deleting a draft release that never published, or closing a pull
-    /// request whose head moved past the audited commit. The operation
-    /// shrinks the unaudited surface instead of adding to it.
+    /// closing a pull request whose head moved past the audited commit.
+    /// The operation shrinks the unaudited surface instead of adding to
+    /// it. Nothing deletes a release, draft included: deletion emits
+    /// `release:deleted` even for drafts and no atomic draft-only
+    /// precondition exists, so a failed draft stays for the operator.
     Containment,
 }
 

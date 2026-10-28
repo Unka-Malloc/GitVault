@@ -159,11 +159,14 @@ impl ScratchRoot {
         // through the root's path: O_NOFOLLOW turns a leaf name replaced by
         // a symlink into a refusal, and the fstat/fstatat identity match
         // below proves this descriptor names the inode mkdirat created.
+        // O_CLOEXEC keeps the pinned descriptor out of child fd tables; a
+        // consumer binds the leaf's cwd through `fchdir` in pre_exec, which
+        // runs before the flag would matter.
         let dir = unsafe {
             libc::openat(
                 self.fd.as_raw_fd(),
                 cname.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )
         };
         anyhow::ensure!(
@@ -688,7 +691,8 @@ impl TempSecret {
     pub fn path(&self) -> Result<&Path> {
         anyhow::bail!(
             "this platform cannot hand a checked secret to a consumer atomically - \
-             descriptor-bound handoff is required, refusing"
+             the descriptor-bound handoff (fd_share, fchdir-bound cwd) unix \
+             provides is required, refusing"
         )
     }
 
@@ -919,8 +923,8 @@ mod tests {
     /// leaf's own descriptor still serves the REAL directory's contents,
     /// and drop must leave the stand-in's contents untouched - removal is
     /// conditional on the recorded inode, not on the name. Unix-only like
-    /// every test that exercises descriptor-bound handoff; non-unix has
-    /// none of these primitives.
+    /// every test that exercises descriptor-bound handoff; on non-unix
+    /// none of these primitives exists and the production path refuses.
     #[cfg(unix)]
     #[test]
     fn a_renamed_and_replanted_leaf_is_refused_and_never_removed() {

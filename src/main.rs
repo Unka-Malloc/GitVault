@@ -3322,10 +3322,11 @@ fn publication_surface(method: &str, path: &str) -> Option<String> {
     // classifier, so any write still arriving is one the audit cannot see.
     // This is the routing verdict; the enforcement point is the Mutation
     // mark checked at `api::authorize`, which no request path can skip.
-    // There is no verified-safe metadata allowlist: every repository
-    // mutation emits events (issues, label, milestone, project,
-    // issue_comment, commit_comment, pull_request, repository...) that can
-    // trigger privileged Actions workflows holding repository credentials,
+    // There is no verified-safe metadata allowlist - not even issues or
+    // labels - because every repository mutation emits events (issues,
+    // label, milestone, project, issue_comment, commit_comment,
+    // pull_request, repository...) that can trigger privileged Actions
+    // workflows holding repository credentials,
     // and the generic broker cannot prove a caller's write will not. CI
     // authority spent outside the audited path is publication power, so
     // the generic `api` broker is read-only by verdict.
@@ -3589,19 +3590,19 @@ fn cmd_pr(
         body: None,
         body_stream: None,
         follow: false,
-        // Read until proven otherwise: only the merge arm flips this to
-        // Audited below, and only after its publication gate has run.
-        mutation: api::Mutation::Read,
+        // Read until proven otherwise: the merge arm mints Audited only
+        // because it already ran `run_publication_gate` and re-verified the
+        // request's head and base after it - the PUT lands exactly what the
+        // audit judged, which is what Audited means at the credential
+        // boundary. Every other arm stays Read and fails closed there.
+        mutation: if merge_audited {
+            api::Mutation::Audited
+        } else {
+            api::Mutation::Read
+        },
         jq,
         silent: false,
     };
-    if merge_audited {
-        // The merge arm already ran `run_publication_gate` and re-verified
-        // the request's head and base after it: the PUT lands exactly what
-        // the audit judged, which is what Audited means at the credential
-        // boundary.
-        req.mutation = api::Mutation::Audited;
-    }
     // A created pull request carries the head and base the API actually used.
     // If either advanced between the last read and the POST, the request
     // contains a commit or a diff base the audit never saw: close it and
@@ -3610,7 +3611,9 @@ fn cmd_pr(
     // request open. The create endpoint accepts no server-side conditional
     // for either ref - the re-read before the POST bounds the window and the
     // post-create verify is the containment, so the residual race is only
-    // the span of one request.
+    // the span of one request. The merge arm holds the same discipline: its
+    // publication gate and post-audit head/base re-verify are why it alone
+    // may mint Audited in the request above.
     if let Some((expected_head, expected_base)) = expected_head {
         req.mutation = api::Mutation::Audited;
         req.jq = Some(".html_url, .head.sha, .base.sha, .number".to_string());
@@ -4073,8 +4076,9 @@ fn cmd_release(
             r.mutation = api::Mutation::Audited;
             // Every release is created as a draft: assets upload while it is
             // invisible, the tag is re-verified against the audited commit,
-            // and only then is the release published. A failure deletes the
-            // draft rather than leaving a half-uploaded release public.
+            // and only then is the release published. A failure past this
+            // point leaves the draft unpublished for the operator - nothing
+            // here deletes it, since release:deleted fires even for drafts.
             r.raw_fields.push(("draft".into(), "true".to_string()));
             r.raw_fields
                 .push(("prerelease".into(), prerelease.to_string()));
@@ -4311,6 +4315,10 @@ fn bytes_writer() -> &'static std::sync::mpsc::Sender<ImageJob> {
                 offset: usize,
                 ack: std::sync::mpsc::Sender<bool>,
             }
+            /// The receipt a finished writer sends exactly once: `true`
+            /// only when every staged byte went into the pipe. A writer
+            /// that dies mid-image or never ran drops the sender instead,
+            /// which `verify_delivered` reads the same as `false`.
             impl Drop for Job {
                 fn drop(&mut self) {
                     let _ = self.ack.send(self.offset >= self.image.len());
@@ -4340,6 +4348,10 @@ fn bytes_writer() -> &'static std::sync::mpsc::Sender<ImageJob> {
                         });
                     }
                     if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                        // The consumer sees EOF on an empty pipe, but no Job
+                        // means no ack is ever sent - `verify_delivered`
+                        // refuses on the missing receipt, so this silent
+                        // close can never pass the gate.
                         unsafe {
                             libc::close(fd);
                         }
@@ -5194,7 +5206,8 @@ fn create_release_staged(
         Ok(false) => {
             anyhow::bail!(
                 "the remote tag {} vanished while the draft was created - draft {id} \
-                 was left unpublished; remove it through GitHub if it should go",
+                 holds no assets yet and was left unpublished; remove it through \
+                 GitHub if it should go",
                 staged.tag
             );
         }
@@ -5254,10 +5267,12 @@ fn create_release_staged(
     // the operator to inspect rather than being silently deleted or
     // published on a stale binding.
     let still_bound = verify_remote_tag(staged.repo_root, slug, staged.tag, staged.audited)
-        .context("the tag moved after the draft was bound; it stays unpublished for inspection")?;
+        .with_context(|| {
+            format!("the tag moved after the draft was bound; draft {id} stays unpublished for inspection")
+        })?;
     anyhow::ensure!(
         still_bound,
-        "the remote tag {} vanished after the draft was bound; it stays unpublished for inspection",
+        "the remote tag {} vanished after the draft was bound; draft {id} stays unpublished for inspection",
         staged.tag
     );
     if staged.keep_draft {
@@ -5277,7 +5292,7 @@ fn create_release_staged(
     let resolved = api::run_value(cfg, vault, &bound).unwrap_or_default();
     anyhow::ensure!(
         resolved.trim().eq_ignore_ascii_case(staged.audited),
-        "the draft release resolves to '{}' not the audited {} - it stays a draft",
+        "draft {id} resolves to '{}' not the audited {} - it stays unpublished",
         resolved.trim(),
         staged.audited
     );
@@ -5291,7 +5306,9 @@ fn create_release_staged(
     publish
         .raw_fields
         .push(("draft".into(), "false".to_string()));
-    emit(cfg, vault, publish)
+    emit(cfg, vault, publish).with_context(|| {
+        format!("publishing failed; draft {id} was left unpublished for inspection")
+    })
 }
 
 fn cmd_run(
