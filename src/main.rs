@@ -3313,97 +3313,17 @@ fn publication_surface(method: &str, path: &str) -> Option<String> {
     if first == Some("graphql") {
         return Some(format!("{verb} /{route} (GraphQL endpoint)"));
     }
-    // repos/{owner}/{repo}/<surface>/...
-    if first != Some("repos") || segments.len() < 3 {
-        // Outside repos/* a write can still mint a repository or a
-        // migration - new homes content can be pushed into without the gate
-        // ever seeing a push. Those refuse; account metadata, notifications
-        // and the other non-publishing routes stay open.
-        return matches!(
-            segments.as_slice(),
-            ["user", "repos", ..]
-                | ["user", "migrations", ..]
-                | ["orgs", _, "repos", ..]
-                | ["orgs", _, "migrations", ..]
-        )
-        .then(|| format!("{verb} /{route}"));
-    }
-    let tail: Vec<&str> = segments.get(3..).unwrap_or(&[]).to_vec();
-    let hit = match tail.first().copied() {
-        // File contents and every git object/ref write.
-        Some("contents" | "git") => true,
-        // Branch merges performed server-side, and a fork syncing its branch
-        // from upstream - both move a ref without the local gate seeing it.
-        Some("merges" | "merge-upstream") => true,
-        // Creating a pull request, or merging one or updating its branch from
-        // the base. Metadata writes (PATCH title/body, reviewers, comments)
-        // are not publication.
-        Some("pulls") => {
-            verb == "POST" && tail.len() == 1
-                || tail
-                    .get(2)
-                    .is_some_and(|seg| *seg == "merge" || *seg == "update-branch")
-        }
-        // Releases and their assets, created or edited.
-        Some("releases") => true,
-        // Commit statuses write to the repository's publication surface and
-        // can drive server-side checks; the broker refuses them outright.
-        Some("statuses") => true,
-        // `repository_dispatch` (repos/.../dispatches) and
-        // `workflow_dispatch` (repos/.../actions/workflows/.../dispatches)
-        // both spend CI authority on a selected ref with a caller payload -
-        // and so does every other write under actions: reruns, approvals,
-        // cancellations, artifact and secret writes all execute or publish
-        // without the local gate reviewing what runs. Repository-lifecycle,
-        // ref-moving and trust-moving writes are the same class: forking,
-        // templating, importing and transferring mint or move publication
-        // homes; branch writes rename refs or rewrite protection rules; a
-        // pages build publishes a site; deploy keys, hooks and deployments
-        // move trust or publish refs. None of it passes through an audited
-        // push, so every mutating verb on any of these surfaces refuses.
-        // `repository_dispatch`/`workflow_dispatch` fire privileged
-        // workflows on a caller-chosen ref with caller payloads - CI
-        // authority IS publication power; `actions` writes (rerun, approve,
-        // cancel, secrets, variables, caches) steer the same authority;
-        // `forks`, `generate`, `import` and `migrations` mint repositories;
-        // `transfer`, `branches`, `pages`, `keys`, `hooks` and `deployments`
-        // move trust or refs outside an audited push. Every mutating verb
-        // on these surfaces refuses: nothing here publishes unreviewed code.
-        Some(
-            "dispatches" | "actions" | "forks" | "generate" | "import" | "migrations" | "transfer"
-            | "branches" | "pages" | "keys" | "hooks" | "deployments",
-        ) => true,
-        // CI check, ruleset and environment-secret controls: a created
-        // check run or suite spends CI authority on a chosen ref exactly
-        // like a dispatch; a ruleset write rewrites ref protection; an
-        // environment write rewrites secrets, variables and protection
-        // gates. None passes through an audited push - every mutating
-        // verb refuses, named so the deny survives future edits of the
-        // allowlist below.
-        Some("check-runs" | "check-suites" | "rulesets" | "rules" | "environments") => true,
-        // The repository root itself: only mutating verbs reach this arm,
-        // and they are the widest publication surface of all - PATCH flips
-        // `visibility` to public (exposing every private byte without an
-        // audited push), renames or archives the home, DELETE removes it.
-        // A read of repo metadata was returned open above.
-        None => true,
-        // The verified metadata allowlist: these writes publish no code,
-        // move no trust or credential, spend no CI authority and expose
-        // no secret - issues and their labels and assignees, milestones,
-        // issue/commit comments, topics and classic project boards.
-        Some(
-            "issues" | "labels" | "milestones" | "comments" | "commit_comments" | "assignees"
-            | "topics" | "projects",
-        ) => false,
-        // Every other mutating repository route fails closed: an
-        // unmodelled surface refuses rather than inheriting write
-        // authorization - collaborators, invitations, installations,
-        // security-advisory workspaces, tag protection and whatever
-        // GitHub adds next all land here until a reviewer proves them
-        // metadata-only and names them above.
-        Some(_) => true,
-    };
-    hit.then(|| format!("{verb} /{route}"))
+    // Every mutating verb reaching here fails closed. The audited commands
+    // - push, pr create/merge, release create - never pass through this
+    // classifier, so any write still arriving is one the audit cannot see.
+    // There is no verified-safe metadata allowlist: every repository
+    // mutation emits events (issues, label, milestone, project,
+    // issue_comment, commit_comment, pull_request, repository...) that can
+    // trigger privileged Actions workflows holding repository credentials,
+    // and the generic broker cannot prove a caller's write will not. CI
+    // authority spent outside the audited path is publication power, so
+    // the generic `api` broker is read-only by verdict.
+    Some(format!("{verb} /{route}"))
 }
 
 fn cmd_pr(
@@ -4310,15 +4230,26 @@ fn bytes_writer() -> &'static std::sync::mpsc::Sender<(std::sync::Arc<Vec<u8>>, 
                 file: std::fs::File,
                 offset: usize,
             }
-            fn take(item: (std::sync::Arc<Vec<u8>>, i32)) -> Job {
+            /// `None` on a failed `F_SETFL`: a pipe that could not be made
+            /// nonblocking is never queued - a blocking write to a stalled
+            /// reader would stop this one worker. Closing the write end
+            /// instead gives the consumer an immediate EOF, fail-closed.
+            fn take(item: (std::sync::Arc<Vec<u8>>, i32)) -> Option<Job> {
                 let (image, fd) = item;
-                unsafe {
-                    libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
-                }
-                Job {
-                    image,
-                    file: unsafe { std::fs::File::from_raw_fd(fd) },
-                    offset: 0,
+                loop {
+                    if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } == 0 {
+                        return Some(Job {
+                            image,
+                            file: unsafe { std::fs::File::from_raw_fd(fd) },
+                            offset: 0,
+                        });
+                    }
+                    if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                        unsafe {
+                            libc::close(fd);
+                        }
+                        return None;
+                    }
                 }
             }
             let mut jobs: Vec<Job> = Vec::new();
@@ -4327,14 +4258,22 @@ fn bytes_writer() -> &'static std::sync::mpsc::Sender<(std::sync::Arc<Vec<u8>>, 
                 // its own slot and never delays the admission of new work.
                 loop {
                     match rx.try_recv() {
-                        Ok(item) => jobs.push(take(item)),
+                        Ok(item) => {
+                            if let Some(job) = take(item) {
+                                jobs.push(job);
+                            }
+                        }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
                     }
                 }
                 if jobs.is_empty() {
                     match rx.recv() {
-                        Ok(item) => jobs.push(take(item)),
+                        Ok(item) => {
+                            if let Some(job) = take(item) {
+                                jobs.push(job);
+                            }
+                        }
                         Err(_) => return,
                     }
                     continue;
@@ -6208,7 +6147,7 @@ mod tests {
     /// stay open. An absolute URL that no longer normalizes silently unguards
     /// the whole list, so that form is exercised explicitly.
     #[test]
-    fn the_api_surface_refuses_only_publication_writes() {
+    fn the_api_broker_refuses_every_mutating_verb() {
         for (method, path) in [
             ("PUT", "/repos/o/r/contents/src/lib.rs"),
             ("POST", "/repos/o/r/git/refs"),
@@ -6323,42 +6262,58 @@ mod tests {
             ("POST", "/orgs/acme/repos"),
             ("POST", "/user/migrations"),
             ("POST", "/orgs/acme/migrations"),
+            // There is no verified-safe metadata write through the generic
+            // broker: every repository mutation emits events (issues,
+            // label, milestone, project, issue_comment, commit_comment,
+            // pull_request, repository) that can trigger privileged
+            // Actions workflows with repository credentials - CI authority
+            // the audit never saw spent. All of these now refuse.
+            ("POST", "/repos/o/r/issues"),
+            ("POST", "/repos/o/r/issues/3/comments"),
+            ("PATCH", "/repos/o/r/issues/9"),
+            ("PATCH", "/repos/o/r/pulls/7"),
+            ("POST", "/repos/o/r/labels"),
+            ("POST", "/repos/o/r/milestones"),
+            ("PUT", "/repos/o/r/topics"),
+            ("POST", "/repos/o/r/issues/9/assignees"),
+            ("POST", "/repos/o/r/projects"),
+            ("PATCH", "/repos/o/r/comments/4"),
+            ("POST", "/repos/o/r/commit_comments"),
+            ("POST", "/repos/o/r/pulls/7/comments"),
+            ("POST", "/repos/o/r/pulls/7/reviews"),
+            ("POST", "/repos/o/r/issues?milestone=1"),
+            // Account-level trust and metadata writes outside repos/*
+            // fail the same way - an unmodelled route refuses.
+            ("POST", "/user/keys"),
+            ("POST", "/user/emails"),
+            ("PATCH", "/user"),
+            ("POST", "/user/gpg_keys"),
         ] {
             assert!(
                 publication_surface(method, path).is_some(),
-                "{method} {path} publishes and must be refused"
+                "{method} {path} mutates outside the audit and must be refused"
             );
         }
         for (method, path) in [
             ("GET", "/repos/o/r/contents/src/lib.rs"),
             ("GET", "/repos/o/r/pulls/7"),
             ("GET", "/repos/o/r/%63ontents/src/lib.rs"), // a read stays a read
-            ("POST", "/repos/o/r/issues"),
-            ("POST", "/repos/o/r/issues/3/comments"),
-            ("POST", "/repos/o/r/issues/%31"), // encoded digit, not a surface
-            ("PATCH", "/repos/o/r/pulls/7"),   // metadata edit, not publication
-            ("POST", "/repos/o/r/labels"),
-            // The rest of the verified metadata allowlist: milestones,
-            // commit comments, assignees, topics and classic project
-            // boards publish no code and move no trust or CI authority.
-            ("POST", "/repos/o/r/milestones"),
-            ("PATCH", "/repos/o/r/issues/9"),
-            ("PUT", "/repos/o/r/topics"),
-            ("POST", "/repos/o/r/issues/9/assignees"),
-            ("POST", "/repos/o/r/projects"),
-            ("PATCH", "/repos/o/r/comments/4"),
-            ("POST", "/repos/o/r/commit_comments"),
-            ("POST", "/repos/o/r/pulls/7/merge-ish"), // not the merge endpoint
-            ("GET", "/repos/o/r/actions/runs"),       // an Actions read stays open
+            ("GET", "/repos/o/r/issues"),
+            ("GET", "/repos/o/r/issues/3/comments"),
+            ("GET", "/repos/o/r/actions/runs"), // an Actions read stays open
             ("GET", "/repos/o/r/actions/runs/42/logs"), // logs are metadata reads
-            ("GET", "/repos/o/r/check-runs"),         // checks read fine
-            ("GET", "/repos/o/r/environments/prod/secrets/K"), // so do secrets' names
-            // Query parameters on a non-surface write stay open.
-            ("POST", "/repos/o/r/issues?milestone=1"),
+            ("GET", "/repos/o/r/check-runs"),   // checks read fine
+            ("GET", "/repos/o/r/environments/prod/secrets/K"), // secrets' names read
+            ("HEAD", "/repos/o/r/releases/latest"),
+            ("OPTIONS", "/repos/o/r"),
+            ("GET", "/user/repos"),
+            ("GET", "/orgs/acme/repos"),
+            // Query parameters on a read stay open.
+            ("GET", "/repos/o/r/issues?milestone=1"),
         ] {
             assert!(
                 publication_surface(method, path).is_none(),
-                "{method} {path} does not publish and must stay open"
+                "{method} {path} is a read and must stay open"
             );
         }
     }

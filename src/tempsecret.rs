@@ -167,27 +167,39 @@ impl ScratchRoot {
             "cannot pin the scratch leaf: {}",
             std::io::Error::last_os_error()
         );
+        // Own the descriptor before any fallible check: a refused
+        // validation below drops the File and closes the fd rather than
+        // leaking it.
+        let dir = unsafe { std::fs::File::from_raw_fd(dir) };
         // The open happened after the name existed, so a replant between
         // mkdirat and openat is possible. Pin what we actually opened and
         // refuse unless the name still resolves to that same inode right
-        // now: fstat the descriptor, fstatat the name, then prove the
+        // now: fstat the descriptor, lstat the name without following a
+        // planted link (a symlink to the moved leaf reports the LINK's
+        // inode, not the leaf's), require a directory, then prove the
         // opened directory is the fresh one by requiring it to be empty -
         // a substitute carrying planted entries cannot claim the inode a
         // just-created directory would have had.
         let mut opened: libc::stat = unsafe { std::mem::zeroed() };
         let mut named: libc::stat = unsafe { std::mem::zeroed() };
         let pinned = unsafe {
-            libc::fstat(dir, &mut opened) == 0
-                && libc::fstatat(self.fd.as_raw_fd(), cname.as_ptr(), &mut named, 0) == 0
+            libc::fstat(dir.as_raw_fd(), &mut opened) == 0
+                && libc::fstatat(
+                    self.fd.as_raw_fd(),
+                    cname.as_ptr(),
+                    &mut named,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                ) == 0
+                && named.st_mode & libc::S_IFMT == libc::S_IFDIR
                 && opened.st_dev == named.st_dev
                 && opened.st_ino == named.st_ino
         };
         anyhow::ensure!(
-            pinned && leaf_is_empty(dir),
+            pinned && leaf_is_empty(dir.as_raw_fd()),
             "the pinned scratch leaf was replaced during creation - refusing"
         );
         Ok(PinnedLeaf {
-            dir: unsafe { std::fs::File::from_raw_fd(dir) },
+            dir,
             root: self
                 .fd
                 .try_clone()
@@ -342,8 +354,19 @@ impl PinnedLeaf {
         let cname = std::ffi::CString::new(self.name.as_encoded_bytes())
             .context("leaf name is not encodable")?;
         let mut named: libc::stat = unsafe { std::mem::zeroed() };
+        // No-follow, directory-typed identity: a symlink planted under the
+        // leaf's name reports the link's own inode - never the leaf's - so
+        // a replant cannot launder an outside directory through this check.
         anyhow::ensure!(
-            unsafe { libc::fstatat(self.root.as_raw_fd(), cname.as_ptr(), &mut named, 0) } == 0
+            unsafe {
+                libc::fstatat(
+                    self.root.as_raw_fd(),
+                    cname.as_ptr(),
+                    &mut named,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } == 0
+                && named.st_mode & libc::S_IFMT == libc::S_IFDIR
                 && (named.st_dev, named.st_ino) == self.ident,
             "the pinned scratch leaf moved after the boundary check - refusing"
         );
@@ -362,7 +385,13 @@ impl Drop for PinnedLeaf {
         if let Ok(cname) = std::ffi::CString::new(self.name.as_encoded_bytes()) {
             let mut named: libc::stat = unsafe { std::mem::zeroed() };
             let ours = unsafe {
-                libc::fstatat(self.root.as_raw_fd(), cname.as_ptr(), &mut named, 0) == 0
+                libc::fstatat(
+                    self.root.as_raw_fd(),
+                    cname.as_ptr(),
+                    &mut named,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                ) == 0
+                    && named.st_mode & libc::S_IFMT == libc::S_IFDIR
                     && (named.st_dev, named.st_ino) == self.ident
             };
             if ours {
@@ -918,6 +947,52 @@ mod tests {
         assert!(root_path.join(&moved).exists());
         let _ = std::fs::remove_dir_all(root_path.join(&tag));
         let _ = std::fs::remove_dir_all(root_path.join(&moved));
+    }
+
+    /// The symlink variant of the replant: the leaf is moved outside the
+    /// scratch root and its name replaced with a link back to it. A
+    /// following lookup would see the right inode through the link and
+    /// accept an out-of-root directory; the no-follow identity check must
+    /// see the LINK's own inode and refuse, and cleanup must neither
+    /// follow the link nor remove its target.
+    #[test]
+    fn a_symlinked_leaf_name_is_never_the_leaf() {
+        let root = private_temp_root().unwrap();
+        let root_path = crate::fd_canonical_path(&root.fd).unwrap();
+        let outside = std::env::temp_dir().join(format!(
+            "gv-leaf-out-{}-{:04x}",
+            std::process::id(),
+            rand::random::<u16>()
+        ));
+        std::fs::create_dir(&outside).unwrap();
+        let tag = format!("leaf-{}-{:04x}", std::process::id(), rand::random::<u16>());
+        let leaf = root.mkdir_leaf(std::ffi::OsStr::new(&tag), 0o700).unwrap();
+        std::fs::write(root_path.join(&tag).join("k"), b"secret").unwrap();
+
+        // Move the real leaf outside the pinned root entirely, then point
+        // its old name at it through a symlink.
+        let moved = outside.join(&tag);
+        std::fs::rename(root_path.join(&tag), &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, root_path.join(&tag)).unwrap();
+
+        assert!(
+            leaf.reassert().is_err(),
+            "a symlinked leaf name must refuse: the name no longer names the leaf"
+        );
+        // The descriptor still serves the real inode's bytes.
+        assert_eq!(leaf.read(std::ffi::OsStr::new("k")).unwrap(), b"secret");
+
+        drop(leaf);
+        // Cleanup neither followed the link nor removed the out-of-root
+        // target: the link stays a link, and the moved directory keeps its
+        // contents.
+        assert!(
+            root_path.join(&tag).is_symlink(),
+            "the planted link must be left alone"
+        );
+        assert_eq!(std::fs::read(moved.join("k")).unwrap(), b"secret");
+        let _ = std::fs::remove_file(root_path.join(&tag));
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     /// The scratch root moving mid-operation is the relocation the

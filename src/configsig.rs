@@ -785,7 +785,10 @@ mod tests {
         let leaf_path = scratch.path().unwrap().join(&name);
         let moved = leaf_path.with_file_name(format!("{name}-moved"));
         std::fs::rename(&leaf_path, &moved).unwrap();
-        std::fs::create_dir(&leaf_path).unwrap();
+        // The link replant is the sharper fixture: a following identity
+        // check would see the leaf's own inode through the link and accept
+        // a directory the boundary never judged.
+        std::os::unix::fs::symlink(&moved, &leaf_path).unwrap();
         let refused = accept_keypair(&scratch, &leaf, pair);
         assert!(
             refused.is_err(),
@@ -794,7 +797,14 @@ mod tests {
         leaf.unlink(std::ffi::OsStr::new("key"));
         leaf.unlink(std::ffi::OsStr::new("key.pub"));
         drop(leaf);
-        let _ = std::fs::remove_dir_all(&leaf_path);
+        // The secrets went away through the pinned descriptor; the planted
+        // link and the relocated directory itself were left alone - cleanup
+        // never followed the link and never rmdir'd a name it could not
+        // prove was the leaf's own inode.
+        assert!(leaf_path.is_symlink());
+        assert!(moved.is_dir());
+        assert!(!moved.join("key").exists());
+        let _ = std::fs::remove_file(&leaf_path);
         let _ = std::fs::remove_dir_all(&moved);
     }
 
