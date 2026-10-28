@@ -3320,6 +3320,8 @@ fn publication_surface(method: &str, path: &str) -> Option<String> {
     // Every mutating verb reaching here fails closed. The audited commands
     // - push, pr create/merge, release create - never pass through this
     // classifier, so any write still arriving is one the audit cannot see.
+    // This is the routing verdict; the enforcement point is the Mutation
+    // mark checked at `api::authorize`, which no request path can skip.
     // There is no verified-safe metadata allowlist: every repository
     // mutation emits events (issues, label, milestone, project,
     // issue_comment, commit_comment, pull_request, repository...) that can
@@ -3587,6 +3589,8 @@ fn cmd_pr(
         body: None,
         body_stream: None,
         follow: false,
+        // Read until proven otherwise: only the merge arm flips this to
+        // Audited below, and only after its publication gate has run.
         mutation: api::Mutation::Read,
         jq,
         silent: false,
@@ -4100,8 +4104,9 @@ fn cmd_release(
             // `release:deleted` fires webhooks even for drafts, and a
             // collaborator publishing in the check/delete window would make
             // the same request emit an event that triggers privileged
-            // workflows. Failed-transaction drafts are cleaned up internally
-            // by the release flow itself.
+            // workflows. Failed-transaction drafts therefore stay on the
+            // server for the operator to inspect and remove through GitHub -
+            // no code path in this tool deletes a release, draft or not.
             anyhow::bail!(
                 "release '{tag}' was not deleted: deleting a release emits events \
                  that can trigger workflows, and no atomic draft-only check \
@@ -4317,6 +4322,12 @@ fn bytes_writer() -> &'static std::sync::mpsc::Sender<ImageJob> {
             /// instead gives the consumer an immediate EOF, fail-closed.
             /// (The untouched `ack` then drops unanswered, which the audit
             /// side also reads as not-delivered.)
+            ///
+            /// The `ack` receipt is only the writer's half of the proof: it
+            /// says the producer finished, not that the consumer read to
+            /// EOF. `verify_delivered` pairs it with draining the parent's
+            /// duplicated read end - bytes left behind there fail the gate,
+            /// so a consumer that stopped early cannot pass.
             fn take(item: ImageJob) -> Option<Job> {
                 let (image, fd, ack) = item;
                 loop {
@@ -5125,12 +5136,20 @@ fn stage_release_assets(
 /// Create the release as a draft, upload each verified asset, re-verify the
 /// tag still names the audited commit, then publish - unless `--draft` asked
 /// the release to stay invisible. The draft keeps a half-uploaded or
-/// tag-moved release from ever becoming public: any failure deletes it.
-/// Deleting the draft also discards bytes already uploaded - a deliberate
-/// trade: a draft left behind would be unaudited server-side state, and the
-/// audited digest set binds the release as a whole rather than per asset,
-/// so a retry re-verifies and re-transmits rather than resuming under a
-/// draft the audit never saw.
+/// tag-moved release from ever becoming public: a failure anywhere past
+/// creation leaves the draft unpublished rather than deleted - deleting a
+/// release emits `release:deleted`, which can start workflows the audit
+/// never reviewed, and no atomic draft-only precondition exists to delete
+/// under.
+/// What remains remotely on such a failure is bounded and named: the draft
+/// record itself plus any assets that finished uploading before it - bytes
+/// the audit already consumed, since staging streams every staged byte to
+/// the scanner before the upload begins. A draft is visible only to the
+/// repository's collaborators; each failure message names its id, and
+/// removing it is a deliberate manual step through GitHub, never implicit.
+/// A retry creates a fresh draft and re-uploads: the audited digest set
+/// binds the release as a whole rather than per asset, so nothing resumes
+/// under a draft this run did not create.
 /// The verified release context a staged publish needs beyond the request:
 /// where the audit ran, the commit it judged, the tag being created and the
 /// digest-bound assets.
@@ -5168,7 +5187,8 @@ fn create_release_staged(
     // The created draft binds the audited commit at once: an existing tag
     // resolves to its live commit here, a new tag is created at
     // `target_commitish`. If the tag already moved, the draft recorded
-    // unaudited content - it is deleted, not kept.
+    // unaudited content - it stays unpublished for the operator to inspect,
+    // never deleted from inside the tool.
     match verify_remote_tag(staged.repo_root, slug, staged.tag, staged.audited) {
         Ok(true) => {}
         Ok(false) => {

@@ -155,6 +155,10 @@ impl ScratchRoot {
             "cannot create the pinned scratch leaf: {}",
             std::io::Error::last_os_error()
         );
+        // Open the just-created leaf relative to the root descriptor, never
+        // through the root's path: O_NOFOLLOW turns a leaf name replaced by
+        // a symlink into a refusal, and the fstat/fstatat identity match
+        // below proves this descriptor names the inode mkdirat created.
         let dir = unsafe {
             libc::openat(
                 self.fd.as_raw_fd(),
@@ -672,13 +676,14 @@ impl TempSecret {
         &self.name
     }
 
-    /// The secret file's path for consumers that need one. On unix there
-    /// is no path accessor at all: every consumer is bound by descriptor
-    /// (fd_share / fchdir-bound cwd), so a rename or reparent has nothing
-    /// left to redirect. Non-unix has no descriptor pin, and a path can be
-    /// relocated between any check and the child's open - a check-then-open
-    /// this platform cannot close, so the handoff refuses rather than lend
-    /// a raceable spelling to a consumer.
+    /// The secret file's path for consumers that need one. On unix this
+    /// accessor does not exist: every consumer is bound by descriptor -
+    /// `fd_share` for tools that read a `/dev/fd/N`, `fchdir_child` +
+    /// `name()` for tools that open a relative spelling - so a rename or
+    /// reparent has nothing left to redirect. Non-unix has no descriptor
+    /// pin, and a path can be relocated between any check and the child's
+    /// open - a check-then-open this platform cannot close, so the handoff
+    /// refuses rather than lend a raceable spelling to a consumer.
     #[cfg(not(unix))]
     pub fn path(&self) -> Result<&Path> {
         anyhow::bail!(
@@ -913,7 +918,9 @@ mod tests {
     /// must refuse (the name no longer resolves to the pinned inode), the
     /// leaf's own descriptor still serves the REAL directory's contents,
     /// and drop must leave the stand-in's contents untouched - removal is
-    /// conditional on the recorded inode, not on the name.
+    /// conditional on the recorded inode, not on the name. Unix-only like
+    /// every test that exercises descriptor-bound handoff; non-unix has
+    /// none of these primitives.
     #[cfg(unix)]
     #[test]
     fn a_renamed_and_replanted_leaf_is_refused_and_never_removed() {

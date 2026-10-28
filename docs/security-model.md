@@ -281,8 +281,19 @@ any repository write - comments, labels, state flips included - emits
 events that can trigger privileged workflows outside the audited path. The
 only mutating requests the broker honors are marked by commands whose own
 audit already ran (`pr create/merge`, `release create`) or by narrowly
-justified removals of unaudited server-side state (draft-release and
-moved-head pull-request cleanup).
+justified removals of unaudited server-side state (moved-head pull-request
+cleanup).
+
+A release transaction that fails past draft creation deliberately leaves
+the draft - and any assets uploaded before the failure - unpublished on
+the server. No code path in GitVault deletes a release: `release:deleted`
+emits an event even for drafts, which can start workflows the audit never
+reviewed, and the API offers no atomic draft-only precondition. What stays
+is bounded - the draft record plus assets the audit already consumed,
+since staging streams every staged byte to the scanner before upload -
+and the failure message names the draft id for manual cleanup. A retry
+creates a fresh draft; nothing resumes under a draft this run did not
+create.
 
 ## Concurrent audits
 
