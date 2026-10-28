@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.0
+
 - `gitvault api` gains `--follow`/`-L` and `gitvault run` gains `logs JOB_ID`
   (job log text) and `logs --run RUN_ID` (run log archive). GitHub's log
   endpoints answer `302` to a signed download URL; the broker now follows the
@@ -203,9 +205,3 @@
   by the removed internal review engine and their cursor keys predate the
   engine's reviewer-bound key, so the engine cannot reuse them; rewriting the
   engine field or re-keying them would assert a provenance it never issued.
-
-## 0.2.0
-
-- Earlier 0.2.0 notes described the built-in review runtime and checker
-  registry. Both were removed in the audit consolidation above; Probator now
-  owns that surface.
