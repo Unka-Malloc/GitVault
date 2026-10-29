@@ -65,11 +65,11 @@ pub struct Ruling {
     pub kind: String,
     #[serde(default)]
     pub file: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<u64>,
     /// sha256 of the finding's normalized evidence text; set at filing so
     /// the ruling lapses if the finding is reworded.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
     /// The candidate head a `verdict` ruling covers.
     #[serde(default)]
@@ -96,9 +96,9 @@ pub struct Pending {
     pub kind: String,
     #[serde(default)]
     pub file: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
     #[serde(default)]
     pub head: String,
@@ -301,13 +301,28 @@ mod tests {
             reason: "why".into(),
             filed_at: "t".into(),
         };
+        // A verdict objection carries no line or fingerprint; serializing it
+        // must not emit a null TOML cannot represent.
+        let verdict = Pending {
+            id: "ob-2".into(),
+            repo: "owner/repo".into(),
+            checker: "c".into(),
+            kind: "verdict".into(),
+            file: String::new(),
+            line: None,
+            fingerprint: None,
+            head: "h".into(),
+            reason: "why".into(),
+            filed_at: "t".into(),
+        };
         let body = toml::to_string(
             &toml::Value::try_from(serde_json::json!({
-                "pending": [&entry]
+                "pending": [&entry, &verdict]
             }))
             .unwrap(),
         )
         .unwrap();
+        assert!(!body.contains("fingerprint = \"\""));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&path, body).unwrap();
         let loaded: Vec<Pending> = load_list(&path, "pending")
@@ -315,8 +330,39 @@ mod tests {
             .into_iter()
             .map(|v| v.try_into().unwrap())
             .collect();
-        assert_eq!(loaded, vec![entry]);
+        assert_eq!(loaded, vec![entry, verdict]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verdict_ruling_serializes_without_null_fields() {
+        let ruling = Ruling {
+            id: "ob-1".into(),
+            repo: "owner/repo".into(),
+            checker: "c".into(),
+            kind: "verdict".into(),
+            file: String::new(),
+            line: None,
+            fingerprint: None,
+            head: "h".into(),
+            verdict: "overruled".into(),
+            objection: "why".into(),
+            reason: "note".into(),
+            ruled_at: "t".into(),
+        };
+        let text = toml::to_string(
+            &toml::Value::try_from(serde_json::json!({
+                "ruling": [&ruling]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let doc: toml::Value = toml::from_str(&text).unwrap();
+        let back: Ruling = doc["ruling"].as_array().unwrap()[0]
+            .clone()
+            .try_into()
+            .unwrap();
+        assert_eq!(back, ruling);
     }
 
     #[test]
