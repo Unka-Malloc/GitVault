@@ -307,6 +307,26 @@ enum Command {
         #[arg(long, short = 'R', global = true)]
         repo: Option<String>,
     },
+    /// Verify a hook dispatcher directory.
+    ///
+    /// Only the chain's owner can say whether a dispatcher delegates the
+    /// way the contract requires: the check compares the directory's
+    /// `_dispatch` and hook stubs byte-for-byte against the scripts this
+    /// GitVault installs, so a look-alike or inert directory can never be
+    /// mistaken for the real chain.
+    Hooks {
+        #[command(subcommand)]
+        command: HooksCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum HooksCommand {
+    /// Verify a directory is the GitVault dispatcher; exits non-zero when it is not.
+    Verify {
+        /// Directory to inspect; defaults to the account's installed hooks dir.
+        path: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -739,6 +759,7 @@ fn main() -> ExitCode {
         Command::Release { command, repo } => cmd_release(cli.config.as_ref(), command, repo),
         Command::Run { command, repo } => cmd_run(cli.config.as_ref(), command, repo),
         Command::Ruleset { command, repo } => cmd_ruleset(cli.config.as_ref(), command, repo),
+        Command::Hooks { command } => cmd_hooks(command),
     };
 
     match result {
@@ -4005,6 +4026,52 @@ fn cmd_ruleset(
                 updated["enforcement"].as_str().unwrap_or(&enforcement)
             );
             Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+/// A hooks directory is the GitVault dispatcher only when its bytes are the
+/// bytes this program generates: the resolved `_dispatch` script (which names
+/// the installed binary path) and every hook stub. Presence, names and
+/// executable bits are all forgeable; the content contract is not, because
+/// this tool is the contract's owner.
+fn cmd_hooks(command: HooksCommand) -> anyhow::Result<ExitCode> {
+    match command {
+        HooksCommand::Verify { path } => {
+            let home = configsig::account_home()?;
+            let dir = path.unwrap_or_else(|| home.join(".git-hooks"));
+            let target = home.join(".local").join("bin").join("gitvault");
+            let mut mismatches = vec![];
+            if std::fs::read_to_string(dir.join("_dispatch")).unwrap_or_default()
+                != dispatcher_script(&target)
+            {
+                mismatches.push("_dispatch".to_string());
+            }
+            for event in [
+                "pre-commit",
+                "commit-msg",
+                "pre-push",
+                "prepare-commit-msg",
+                "pre-applypatch",
+            ] {
+                if std::fs::read_to_string(dir.join(event)).unwrap_or_default()
+                    != hook_stub_script(event)
+                {
+                    mismatches.push(event.to_string());
+                }
+            }
+            if mismatches.is_empty() {
+                println!("hooks: {} is the GitVault dispatcher", dir.display());
+                Ok(ExitCode::SUCCESS)
+            } else {
+                eprintln!(
+                    "gitvault: {} is not the GitVault dispatcher ({} mismatch(es): {})",
+                    dir.display(),
+                    mismatches.len(),
+                    mismatches.join(", ")
+                );
+                Ok(ExitCode::from(2))
+            }
         }
     }
 }
