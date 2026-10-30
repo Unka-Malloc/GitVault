@@ -291,6 +291,57 @@ enum Command {
         #[arg(long, short = 'R', global = true)]
         repo: Option<String>,
     },
+
+    /// Repository rulesets.
+    ///
+    /// Listing is a read. Changing a ruleset's enforcement is a
+    /// protection-surface write: every `set` asks the operator for a fresh
+    /// biometric named for the exact ruleset and target state, and an open
+    /// vault window never satisfies it. No repository content moves, so
+    /// there is nothing a publication audit could review - the per-call
+    /// confirmation is the gate.
+    Ruleset {
+        #[command(subcommand)]
+        command: RulesetCommand,
+        /// Act for this OWNER/NAME instead of the current working tree.
+        #[arg(long, short = 'R', global = true)]
+        repo: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RulesetCommand {
+    /// List the repository's rulesets with their enforcement state.
+    ///
+    /// Read-only; the same authority as `api GET`.
+    List {
+        /// Print the raw API response instead of one line per ruleset.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Create a ruleset from a JSON spec file.
+    ///
+    /// The spec is an object with `name`, `target`, `enforcement` and a
+    /// non-empty `rules` array (the same shape `ruleset list --json` or
+    /// the REST API returns); server-owned fields are stripped before
+    /// the create call. Same per-call biometric gate as `set`.
+    Create {
+        /// Path to the ruleset JSON spec.
+        file: PathBuf,
+    },
+    /// Set a ruleset's enforcement to active, evaluate or disabled.
+    ///
+    /// A fresh biometric confirmation is requested on every call - the
+    /// open vault window never satisfies it - and the request is sent
+    /// only after it succeeds.
+    Set {
+        /// Ruleset id, as shown by `gitvault ruleset list`.
+        #[arg(long)]
+        id: u64,
+        /// New enforcement level.
+        #[arg(long, value_parser = ["active", "evaluate", "disabled"])]
+        enforcement: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -687,6 +738,7 @@ fn main() -> ExitCode {
         Command::Repo { command } => cmd_repo(cli.config.as_ref(), command),
         Command::Release { command, repo } => cmd_release(cli.config.as_ref(), command, repo),
         Command::Run { command, repo } => cmd_run(cli.config.as_ref(), command, repo),
+        Command::Ruleset { command, repo } => cmd_ruleset(cli.config.as_ref(), command, repo),
     };
 
     match result {
@@ -3220,7 +3272,8 @@ fn cmd_api(
         eprintln!(
             "gitvault: refusing unaudited publication via api: {reason}\n  \
              use the gated command instead: `gitvault pr create`, `gitvault pr merge`,\n  \
-             `gitvault release create`, or `git push` through the pre-push hook"
+             `gitvault release create`, `git push` through the pre-push hook,\n  \
+             or `gitvault ruleset set` for protection-surface changes"
         );
         return Ok(ExitCode::from(2));
     }
@@ -3790,6 +3843,170 @@ fn cmd_issue(
         }
     };
     emit(&cfg, &vault, req)
+}
+
+/// The only write path GitVault opens for protection-surface state. A
+/// ruleset set moves no content, so the publication audit has nothing to
+/// review - the gate is the operator confirming this exact change with a
+/// fresh biometric, and the open-vault window deliberately does not carry
+/// over: each `ruleset set` is authorized on its own.
+fn cmd_ruleset(
+    config: Option<&PathBuf>,
+    command: RulesetCommand,
+    repo: Option<String>,
+) -> anyhow::Result<ExitCode> {
+    let cfg = config::Config::load(config)?;
+    let vault = vault::Vault::open()?;
+    let slug = resolve_slug(repo)?;
+
+    match command {
+        RulesetCommand::List { json } => {
+            let req = get(
+                format!("/repos/{slug}/rulesets?includes_parents=false"),
+                slug.clone(),
+                None,
+            );
+            if json {
+                return emit(&cfg, &vault, req);
+            }
+            let raw = api::run_value(&cfg, &vault, &req)
+                .map_err(|err| anyhow::anyhow!("cannot list rulesets on {slug}: {err:#}"))?;
+            let rulesets: serde_json::Value = serde_json::from_str(&raw)
+                .context("ruleset listing returned an unreadable payload")?;
+            let Some(rows) = rulesets.as_array() else {
+                anyhow::bail!("ruleset listing was not an array")
+            };
+            for r in rows {
+                println!(
+                    "{}\t{}\t{}",
+                    r["id"].as_u64().unwrap_or_default(),
+                    r["name"].as_str().unwrap_or("(unnamed)"),
+                    r["enforcement"].as_str().unwrap_or("?"),
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        RulesetCommand::Create { file } => {
+            let raw_spec = std::fs::read_to_string(&file)
+                .with_context(|| format!("cannot read {}", file.display()))?;
+            let spec: serde_json::Value = serde_json::from_str(&raw_spec)
+                .with_context(|| format!("{} is not valid JSON", file.display()))?;
+            anyhow::ensure!(
+                spec.is_object(),
+                "{} must contain a JSON object",
+                file.display()
+            );
+            let name = spec["name"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("ruleset spec requires a string 'name'"))?;
+            let target = spec["target"].as_str().unwrap_or("branch");
+            let enforcement = spec["enforcement"].as_str().unwrap_or("active");
+            anyhow::ensure!(
+                matches!(enforcement, "disabled" | "evaluate" | "active"),
+                "ruleset enforcement must be disabled, evaluate or active, not '{enforcement}'"
+            );
+            anyhow::ensure!(
+                spec["rules"].as_array().is_some_and(|r| !r.is_empty()),
+                "ruleset spec requires a non-empty 'rules' array"
+            );
+            // Whitelisted fields only: server-owned keys in a spec fetched
+            // from another repository (id, node_id, source, _links, ...)
+            // never travel into the create body.
+            let mut body = serde_json::json!({
+                "name": name,
+                "target": target,
+                "enforcement": enforcement,
+                "rules": spec["rules"],
+                "bypass_actors": spec
+                    .get("bypass_actors")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([])),
+            });
+            if let Some(conditions) = spec.get("conditions").filter(|c| !c.is_null()) {
+                body["conditions"] = conditions.clone();
+            }
+            unlock::require_biometric(&format!(
+                "GitVault: confirm to create ruleset '{name}' on {slug} (enforcement: {enforcement})"
+            ))?;
+            let req = api::Request {
+                method: "POST".into(),
+                path: format!("/repos/{slug}/rulesets"),
+                target: api::Target::Repo(slug.clone()),
+                fields: vec![],
+                raw_fields: vec![],
+                headers: vec![],
+                body: Some(body.to_string()),
+                body_stream: None,
+                follow: false,
+                mutation: api::Mutation::OperatorConfirmed,
+                jq: None,
+                silent: true,
+            };
+            eprintln!("gitvault: creating ruleset '{name}' on {slug} (enforcement: {enforcement})");
+            let raw = api::run_value(&cfg, &vault, &req)
+                .map_err(|err| anyhow::anyhow!("ruleset create refused: {err:#}"))?;
+            let created: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+            println!(
+                "ruleset {} created: {} ({})",
+                created["id"].as_u64().unwrap_or_default(),
+                name,
+                created["enforcement"].as_str().unwrap_or("?")
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        RulesetCommand::Set { id, enforcement } => {
+            // Read first so the confirmation names the ruleset and the
+            // operator sees the before state - not just an id.
+            let read = get(format!("/repos/{slug}/rulesets/{id}"), slug.clone(), None);
+            let raw = api::run_value(&cfg, &vault, &read)
+                .map_err(|err| anyhow::anyhow!("cannot read ruleset {id} on {slug}: {err:#}"))?;
+            let ruleset: serde_json::Value = serde_json::from_str(&raw)
+                .with_context(|| format!("ruleset {id} returned an unreadable payload"))?;
+            let name = ruleset["name"].as_str().unwrap_or("(unnamed)");
+            let current = ruleset["enforcement"].as_str().unwrap_or("unknown");
+            if current == enforcement {
+                println!("ruleset {id} ({name}) is already {enforcement}");
+                return Ok(ExitCode::SUCCESS);
+            }
+            // Per-action authorization: a fresh biometric on every call,
+            // even while the vault window is open - a protection change is
+            // never inherited from an earlier unlock.
+            unlock::require_biometric(&format!(
+                "GitVault: confirm to set ruleset '{name}' ({id}) on {slug}: {current} -> {enforcement}"
+            ))?;
+            let req = api::Request {
+                method: "PATCH".into(),
+                path: format!("/repos/{slug}/rulesets/{id}"),
+                target: api::Target::Repo(slug.clone()),
+                fields: vec![],
+                raw_fields: vec![],
+                headers: vec![],
+                body: Some(
+                    serde_json::json!({
+                        "name": ruleset["name"],
+                        "target": ruleset["target"],
+                        "enforcement": enforcement,
+                        "bypass_actors": ruleset["bypass_actors"],
+                    })
+                    .to_string(),
+                ),
+                body_stream: None,
+                follow: false,
+                mutation: api::Mutation::OperatorConfirmed,
+                jq: None,
+                silent: true,
+            };
+            eprintln!("gitvault: {slug} ruleset {id} ({name}): {current} -> {enforcement}");
+            let raw = api::run_value(&cfg, &vault, &req)
+                .map_err(|err| anyhow::anyhow!("ruleset update refused: {err:#}"))?;
+            let updated: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+            println!(
+                "ruleset {id}: {}",
+                updated["enforcement"].as_str().unwrap_or(&enforcement)
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+    }
 }
 
 fn cmd_repo(config: Option<&PathBuf>, command: RepoCommand) -> anyhow::Result<ExitCode> {

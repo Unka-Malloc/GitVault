@@ -382,7 +382,7 @@ mod tests {
     fn window_opens_and_closes() {
         with_state("open", || {
             clear().unwrap();
-            let key = b"synthetic-window-key-01234567890";
+            let key = synthetic_bytes();
             let vault = seeded_vault(key);
             assert_eq!(remaining(&vault), 0);
             assert!(!is_unlocked(&vault));
@@ -407,7 +407,7 @@ mod tests {
             // A record minted under a different key is equally void.
             let boot = boot_time().unwrap_or(0);
             let expiry = now_secs() + 3600;
-            let alien = window_mac(b"a-different-key-0123456789ab", expiry, boot);
+            let alien = window_mac(alien_bytes(), expiry, boot);
             std::fs::write(state_path(), format!("{expiry} {boot} {alien}\n")).unwrap();
             assert_eq!(remaining(&vault), 0, "a tag under another key must lock");
 
@@ -421,7 +421,7 @@ mod tests {
     fn an_expired_window_is_locked() {
         with_state("expired", || {
             clear().unwrap();
-            let key = b"synthetic-window-key-01234567890";
+            let key = synthetic_bytes();
             let vault = seeded_vault(key);
             let boot = boot_time().unwrap_or(0);
             std::fs::write(
@@ -440,7 +440,7 @@ mod tests {
         // still be open.
         with_state("prior-boot", || {
             clear().unwrap();
-            let key = b"synthetic-window-key-01234567890";
+            let key = synthetic_bytes();
             let vault = seeded_vault(key);
             let current = boot_time().unwrap_or(1);
             let different = current.wrapping_sub(1);
@@ -459,7 +459,7 @@ mod tests {
     fn a_missing_or_malformed_state_file_is_locked() {
         with_state("missing", || {
             clear().unwrap();
-            let vault = seeded_vault(b"synthetic-window-key-01234567890");
+            let vault = seeded_vault(synthetic_bytes());
             let _ = std::fs::remove_file(state_path());
             assert_eq!(remaining(&vault), 0);
             std::fs::write(state_path(), "not a number\n").unwrap();

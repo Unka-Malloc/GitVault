@@ -202,6 +202,13 @@ pub enum Mutation {
     /// `release:deleted` even for drafts and no atomic draft-only
     /// precondition exists, so a failed draft stays for the operator.
     Containment,
+    /// A protection-surface write the operator confirmed with a fresh
+    /// biometric at the moment of the call - never satisfied by an open
+    /// vault window. No repository content moves, so there is nothing a
+    /// publication audit could review; the per-invocation confirmation
+    /// is the entire gate, scoped to the exact ruleset and enforcement
+    /// level named in the prompt.
+    OperatorConfirmed,
 }
 
 pub struct Request {
