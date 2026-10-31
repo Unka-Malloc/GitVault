@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.1
 
 - `gitvault objection file --finding` now searches the standing set - fresh
   findings plus the blockers a previous verdict carried into this head - so a
@@ -8,6 +8,9 @@
   reports. The new `--fingerprint HEX` names one blocker by its evidence
   fingerprint prefix when a location matches more than one, and an ambiguous
   location refuses with each candidate's fingerprint instead of picking one.
+
+## 0.3.0
+
 - `gitvault repo` gains `create OWNER/NAME` and `delete OWNER/NAME`. Both are
   operator-confirmed writes: a fresh biometric prompt names the exact slug on
   every call and an open vault window never satisfies it; `create` also binds
@@ -18,8 +21,6 @@
   account itself - `/user/repos` would otherwise name the repository after
   the authenticated account. New repositories are private unless `--public`
   is given.
-
-## 0.3.0
 
 - `gitvault update` performs the whole deploy in one pass: builds the
   Probator checkout (`--probator`) and, when the running binary lives under
