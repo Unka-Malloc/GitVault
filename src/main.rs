@@ -292,6 +292,11 @@ enum Command {
     },
 
     /// Repositories.
+    ///
+    /// Viewing and listing are reads. `create` and `delete` change which
+    /// repositories exist: there is no candidate content a publication audit
+    /// could review, so each asks the operator for a fresh biometric naming
+    /// the exact slug - an open vault window never satisfies it.
     Repo {
         #[command(subcommand)]
         command: RepoCommand,
@@ -525,6 +530,41 @@ enum RepoCommand {
     },
     /// Show the default branch.
     DefaultBranch { slug: Option<String> },
+    /// Create a repository under an owner.
+    ///
+    /// The slug decides both the endpoint and the acting identity: an
+    /// organisation owner creates through `/orgs/{owner}/repos`; a personal
+    /// owner creates through `/user/repos`, and only when the owner is the
+    /// resolved account itself - the API would silently name the repository
+    /// after the authenticated account otherwise. A fresh biometric names
+    /// the exact slug and the confirmed body digest on every call; the open
+    /// vault window never satisfies it.
+    Create {
+        /// OWNER/NAME the repository will have.
+        slug: String,
+        /// Make the repository public; it is private unless this is given.
+        #[arg(long, conflicts_with = "private")]
+        public: bool,
+        /// Make the repository private (the default).
+        #[arg(long)]
+        private: bool,
+        /// Short description for the repository.
+        #[arg(long)]
+        description: Option<String>,
+        /// Print the raw API response instead of the created slug.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Permanently delete a repository.
+    ///
+    /// Deletion destroys issues, pull requests, releases and settings along
+    /// with the repository, and there is no draft state a publication audit
+    /// could review - the gate is a fresh biometric naming the exact slug on
+    /// every call; the open vault window never satisfies it.
+    Delete {
+        /// OWNER/NAME to delete; spelled out, never inferred from a checkout.
+        slug: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -4177,12 +4217,36 @@ fn cmd_issue(
     emit(&cfg, &vault, req)
 }
 
-/// A short digest of the exact request body the biometric prompt confirms,
-/// so the approval is bound to the bytes sent rather than only to a name.
-fn ruleset_digest(body: &str) -> String {
+/// The full digest of the exact request body the biometric prompt confirms,
+/// so the approval is bound to the bytes sent rather than only to a name. A
+/// truncated digest would leave a crafted body room to collide under the
+/// displayed token, so all 32 bytes are rendered.
+fn body_digest(body: &str) -> String {
     use sha2::Digest;
     let digest = sha2::Sha256::digest(body.as_bytes());
-    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The protection fields the operator's confirmation covers: drift on any
+/// of them between the shown state and the pre-write re-read refuses the
+/// update, enforcement included — a concurrent flip of the transition's own
+/// origin is unseen state just like a rules change.
+const RULESET_CONFIRMED_FIELDS: [&str; 6] = [
+    "name",
+    "target",
+    "enforcement",
+    "conditions",
+    "rules",
+    "bypass_actors",
+];
+
+/// The first confirmed field that changed between the state the operator
+/// was shown and the state re-read just before writing, if any did.
+fn ruleset_drifted(shown: &serde_json::Value, fresh: &serde_json::Value) -> Option<&'static str> {
+    RULESET_CONFIRMED_FIELDS
+        .iter()
+        .copied()
+        .find(|field| shown[*field] != fresh[*field])
 }
 
 /// The human-readable shape of a ruleset body: which protections and how
@@ -4296,7 +4360,7 @@ fn cmd_ruleset(
             unlock::require_biometric(&format!(
                 "GitVault: confirm to create ruleset '{name}' on {slug}: target {target}, enforcement {enforcement}, {}, body sha256:{}",
                 ruleset_shape(&body),
-                ruleset_digest(&body_bytes),
+                body_digest(&body_bytes),
             ))?;
             let req = api::Request {
                 method: "POST".into(),
@@ -4356,7 +4420,7 @@ fn cmd_ruleset(
             unlock::require_biometric(&format!(
                 "GitVault: confirm to set ruleset '{name}' ({id}) on {slug}: {current} -> {enforcement} ({}, body sha256:{})",
                 ruleset_shape(&body),
-                ruleset_digest(&body_bytes),
+                body_digest(&body_bytes),
             ))?;
             // Re-read immediately before writing: the operator approved an
             // enforcement transition on the state it was shown, so a
@@ -4366,9 +4430,8 @@ fn cmd_ruleset(
                 .map_err(|err| anyhow::anyhow!("cannot re-read ruleset {id} on {slug}: {err:#}"))?;
             let fresh: serde_json::Value = serde_json::from_str(&fresh_raw)
                 .with_context(|| format!("ruleset {id} re-read returned an unreadable payload"))?;
-            for field in ["name", "target", "conditions", "rules", "bypass_actors"] {
-                anyhow::ensure!(
-                    fresh[field] == ruleset[field],
+            if let Some(field) = ruleset_drifted(&ruleset, &fresh) {
+                anyhow::bail!(
                     "ruleset {id} changed under the confirmation ({field}); refusing to overwrite unseen state"
                 );
             }
@@ -4500,8 +4563,166 @@ fn cmd_repo(config: Option<&PathBuf>, command: RepoCommand) -> anyhow::Result<Ex
                 Some(".default_branch".into()),
             )
         }
+        RepoCommand::Create {
+            slug,
+            public,
+            description,
+            json,
+            ..
+        } => return cmd_repo_create(&cfg, &vault, &slug, public, description, json),
+        RepoCommand::Delete { slug } => return cmd_repo_delete(&cfg, &vault, &slug),
     };
     emit(&cfg, &vault, req)
+}
+
+/// Split a spelled-out `OWNER/NAME` into its parts.
+///
+/// Repository create and delete take the slug explicitly rather than
+/// discovering it, because the biometric prompt names exactly this string.
+/// Its shape is checked before any credential or confirmation is spent on
+/// it: one slash, no empty side, and only GitHub's name characters - which
+/// also keeps the text safe to splice into a request path.
+fn parse_repo_slug(slug: &str) -> anyhow::Result<(&str, &str)> {
+    let (owner, name) = slug
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("expected OWNER/NAME, got '{slug}'"))?;
+    let valid = |part: &str| {
+        !part.is_empty()
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    anyhow::ensure!(
+        valid(owner) && valid(name) && !name.contains('/'),
+        "expected OWNER/NAME with GitHub's name characters, got '{slug}'"
+    );
+    Ok((owner, name))
+}
+
+/// Create a repository under an organisation or the resolved account itself.
+///
+/// The endpoint differs by owner type (the same problem `repo list` solves
+/// with its `/users/{owner}` probe): `/orgs/{owner}/repos` answers 404 for a
+/// personal account, and `/user/repos` names the repository after the
+/// *authenticated* account, so a personal owner must be the account the
+/// routing resolved - otherwise the repository would exist under a different
+/// owner than the slug the operator confirmed.
+fn cmd_repo_create(
+    cfg: &config::Config,
+    vault: &vault::Vault,
+    slug: &str,
+    public: bool,
+    description: Option<String>,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    let (owner, name) = parse_repo_slug(slug)?;
+    let visibility = if public { "public" } else { "private" };
+
+    let probe = get(
+        format!("/users/{owner}"),
+        format!("{owner}/.github"),
+        Some(".type".into()),
+    );
+    let kind = api::run_value(cfg, vault, &probe)
+        .map_err(|err| anyhow::anyhow!("cannot resolve owner '{owner}': {err:#}"))?;
+    let path = match kind.trim() {
+        "Organization" => format!("/orgs/{owner}/repos"),
+        _ => {
+            let outcome = identity::resolve(cfg, &git::Repo::for_slug(slug), true)?;
+            let account = outcome.account.as_deref().unwrap_or_default();
+            anyhow::ensure!(
+                account.eq_ignore_ascii_case(owner),
+                "a personal repository can only be created under the owning \
+                 account itself: '{slug}' resolves to account '{account}'"
+            );
+            "/user/repos".to_string()
+        }
+    };
+
+    let mut body = serde_json::json!({
+        "name": name,
+        "private": !public,
+    });
+    if let Some(description) = description {
+        body["description"] = description.into();
+    }
+    // Per-call authorization: the prompt names the exact repository being
+    // created and binds the confirmation to the bytes sent; an open vault
+    // window never satisfies it.
+    let body_bytes = body.to_string();
+    eprintln!("gitvault: creating repository {slug} ({visibility})");
+    unlock::require_biometric(&format!(
+        "GitVault: confirm to create repository {slug} ({visibility}), body sha256:{}",
+        body_digest(&body_bytes),
+    ))?;
+    let req = api::Request {
+        method: "POST".into(),
+        path,
+        target: api::Target::Repo(slug.to_string()),
+        fields: vec![],
+        raw_fields: vec![],
+        headers: vec![],
+        body: Some(body_bytes),
+        body_stream: None,
+        follow: false,
+        mutation: api::Mutation::OperatorConfirmed,
+        jq: if json {
+            None
+        } else {
+            Some(".full_name".into())
+        },
+        silent: false,
+    };
+    emit(cfg, vault, req)
+}
+
+/// Permanently delete a repository.
+///
+/// No draft or revertable state exists a publication audit could review, so
+/// the gate is the operator confirming this exact slug with a fresh
+/// biometric on every call - never inherited from an open window.
+fn cmd_repo_delete(
+    cfg: &config::Config,
+    vault: &vault::Vault,
+    slug: &str,
+) -> anyhow::Result<ExitCode> {
+    let _ = parse_repo_slug(slug)?;
+    // Open the window before the named confirmation so a locked vault asks
+    // in the same order `repo create` does: authenticate the account first,
+    // then confirm this exact repository. Routing is enforced again by the
+    // broker at the credential moment; this resolve only labels the prompt.
+    let outcome = identity::resolve(cfg, &git::Repo::for_slug(slug), true)?;
+    if let Some(account) = outcome.account.as_deref() {
+        unlock::ensure_open(
+            vault,
+            &format!("GitVault: confirm to authenticate {account} to the GitHub API"),
+            false,
+            None,
+        )?;
+    }
+    eprintln!("gitvault: permanently deleting repository {slug}");
+    unlock::require_biometric(&format!(
+        "GitVault: confirm to permanently delete repository {slug}"
+    ))?;
+    let req = api::Request {
+        method: "DELETE".into(),
+        path: format!("/repos/{slug}"),
+        target: api::Target::Repo(slug.to_string()),
+        fields: vec![],
+        raw_fields: vec![],
+        headers: vec![],
+        body: None,
+        body_stream: None,
+        follow: false,
+        mutation: api::Mutation::OperatorConfirmed,
+        jq: None,
+        silent: true,
+    };
+    let code = api::run(cfg, vault, &req)?;
+    if code == 0 {
+        println!("repository {slug} deleted");
+    }
+    Ok(ExitCode::from(code as u8))
 }
 
 /// Refuse a release whose tag already exists at a different commit. For a new
@@ -6321,8 +6542,9 @@ mod tests {
     use super::{
         MAX_ASSET_BYTES, MAX_RELEASE_ASSETS, branch_for_api, check_release_assets,
         dispatcher_script, fetch_remote_ref, hook_stub_script, local_pr_base, outgoing_push_stdin,
-        parse_push_args, publication_surface, push_plan, release_staging_root, remote_mirrors,
-        sha256_file, sha256_reader, stage_release_assets, verify_remote_tag,
+        parse_push_args, parse_repo_slug, publication_surface, push_plan, release_staging_root,
+        remote_mirrors, ruleset_drifted, sha256_file, sha256_reader, stage_release_assets,
+        verify_remote_tag,
     };
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -6365,6 +6587,33 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// The slug the biometric prompt names is checked before a credential or
+    /// confirmation is spent on it: exactly one slash, no empty side, only
+    /// GitHub's name characters.
+    #[test]
+    fn a_repo_slug_is_exactly_owner_slash_name() {
+        assert_eq!(
+            parse_repo_slug("LicoLand/LicoUp").unwrap(),
+            ("LicoLand", "LicoUp")
+        );
+        assert_eq!(
+            parse_repo_slug("my-org_1/my.repo").unwrap(),
+            ("my-org_1", "my.repo")
+        );
+        for bad in [
+            "noslash",
+            "owner/",
+            "/name",
+            "a/b/c",
+            "owner name/repo",
+            "owner/repo name",
+            "owner/repo.git/extra",
+            "",
+        ] {
+            assert!(parse_repo_slug(bad).is_err(), "'{bad}' must be refused");
+        }
     }
 
     /// A remote-prefixed base keeps the slashes that belong to the branch:
@@ -7816,5 +8065,33 @@ mod tests {
             2
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_ruleset_changed_under_the_confirmation_is_refused() {
+        let shown = serde_json::json!({
+            "name": "protect-main",
+            "target": "branch",
+            "enforcement": "evaluate",
+            "conditions": {"ref_name": {"include": ["refs/heads/main"], "exclude": []}},
+            "rules": [{"type": "deletion"}],
+            "bypass_actors": [],
+        });
+        // An untouched re-read drifts on nothing, enforcement included.
+        let same = shown.clone();
+        assert_eq!(ruleset_drifted(&shown, &same), None);
+        // A concurrent flip of the transition's own origin is drift: the
+        // operator confirmed "evaluate -> active", not "active -> active".
+        let mut flipped = shown.clone();
+        flipped["enforcement"] = serde_json::json!("active");
+        assert_eq!(ruleset_drifted(&shown, &flipped), Some("enforcement"));
+        // And a stronger rules list swapped in behind the prompt is too.
+        let mut weakened = shown.clone();
+        weakened["rules"] = serde_json::json!([{"type": "deletion"}, {"type": "non_fast_forward"}]);
+        assert_eq!(ruleset_drifted(&shown, &weakened), Some("rules"));
+        let mut bypassed = shown.clone();
+        bypassed["bypass_actors"] =
+            serde_json::json!([{"actor_id": 5, "actor_type": "Team", "bypass_mode": "always"}]);
+        assert_eq!(ruleset_drifted(&shown, &bypassed), Some("bypass_actors"));
     }
 }

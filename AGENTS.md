@@ -149,7 +149,11 @@ again after the audit; a moved head refuses before the POST, and the created
 request's reported head is checked against the audited commit. `release
 create` likewise reads the remote tag it will publish. These are read-only
 credential uses, not the publication itself. `api`/`ssh`/`config sign`/
-`objection rule` prompt at use time.
+`objection rule` prompt at use time. `ruleset create`/`set` and
+`repo create`/`repo delete` ask for a fresh biometric naming the exact
+object and outcome on every call (body-bearing requests also bind the
+body's digest into the prompt); an open vault window never satisfies
+them.
 
 `gitvault update` runs the whole deploy as one command: it builds the
 Probator checkout (`--probator`) and the GitVault checkout (`--self-src`,

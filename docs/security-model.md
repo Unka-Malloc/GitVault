@@ -280,9 +280,20 @@ read-only: every mutating method refuses at the credential moment, because
 any repository write - comments, labels, state flips included - emits
 events that can trigger privileged workflows outside the audited path. The
 only mutating requests the broker honors are marked by commands whose own
-audit already ran (`pr create/merge`, `release create`) or by narrowly
+audit already ran (`pr create/merge`, `release create`), by narrowly
 justified removals of unaudited server-side state (moved-head pull-request
-cleanup).
+cleanup), or by an operator confirmation the open window cannot satisfy:
+`ruleset create`, `ruleset set`, `repo create` and `repo delete` change
+server-side protection or repository existence - no candidate content
+moves, so there is nothing a publication audit could review. Each is minted
+only after a fresh biometric confirmation naming the exact object and
+outcome (the ruleset and its enforcement, or the repository being created
+or deleted), requested on every call regardless of window state; where the
+request carries a body the prompt also binds its digest, so the confirmed
+bytes are the bytes sent. The per-call confirmation is the entire gate.
+`repo create` routes by the slug's owner through the same identity rules as
+any other repository-scoped request, so an unlisted owner is refused rather
+than attributed to a default account.
 
 A release transaction that fails past draft creation deliberately leaves
 the draft - and any assets uploaded before the failure - unpublished on

@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- `gitvault repo` gains `create OWNER/NAME` and `delete OWNER/NAME`. Both are
+  operator-confirmed writes: a fresh biometric prompt names the exact slug on
+  every call and an open vault window never satisfies it; `create` also binds
+  the request body's digest into the prompt. `create` routes the slug's owner
+  through the same identity rules as any other request (an unlisted owner is
+  refused), picks `/orgs/{owner}/repos` for an organisation or `/user/repos`
+  for a personal owner, and refuses a personal owner that is not the resolved
+  account itself - `/user/repos` would otherwise name the repository after
+  the authenticated account. New repositories are private unless `--public`
+  is given.
+
 ## 0.3.0
 
 - `gitvault update` performs the whole deploy in one pass: builds the
