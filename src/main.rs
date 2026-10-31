@@ -403,17 +403,25 @@ enum RulesetCommand {
 enum ObjectionCommand {
     /// File an objection against a finding (or a whole non-pass verdict).
     ///
-    /// For a finding objection, `--finding FILE[:LINE]` locates the newest
-    /// blocking finding in the checker's latest report and pins its evidence
-    /// fingerprint. `--verdict` instead objects to a non-pass outcome (for
-    /// example an `incomplete`) and binds the ruling to the current head.
+    /// For a finding objection, `--finding FILE[:LINE]` locates one blocking
+    /// finding in the checker's latest report - fresh findings and blockers
+    /// a previous verdict carried into this head alike - and pins its
+    /// evidence fingerprint. `--fingerprint HEX` names the finding by that
+    /// fingerprint instead, for locations that match more than one blocker.
+    /// `--verdict` instead objects to a non-pass outcome (for example an
+    /// `incomplete`) and binds the ruling to the current head.
     File {
         /// Checker contract name, e.g. money-saver.
         #[arg(long)]
         checker: String,
-        /// Finding location in `FILE[:LINE]` form.
-        #[arg(long, conflicts_with = "verdict")]
+        /// Finding location in `FILE[:LINE]` form; searches fresh and
+        /// carried findings alike.
+        #[arg(long, conflicts_with_all = ["verdict", "fingerprint"])]
         finding: Option<String>,
+        /// Finding's evidence fingerprint (sha256 prefix, at least 8 hex
+        /// characters) when a location names more than one blocker.
+        #[arg(long, conflicts_with_all = ["verdict", "finding"])]
+        fingerprint: Option<String>,
         /// Object to the checker's whole non-pass verdict for this head.
         #[arg(long)]
         verdict: bool,
@@ -6326,6 +6334,7 @@ fn cmd_objection(command: ObjectionCommand) -> anyhow::Result<ExitCode> {
         ObjectionCommand::File {
             checker,
             finding,
+            fingerprint: fingerprint_spec,
             verdict,
             reason,
             directory,
@@ -6360,35 +6369,25 @@ fn cmd_objection(command: ObjectionCommand) -> anyhow::Result<ExitCode> {
                     filed_at: jiff::Timestamp::now().to_string(),
                 }
             } else {
-                let spec = finding
-                    .as_deref()
-                    .context("--finding FILE[:LINE] or --verdict is required")?;
-                let (file, line) = match spec.rsplit_once(':') {
-                    Some((f, l)) if l.chars().all(|c| c.is_ascii_digit()) => {
-                        (f.to_string(), l.parse::<u64>().ok())
-                    }
-                    _ => (spec.to_string(), None),
-                };
+                anyhow::ensure!(
+                    finding.is_some() || fingerprint_spec.is_some(),
+                    "--finding FILE[:LINE] or --fingerprint HEX is required"
+                );
                 let report = latest_report(&checker)
                     .with_context(|| format!("no report.json for checker '{checker}'"))?;
-                let findings = report["findings"].as_array().cloned().unwrap_or_default();
-                let hit = findings
-                    .iter()
-                    .find(|f| {
-                        f["severity"].as_str() == Some("blocking")
-                            && f["file"].as_str() == Some(file.as_str())
-                            && line.is_none_or(|l| f["line"].as_u64() == Some(l))
-                    })
-                    .with_context(|| {
-                        format!(
-                            "no blocking finding at {file}{} in the latest {checker} report",
-                            line.map(|l| format!(":{l}")).unwrap_or_default()
-                        )
-                    })?;
+                let candidates = blocking_findings(&report);
+                let hit = locate_finding(
+                    &candidates,
+                    &checker,
+                    finding.as_deref(),
+                    fingerprint_spec.as_deref(),
+                )?;
+                let file = hit["file"].as_str().unwrap_or_default().to_string();
+                let line = hit["line"].as_u64();
                 let fingerprint = objection::fingerprint(
                     &checker,
                     &file,
-                    hit["line"].as_u64().unwrap_or(0),
+                    line.unwrap_or(0),
                     hit["evidence"].as_str().unwrap_or(""),
                 );
                 objection::Pending {
@@ -6397,7 +6396,7 @@ fn cmd_objection(command: ObjectionCommand) -> anyhow::Result<ExitCode> {
                     checker: checker.clone(),
                     kind: "finding".into(),
                     file,
-                    line: hit["line"].as_u64(),
+                    line,
                     fingerprint: Some(fingerprint),
                     head,
                     reason: reason.clone(),
@@ -6515,6 +6514,130 @@ fn cmd_objection(command: ObjectionCommand) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// The blocking findings an objection may target: the report's fresh
+/// findings plus the blockers a previous verdict carried into this head,
+/// deduplicated by location and evidence. This is the same standing set the
+/// engine merges before it applies rulings, so an objection filed here
+/// names the same finding the gate will evaluate.
+fn blocking_findings(report: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for key in ["findings", "carried_findings"] {
+        for finding in report[key].as_array().into_iter().flatten() {
+            if finding["severity"].as_str() != Some("blocking") {
+                continue;
+            }
+            let duplicate = out.iter().any(|existing: &serde_json::Value| {
+                existing["file"] == finding["file"]
+                    && existing["line"] == finding["line"]
+                    && existing["evidence"] == finding["evidence"]
+            });
+            if !duplicate {
+                out.push(finding.clone());
+            }
+        }
+    }
+    out
+}
+
+/// One candidate's fingerprint, abbreviated for display to the operator
+/// choosing between same-location blockers.
+fn finding_fingerprint_short(checker: &str, finding: &serde_json::Value) -> String {
+    let full = objection::fingerprint(
+        checker,
+        finding["file"].as_str().unwrap_or(""),
+        finding["line"].as_u64().unwrap_or(0),
+        finding["evidence"].as_str().unwrap_or(""),
+    );
+    full[..12].to_string()
+}
+
+/// Locate the single blocking finding the objection names, either by
+/// location (`FILE[:LINE]`) or by its evidence fingerprint prefix. Both the
+/// fresh and the carried surface of the latest report are searched: a
+/// blocker the previous verdict anchored to this head must be objectionable
+/// by the same location the gate reports, and a location shared by two
+/// distinct blockers is refused with each candidate's fingerprint so the
+/// operator can narrow the choice instead of silently waiving one.
+fn locate_finding<'a>(
+    candidates: &'a [serde_json::Value],
+    checker: &str,
+    spec: Option<&str>,
+    fingerprint: Option<&str>,
+) -> anyhow::Result<&'a serde_json::Value> {
+    if let Some(fp) = fingerprint {
+        let needle = fp.trim().to_ascii_lowercase();
+        anyhow::ensure!(
+            needle.len() >= 8 && needle.chars().all(|c| c.is_ascii_hexdigit()),
+            "--fingerprint needs at least 8 hexadecimal characters"
+        );
+        let matches: Vec<&serde_json::Value> = candidates
+            .iter()
+            .filter(|f| {
+                objection::fingerprint(
+                    checker,
+                    f["file"].as_str().unwrap_or(""),
+                    f["line"].as_u64().unwrap_or(0),
+                    f["evidence"].as_str().unwrap_or(""),
+                )
+                .starts_with(&needle)
+            })
+            .collect();
+        return match matches.as_slice() {
+            [] => anyhow::bail!(
+                "no blocking finding with fingerprint '{needle}' in the latest \
+                 {checker} report (fresh or carried)"
+            ),
+            [one] => Ok(*one),
+            many => anyhow::bail!(
+                "fingerprint prefix '{needle}' names {} blocking findings in the \
+                 latest {checker} report; give a longer prefix",
+                many.len()
+            ),
+        };
+    }
+    let spec = spec.context("--finding FILE[:LINE] or --fingerprint HEX is required")?;
+    let (file, line) = match spec.rsplit_once(':') {
+        Some((f, l)) if l.chars().all(|c| c.is_ascii_digit()) => {
+            (f.to_string(), l.parse::<u64>().ok())
+        }
+        _ => (spec.to_string(), None),
+    };
+    let matches: Vec<&serde_json::Value> = candidates
+        .iter()
+        .filter(|f| {
+            f["file"].as_str() == Some(file.as_str())
+                && line.is_none_or(|l| f["line"].as_u64() == Some(l))
+        })
+        .collect();
+    match matches.as_slice() {
+        [] => anyhow::bail!(
+            "no blocking finding at {file}{} in the latest {checker} report \
+             (fresh or carried)",
+            line.map(|l| format!(":{l}")).unwrap_or_default()
+        ),
+        [one] => Ok(*one),
+        many => {
+            let list = many
+                .iter()
+                .map(|f| {
+                    format!(
+                        "  sha256:{}  {}:{}",
+                        finding_fingerprint_short(checker, f),
+                        f["file"].as_str().unwrap_or(""),
+                        f["line"].as_u64().unwrap_or(0)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            anyhow::bail!(
+                "'{spec}' names {} blocking findings in the latest {checker} report;\n\
+                 narrow one with --fingerprint:\n{list}",
+                many.len()
+            )
+        }
+    }
+}
+
 /// A checker's newest report.json under the engine's profile run history.
 /// The root comes from the same armed-aware resolver as the engine child's
 /// data root, so an objection always binds the report the engine wrote.
@@ -6540,11 +6663,11 @@ fn latest_report(checker: &str) -> Option<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_ASSET_BYTES, MAX_RELEASE_ASSETS, branch_for_api, check_release_assets,
-        dispatcher_script, fetch_remote_ref, hook_stub_script, local_pr_base, outgoing_push_stdin,
-        parse_push_args, parse_repo_slug, publication_surface, push_plan, release_staging_root,
-        remote_mirrors, ruleset_drifted, sha256_file, sha256_reader, stage_release_assets,
-        verify_remote_tag,
+        MAX_ASSET_BYTES, MAX_RELEASE_ASSETS, blocking_findings, branch_for_api,
+        check_release_assets, dispatcher_script, fetch_remote_ref, hook_stub_script, local_pr_base,
+        locate_finding, outgoing_push_stdin, parse_push_args, parse_repo_slug, publication_surface,
+        push_plan, release_staging_root, remote_mirrors, ruleset_drifted, sha256_file,
+        sha256_reader, stage_release_assets, verify_remote_tag,
     };
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -6613,6 +6736,71 @@ mod tests {
             "",
         ] {
             assert!(parse_repo_slug(bad).is_err(), "'{bad}' must be refused");
+        }
+    }
+
+    /// An objection can target a blocker the previous verdict carried into
+    /// this head: the search surface is the standing set - fresh findings
+    /// plus carried blockers, deduplicated by location and evidence.
+    #[test]
+    fn a_carried_blocker_is_objectionable_by_location_or_fingerprint() {
+        use serde_json::json;
+        let report = json!({
+            "findings": [
+                {"severity": "blocking", "file": "src/a.rs", "line": 10, "evidence": "fresh one"},
+                {"severity": "advisory", "file": "src/b.rs", "line": 2, "evidence": "not blocking"}
+            ],
+            "carried_findings": [
+                {"severity": "blocking", "file": "src/b.rs", "line": 20, "evidence": "carried one"},
+                {"severity": "blocking", "file": "src/a.rs", "line": 10, "evidence": "fresh one"}
+            ]
+        });
+        let candidates = blocking_findings(&report);
+        // Advisory rows never surface, and a carried row identical to a fresh
+        // one is not double-counted: 1 fresh-blocking + 1 carried = 2.
+        assert_eq!(candidates.len(), 2);
+
+        // Location match reaches the carried blocker.
+        let hit = locate_finding(&candidates, "c", Some("src/b.rs:20"), None).unwrap();
+        assert_eq!(hit["evidence"].as_str(), Some("carried one"));
+
+        // Fingerprint match reaches it too, by prefix.
+        let fp = crate::objection::fingerprint("c", "src/b.rs", 20, "carried one");
+        let hit = locate_finding(&candidates, "c", None, Some(&fp[..16])).unwrap();
+        assert_eq!(hit["line"].as_u64(), Some(20));
+
+        // What exists nowhere is refused on both surfaces.
+        assert!(locate_finding(&candidates, "c", Some("src/z.rs:1"), None).is_err());
+        assert!(locate_finding(&candidates, "c", None, Some("deadbeef")).is_err());
+        // Too-short and non-hex prefixes are refused, never prefix-matched.
+        assert!(locate_finding(&candidates, "c", None, Some("ab")).is_err());
+        assert!(locate_finding(&candidates, "c", None, Some("zzzzzzzz")).is_err());
+    }
+
+    /// Two distinct blockers may share a file:line - a carried one whose
+    /// evidence drifted and a fresh one. The location alone cannot choose;
+    /// the refusal names each candidate's fingerprint for narrowing.
+    #[test]
+    fn an_ambiguous_location_is_refused_with_fingerprints() {
+        use serde_json::json;
+        let report = json!({
+            "findings": [
+                {"severity": "blocking", "file": "src/a.rs", "line": 10, "evidence": "new wording"}
+            ],
+            "carried_findings": [
+                {"severity": "blocking", "file": "src/a.rs", "line": 10, "evidence": "old wording"}
+            ]
+        });
+        let candidates = blocking_findings(&report);
+        let err = locate_finding(&candidates, "c", Some("src/a.rs:10"), None).unwrap_err();
+        let text = format!("{err}");
+        assert!(text.contains("--fingerprint"), "{text}");
+        for evidence in ["new wording", "old wording"] {
+            let fp = crate::objection::fingerprint("c", "src/a.rs", 10, evidence);
+            assert!(text.contains(&fp[..12]), "{text}");
+            // And the offered fingerprint resolves that blocker alone.
+            let hit = locate_finding(&candidates, "c", None, Some(&fp[..16])).unwrap();
+            assert_eq!(hit["evidence"].as_str(), Some(evidence));
         }
     }
 

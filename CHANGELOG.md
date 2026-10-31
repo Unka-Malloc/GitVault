@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `gitvault objection file --finding` now searches the standing set - fresh
+  findings plus the blockers a previous verdict carried into this head - so a
+  carried finding is objectionable by the same `FILE[:LINE]` the gate
+  reports. The new `--fingerprint HEX` names one blocker by its evidence
+  fingerprint prefix when a location matches more than one, and an ambiguous
+  location refuses with each candidate's fingerprint instead of picking one.
 - `gitvault repo` gains `create OWNER/NAME` and `delete OWNER/NAME`. Both are
   operator-confirmed writes: a fresh biometric prompt names the exact slug on
   every call and an open vault window never satisfies it; `create` also binds
