@@ -47,6 +47,12 @@ evaluate(context, policy, reason)
 exit(0)
 
 func evaluate(_ context: LAContext, _ policy: LAPolicy, _ reason: String) {
+    // How long a prompt may sit unanswered before it reads as "nobody is
+    // there". An expired prompt is a REFUSAL, never an approval, so a bound
+    // cannot grant anything: it only converts a hung caller - an unattended
+    // agent stalled on a fingerprint nobody will ever give - into a clean
+    // failure it can report.
+    let promptWindow: DispatchTimeInterval = .seconds(120)
     let semaphore = DispatchSemaphore(value: 0)
     var ok = false
     var failure: String?
@@ -56,9 +62,16 @@ func evaluate(_ context: LAContext, _ policy: LAPolicy, _ reason: String) {
         failure = err?.localizedDescription
         semaphore.signal()
     }
-    // The prompt is modal; wait for the human. A timeout here would be a security
-    // hole, so there is none.
-    semaphore.wait()
+    if semaphore.wait(timeout: .now() + promptWindow) == .timedOut {
+        // Cancel the modal UI and let the evaluation callback settle before
+        // exiting, so the prompt does not linger for a dead caller.
+        context.invalidate()
+        _ = semaphore.wait(timeout: .now() + .seconds(5))
+        FileHandle.standardError.write(
+            "touchid: not confirmed: no answer within the prompt window\n"
+                .data(using: .utf8)!)
+        exit(1)
+    }
 
     if !ok {
         FileHandle.standardError.write(
