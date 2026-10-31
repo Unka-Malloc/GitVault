@@ -4177,6 +4177,38 @@ fn cmd_issue(
     emit(&cfg, &vault, req)
 }
 
+/// A short digest of the exact request body the biometric prompt confirms,
+/// so the approval is bound to the bytes sent rather than only to a name.
+fn ruleset_digest(body: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(body.as_bytes());
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The human-readable shape of a ruleset body: which protections and how
+/// many bypass actors the confirmed bytes actually create or keep.
+fn ruleset_shape(body: &serde_json::Value) -> String {
+    let rule_types: Vec<&str> = body["rules"]
+        .as_array()
+        .map(|rules| {
+            rules
+                .iter()
+                .map(|rule| rule["type"].as_str().unwrap_or("?"))
+                .collect()
+        })
+        .unwrap_or_default();
+    let bypass = body["bypass_actors"]
+        .as_array()
+        .map(|actors| actors.len())
+        .unwrap_or(0);
+    format!(
+        "{} rule(s) [{}], {} bypass actor(s)",
+        rule_types.len(),
+        rule_types.join(","),
+        bypass
+    )
+}
+
 /// The only write path GitVault opens for protection-surface state. A
 /// ruleset set moves no content, so the publication audit has nothing to
 /// review - the gate is the operator confirming this exact change with a
@@ -4257,8 +4289,14 @@ fn cmd_ruleset(
             if let Some(conditions) = spec.get("conditions").filter(|c| !c.is_null()) {
                 body["conditions"] = conditions.clone();
             }
+            // The confirmation is bound to the exact request body: the
+            // prompt carries a human-readable shape summary and the body's
+            // stable digest, and the confirmed bytes are the bytes sent.
+            let body_bytes = body.to_string();
             unlock::require_biometric(&format!(
-                "GitVault: confirm to create ruleset '{name}' on {slug} (enforcement: {enforcement})"
+                "GitVault: confirm to create ruleset '{name}' on {slug}: target {target}, enforcement {enforcement}, {}, body sha256:{}",
+                ruleset_shape(&body),
+                ruleset_digest(&body_bytes),
             ))?;
             let req = api::Request {
                 method: "POST".into(),
@@ -4267,7 +4305,7 @@ fn cmd_ruleset(
                 fields: vec![],
                 raw_fields: vec![],
                 headers: vec![],
-                body: Some(body.to_string()),
+                body: Some(body_bytes),
                 body_stream: None,
                 follow: false,
                 mutation: api::Mutation::OperatorConfirmed,
@@ -4300,12 +4338,40 @@ fn cmd_ruleset(
                 println!("ruleset {id} ({name}) is already {enforcement}");
                 return Ok(ExitCode::SUCCESS);
             }
+            let body = serde_json::json!({
+                "name": ruleset["name"],
+                "target": ruleset["target"],
+                "enforcement": enforcement,
+                "conditions": ruleset["conditions"],
+                "rules": ruleset["rules"],
+                "bypass_actors": ruleset["bypass_actors"],
+            });
+            // The confirmation is bound to the exact request body: the
+            // prompt carries the transition, the body's shape summary and
+            // its stable digest, and the confirmed bytes are the bytes sent.
+            let body_bytes = body.to_string();
             // Per-action authorization: a fresh biometric on every call,
             // even while the vault window is open - a protection change is
             // never inherited from an earlier unlock.
             unlock::require_biometric(&format!(
-                "GitVault: confirm to set ruleset '{name}' ({id}) on {slug}: {current} -> {enforcement}"
+                "GitVault: confirm to set ruleset '{name}' ({id}) on {slug}: {current} -> {enforcement} ({}, body sha256:{})",
+                ruleset_shape(&body),
+                ruleset_digest(&body_bytes),
             ))?;
+            // Re-read immediately before writing: the operator approved an
+            // enforcement transition on the state it was shown, so a
+            // concurrent change to any other field refuses rather than
+            // silently overwriting unseen policy.
+            let fresh_raw = api::run_value(&cfg, &vault, &read)
+                .map_err(|err| anyhow::anyhow!("cannot re-read ruleset {id} on {slug}: {err:#}"))?;
+            let fresh: serde_json::Value = serde_json::from_str(&fresh_raw)
+                .with_context(|| format!("ruleset {id} re-read returned an unreadable payload"))?;
+            for field in ["name", "target", "conditions", "rules", "bypass_actors"] {
+                anyhow::ensure!(
+                    fresh[field] == ruleset[field],
+                    "ruleset {id} changed under the confirmation ({field}); refusing to overwrite unseen state"
+                );
+            }
             let req = api::Request {
                 method: "PUT".into(),
                 path: format!("/repos/{slug}/rulesets/{id}"),
@@ -4313,17 +4379,7 @@ fn cmd_ruleset(
                 fields: vec![],
                 raw_fields: vec![],
                 headers: vec![],
-                body: Some(
-                    serde_json::json!({
-                        "name": ruleset["name"],
-                        "target": ruleset["target"],
-                        "enforcement": enforcement,
-                        "conditions": ruleset["conditions"],
-                        "rules": ruleset["rules"],
-                        "bypass_actors": ruleset["bypass_actors"],
-                    })
-                    .to_string(),
-                ),
+                body: Some(body_bytes),
                 body_stream: None,
                 follow: false,
                 mutation: api::Mutation::OperatorConfirmed,
