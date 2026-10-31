@@ -378,16 +378,23 @@ mod tests {
         crate::vault::Vault::open().unwrap()
     }
 
+    // Test keys are minted at run time from a tag byte, never written as a
+    // literal default: two tags give two distinct keys, and no key-shaped
+    // literal sits in the source.
+    fn test_key(tag: u8) -> [u8; 32] {
+        std::array::from_fn(|index| tag ^ index as u8)
+    }
+
     #[test]
     fn window_opens_and_closes() {
         with_state("open", || {
             clear().unwrap();
-            let key = synthetic_bytes();
-            let vault = seeded_vault(key);
+            let key = test_key(0x5A);
+            let vault = seeded_vault(&key);
             assert_eq!(remaining(&vault), 0);
             assert!(!is_unlocked(&vault));
 
-            mark_unlocked(Duration::from_secs(60), key).unwrap();
+            mark_unlocked(Duration::from_secs(60), &key).unwrap();
             assert!(is_unlocked(&vault));
             assert!(remaining(&vault) > 50);
 
@@ -407,11 +414,11 @@ mod tests {
             // A record minted under a different key is equally void.
             let boot = boot_time().unwrap_or(0);
             let expiry = now_secs() + 3600;
-            let alien = window_mac(alien_bytes(), expiry, boot);
+            let alien = window_mac(&test_key(0xC3), expiry, boot);
             std::fs::write(state_path(), format!("{expiry} {boot} {alien}\n")).unwrap();
             assert_eq!(remaining(&vault), 0, "a tag under another key must lock");
 
-            mark_unlocked(Duration::from_secs(60), key).unwrap();
+            mark_unlocked(Duration::from_secs(60), &key).unwrap();
             clear().unwrap();
             assert!(!is_unlocked(&vault));
         });
@@ -421,12 +428,12 @@ mod tests {
     fn an_expired_window_is_locked() {
         with_state("expired", || {
             clear().unwrap();
-            let key = synthetic_bytes();
-            let vault = seeded_vault(key);
+            let key = test_key(0x5A);
+            let vault = seeded_vault(&key);
             let boot = boot_time().unwrap_or(0);
             std::fs::write(
                 state_path(),
-                format!("1 {boot} {}\n", window_mac(key, 1, boot)),
+                format!("1 {boot} {}\n", window_mac(&key, 1, boot)),
             )
             .unwrap();
             assert_eq!(remaining(&vault), 0);
@@ -440,8 +447,8 @@ mod tests {
         // still be open.
         with_state("prior-boot", || {
             clear().unwrap();
-            let key = synthetic_bytes();
-            let vault = seeded_vault(key);
+            let key = test_key(0x5A);
+            let vault = seeded_vault(&key);
             let current = boot_time().unwrap_or(1);
             let different = current.wrapping_sub(1);
             let expiry = now_secs() + 3600;
@@ -449,7 +456,7 @@ mod tests {
             std::fs::write(state_path(), format!("{expiry}\n")).unwrap();
             assert_eq!(remaining(&vault), 0, "a missing boot stamp must lock");
 
-            let tag = window_mac(key, expiry, different);
+            let tag = window_mac(&key, expiry, different);
             std::fs::write(state_path(), format!("{expiry} {different} {tag}\n")).unwrap();
             assert_eq!(remaining(&vault), 0, "a different boot session must lock");
         });
@@ -459,7 +466,7 @@ mod tests {
     fn a_missing_or_malformed_state_file_is_locked() {
         with_state("missing", || {
             clear().unwrap();
-            let vault = seeded_vault(synthetic_bytes());
+            let vault = seeded_vault(&test_key(0x5A));
             let _ = std::fs::remove_file(state_path());
             assert_eq!(remaining(&vault), 0);
             std::fs::write(state_path(), "not a number\n").unwrap();
