@@ -6373,8 +6373,8 @@ fn cmd_objection(command: ObjectionCommand) -> anyhow::Result<ExitCode> {
                     finding.is_some() || fingerprint_spec.is_some(),
                     "--finding FILE[:LINE] or --fingerprint HEX is required"
                 );
-                let report = latest_report(&checker)
-                    .with_context(|| format!("no report.json for checker '{checker}'"))?;
+                let report = latest_report(&checker, &slug)
+                    .with_context(|| format!("no report.json for checker '{checker}' on {slug}"))?;
                 let candidates = blocking_findings(&report, &checker);
                 let hit = locate_finding(
                     &candidates,
@@ -6634,26 +6634,36 @@ fn locate_finding<'a>(
     }
 }
 
-/// A checker's newest report.json under the engine's profile run history.
-/// The root comes from the same armed-aware resolver as the engine child's
-/// data root, so an objection always binds the report the engine wrote.
-fn latest_report(checker: &str) -> Option<serde_json::Value> {
+/// A checker's newest report.json for this repository under the engine's
+/// profile run history. The root comes from the same armed-aware resolver
+/// as the engine child's data root, so an objection always binds the report
+/// the engine wrote; a newer run sealed for another repository can never
+/// answer for this one's findings.
+fn latest_report(checker: &str, slug: &str) -> Option<serde_json::Value> {
     let runs = crate::probator::profiles_root()
         .join(checker)
         .join(format!("{checker}-runs"));
-    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    let mut newest: Option<(std::time::SystemTime, serde_json::Value)> = None;
     for entry in std::fs::read_dir(runs).ok()?.flatten() {
         let report = entry.path().join("report.json");
         let Ok(meta) = report.metadata() else {
             continue;
         };
+        let Ok(raw) = std::fs::read_to_string(&report) else {
+            continue;
+        };
+        let Ok(report) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        if report["repo"].as_str() != Some(slug) {
+            continue;
+        }
         let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
         if newest.as_ref().is_none_or(|(t, _)| modified > *t) {
             newest = Some((modified, report));
         }
     }
-    let (_, path) = newest?;
-    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+    newest.map(|(_, report)| report)
 }
 
 #[cfg(test)]
