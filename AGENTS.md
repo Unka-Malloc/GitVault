@@ -151,6 +151,17 @@ create` likewise reads the remote tag it will publish. These are read-only
 credential uses, not the publication itself. `api`/`ssh`/`config sign`/
 `objection rule` prompt at use time.
 
+`gitvault update` runs the whole deploy as one command: it builds the
+Probator checkout (`--probator`) and the GitVault checkout (`--self-src`,
+defaulting to the running binary's own cargo checkout), rebuilds the Touch
+ID helper when its source is newer, mints or replaces the signing anchor
+(`--rekey`), then runs `install`'s privileged sequence with the engine and
+helper as payloads, sets `core.hooksPath`, installs or refreshes the
+checkers from `tools/*/contract.json`, and re-certifies the configuration
+when a signature no longer verifies. It must run as the normal user - the
+privileged steps escalate internally, and a whole-command sudo resolves the
+account home to root's and deploys into the wrong tree.
+
 ## Verify
 
 `cargo fmt && cargo clippy --all-targets && cargo test`

@@ -180,6 +180,36 @@ enum Command {
     /// user-writable: editing it is allowed, but only a signed version loads.
     Install,
 
+    /// Rebuild and deploy GitVault and the Probator audit engine in one pass.
+    ///
+    /// Builds the given checkouts, unflags the enforcement surface, deploys
+    /// each binary onto a fresh inode and re-locks it, refreshes the engine's
+    /// installed checkers, then re-certifies the configuration when a
+    /// signature no longer verifies. Run as the normal user: the privileged
+    /// steps escalate internally, and a whole-command sudo would resolve the
+    /// account home to root's and deploy into the wrong tree.
+    Update {
+        /// Probator source checkout to build the audit engine from. Its
+        /// tools/*/contract.json checkers are installed or refreshed.
+        #[arg(long)]
+        probator: Option<PathBuf>,
+
+        /// GitVault source checkout to rebuild this binary from. Defaults to
+        /// the checkout containing the running binary when it lives under a
+        /// cargo target directory.
+        #[arg(long = "self-src")]
+        self_src: Option<PathBuf>,
+
+        /// Skip the checker install/update pass over Probator's tools/.
+        #[arg(long)]
+        no_checkers: bool,
+
+        /// Mint a new configuration signing key before arming, replacing the
+        /// existing anchor and invalidating current signatures.
+        #[arg(long)]
+        rekey: bool,
+    },
+
     /// Make an authenticated GitHub API request.
     ///
     /// The token is used inside GitVault and is never returned, so there is no
@@ -722,6 +752,12 @@ fn main() -> ExitCode {
         Command::Config { command } => cmd_config(cli.config.as_ref(), command),
         Command::Objection { command } => cmd_objection(command),
         Command::Install => cmd_install(),
+        Command::Update {
+            probator,
+            self_src,
+            no_checkers,
+            rekey,
+        } => cmd_update(cli.config.as_ref(), probator, self_src, no_checkers, rekey),
         Command::Api {
             path,
             method,
@@ -2885,7 +2921,23 @@ fn hook_stub_script(event: &str) -> String {
     format!("#!/usr/bin/env bash\nexec \"$(dirname -- \"$0\")/_dispatch\" {event} \"$@\"\n")
 }
 
+/// A binary the install sequence deploys onto the enforcement surface: `src`
+/// lands at `dst` through install_atomic before the immutable flag is applied.
+struct Deploy {
+    src: PathBuf,
+    dst: PathBuf,
+}
+
 fn cmd_install() -> anyhow::Result<ExitCode> {
+    install_with(&[])
+}
+
+/// The shared deploy-and-arm sequence: release a previous install's flags,
+/// atomically place this binary, the hook dispatchers and every requested
+/// payload (the audit engine, the Touch ID helper) on fresh inodes, then hand
+/// the whole surface to the immutable flag. `deploys` carries separately
+/// built binaries that join the surface in the same privileged pass.
+fn install_with(deploys: &[Deploy]) -> anyhow::Result<ExitCode> {
     // The installed surface and the anchor must both live under the account
     // home, even when HOME points somewhere else: a redirect must not split
     // the trust root from the files it protects.
@@ -2926,7 +2978,8 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
     // weakening. An unarmed first install may still warn and proceed, because
     // no boundary trusts the engine yet.
     let installed_engine = probator::installed_engine_path();
-    if arming && installed_engine.is_none() {
+    let engine_pending = deploys.iter().any(|d| d.dst == bin_dir.join("probator"));
+    if arming && installed_engine.is_none() && !engine_pending {
         anyhow::bail!(
             "refusing to arm without an audit engine: probator is not installed at {}\n  \
              install Probator first, then re-run `gitvault install`",
@@ -2950,12 +3003,12 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
     // audit. Lock what exists; never copy or install it.
     for name in ["probator", "probator-agent"] {
         let engine = bin_dir.join(name);
-        if engine.exists() {
+        if engine.exists() || deploys.iter().any(|d| d.dst == engine) {
             immobilise.push(engine);
         }
     }
     let touchid = bin_dir.join("gitvault-touchid");
-    if touchid.exists() {
+    if touchid.exists() || deploys.iter().any(|d| d.dst == touchid) {
         immobilise.push(touchid.clone());
     }
     immobilise.push(hooks.clone());
@@ -3018,17 +3071,34 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
     // self-consistent before/after comparison alone.
     let mut expected: std::collections::HashMap<PathBuf, [u8; 32]> =
         std::collections::HashMap::new();
+    let self_src = deploys
+        .iter()
+        .find(|d| d.dst == target)
+        .map(|d| d.src.clone())
+        .unwrap_or_else(|| exe.clone());
+    let self_resolved = self_src.canonicalize().unwrap_or_else(|_| self_src.clone());
     let self_install = target
         .canonicalize()
-        .map(|resolved| resolved == exe)
+        .map(|resolved| resolved == self_resolved)
         .unwrap_or(false);
     if !self_install {
-        expected.insert(target.clone(), install_atomic(&exe, &target, 0o755)?);
+        expected.insert(target.clone(), install_atomic(&self_src, &target, 0o755)?);
+    }
+    for deploy in deploys.iter().filter(|d| d.dst != target) {
+        anyhow::ensure!(
+            deploy.src.is_file(),
+            "deploy source {} does not exist",
+            deploy.src.display()
+        );
+        expected.insert(
+            deploy.dst.clone(),
+            install_atomic(&deploy.src, &deploy.dst, 0o755)?,
+        );
     }
     // Warn, but do not install: the audit engine is installed and versioned on
     // its own. Its absence refuses every publication audit at run time; an
     // armed install was already refused above.
-    if installed_engine.is_none() {
+    if installed_engine.is_none() && !engine_pending {
         eprintln!(
             "gitvault: probator is not installed at {} - \
              publication audits will refuse until it is installed and this install is re-run",
@@ -3044,8 +3114,10 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
     std::fs::set_permissions(&sign_wrapper, std::fs::Permissions::from_mode(0o755))
         .with_context(|| format!("cannot make {} executable", sign_wrapper.display()))?;
     // The touchid helper is a Mach-O too: if an earlier run left it poisoned,
-    // a rewrite onto a fresh inode cures it the same way.
-    if touchid.exists() {
+    // a rewrite onto a fresh inode cures it the same way. A payload already
+    // placed it above, so the self-repair only applies to an existing helper
+    // no deploy carried in.
+    if touchid.exists() && !deploys.iter().any(|d| d.dst == touchid) {
         let mode = touchid
             .metadata()
             .map(|m| m.permissions().mode() & 0o777)
@@ -3230,6 +3302,245 @@ fn cmd_install() -> anyhow::Result<ExitCode> {
              next: gitvault config keygen && gitvault config sign && gitvault install"
         );
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Run a build tool to completion, inheriting the operator's terminal.
+fn run_checked(tool: &str, args: &[std::ffi::OsString]) -> anyhow::Result<()> {
+    let status = std::process::Command::new(tool)
+        .args(args)
+        .status()
+        .with_context(|| format!("cannot run {tool}"))?;
+    anyhow::ensure!(
+        status.success(),
+        "{tool} exited with {}",
+        status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "a signal".to_string())
+    );
+    Ok(())
+}
+
+/// The one-command deploy: build both projects, mint or replace the signing
+/// anchor when needed, then run the shared install sequence with the engine
+/// and helper as payloads, refresh the checkers, and re-certify the
+/// configuration. The manual equivalent is roughly ten steps with ordering
+/// constraints - the engine must precede arming, and schg-locked binaries
+/// cannot be overwritten - that this command internalizes.
+fn cmd_update(
+    config_path: Option<&PathBuf>,
+    probator_src: Option<PathBuf>,
+    self_src: Option<PathBuf>,
+    no_checkers: bool,
+    rekey: bool,
+) -> anyhow::Result<ExitCode> {
+    // Every privileged step below escalates itself; run under sudo and the
+    // account home resolves to root's, deploying into the wrong tree.
+    if unsafe { libc::geteuid() } == 0 {
+        anyhow::bail!(
+            "run `gitvault update` as the normal user, not under sudo - \
+             the privileged steps escalate internally"
+        );
+    }
+    let home = configsig::account_home()?;
+    let bin = home.join(".local/bin");
+
+    let exe = std::env::current_exe().context("cannot locate the running binary")?;
+    let exe = exe.canonicalize().unwrap_or(exe);
+    // A binary run from <checkout>/target/release names its own checkout; an
+    // installed binary cannot rebuild itself without --self-src.
+    let inferred_src = exe
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .filter(|dir| dir.join("Cargo.toml").is_file())
+        .map(Path::to_path_buf);
+    let self_src = self_src.or(inferred_src);
+
+    let mut deploys: Vec<Deploy> = Vec::new();
+
+    if let Some(src) = &probator_src {
+        anyhow::ensure!(
+            src.join("Cargo.toml").is_file(),
+            "Probator checkout not found at {}",
+            src.display()
+        );
+        run_checked(
+            "cargo",
+            &[
+                "build".into(),
+                "--release".into(),
+                "--manifest-path".into(),
+                src.join("Cargo.toml").into_os_string(),
+            ],
+        )?;
+        for name in ["probator", "probator-agent"] {
+            let built = src.join("target/release").join(name);
+            anyhow::ensure!(
+                built.is_file(),
+                "engine build did not produce {}",
+                built.display()
+            );
+            deploys.push(Deploy {
+                src: built,
+                dst: bin.join(name),
+            });
+        }
+    }
+
+    if let Some(src) = &self_src {
+        run_checked(
+            "cargo",
+            &[
+                "build".into(),
+                "--release".into(),
+                "--manifest-path".into(),
+                src.join("Cargo.toml").into_os_string(),
+            ],
+        )?;
+        deploys.push(Deploy {
+            src: src.join("target/release/gitvault"),
+            dst: bin.join("gitvault"),
+        });
+        // The Touch ID helper belongs to this checkout's tools/; rebuild it
+        // only when the source is newer than the installed helper, or none
+        // exists.
+        let helper_src = src.join("tools/gitvault-touchid.swift");
+        let helper_dst = bin.join("gitvault-touchid");
+        let stale = !helper_dst.exists()
+            || match (
+                std::fs::metadata(&helper_src),
+                std::fs::metadata(&helper_dst),
+            ) {
+                (Ok(s), Ok(d)) => s.modified().ok() > d.modified().ok(),
+                _ => true,
+            };
+        if helper_src.is_file() && stale {
+            let built = src.join("target/release/gitvault-touchid");
+            run_checked(
+                "swiftc",
+                &[
+                    helper_src.into_os_string(),
+                    "-o".into(),
+                    built.clone().into_os_string(),
+                ],
+            )?;
+            deploys.push(Deploy {
+                src: built,
+                dst: helper_dst,
+            });
+        }
+    }
+
+    // The signing anchor must exist before the install arms it. Rekeying
+    // removes the old file first: the config directory is user-writable, so
+    // even a root-owned anchor unlinks once its flag is dropped.
+    let anchor = configsig::anchor_path();
+    if rekey {
+        if anchor.exists() {
+            let _ = std::process::Command::new("sudo")
+                .args(["chflags", "noschg"])
+                .arg(&anchor)
+                .status();
+            std::fs::remove_file(&anchor)
+                .with_context(|| format!("cannot unlink {}", anchor.display()))?;
+        }
+        cmd_config_keygen()?;
+    } else if !anchor.exists() {
+        eprintln!("no configuration signing anchor yet - minting one");
+        cmd_config_keygen()?;
+    }
+
+    install_with(&deploys)?;
+
+    // Hook discovery is a git setting, not part of the armed surface.
+    run_checked(
+        "git",
+        &[
+            "config".into(),
+            "--global".into(),
+            "core.hooksPath".into(),
+            home.join(".git-hooks").into_os_string(),
+        ],
+    )?;
+
+    if let Some(src) = &probator_src
+        && !no_checkers
+    {
+        let profiles = std::env::var_os("XDG_DATA_HOME")
+            .map(|d| PathBuf::from(d).join("probator/profiles"))
+            .unwrap_or_else(|| home.join(".local/share/probator/profiles"));
+        let tools = src.join("tools");
+        let mut dirs: Vec<PathBuf> = std::fs::read_dir(&tools)
+            .with_context(|| format!("cannot list {}", tools.display()))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.is_dir())
+            .collect();
+        dirs.sort();
+        for dir in dirs {
+            let contract = dir.join("contract.json");
+            if !contract.is_file() {
+                continue;
+            }
+            let name = std::fs::read(&contract)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|v| v["name"].as_str().map(str::to_string));
+            let Some(name) = name else {
+                eprintln!(
+                    "gitvault: skipping {} - contract.json has no name",
+                    dir.display()
+                );
+                continue;
+            };
+            let installed = profiles
+                .join(&name)
+                .join("plugins")
+                .join(&name)
+                .join("installation.json")
+                .is_file();
+            let sub = if installed { "update" } else { "install" };
+            println!("probator {sub} --source {}", dir.display());
+            let status = std::process::Command::new(bin.join("probator"))
+                .args([sub, "--source"])
+                .arg(&dir)
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        bin.display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .status()
+                .context("cannot run the installed probator")?;
+            anyhow::ensure!(status.success(), "probator {sub} failed for {name}");
+        }
+    }
+
+    // Re-certify the routing table and the engine authorization when either
+    // signature no longer verifies - after a rekey that is always, otherwise
+    // only on drift. `config sign` prompts for the vault when it needs it.
+    let cfg_path = config_path
+        .cloned()
+        .unwrap_or_else(config::Config::default_path);
+    if cfg_path.exists() {
+        let (cfg, _, _) = config::Config::load_unverified(Some(&cfg_path))?;
+        let policy_path = config::Policy::resolve(&cfg_path, &cfg);
+        let certified = configsig::verify(&cfg_path).is_ok()
+            && (!policy_path.exists() || configsig::verify(&policy_path).is_ok());
+        if !certified {
+            cmd_config_sign(Some(&cfg_path))?;
+        }
+    } else {
+        eprintln!(
+            "gitvault: no routing config at {} - create it, then run `gitvault config sign`",
+            cfg_path.display()
+        );
+    }
+
+    println!("update complete");
     Ok(ExitCode::SUCCESS)
 }
 
@@ -3996,7 +4307,7 @@ fn cmd_ruleset(
                 "GitVault: confirm to set ruleset '{name}' ({id}) on {slug}: {current} -> {enforcement}"
             ))?;
             let req = api::Request {
-                method: "PATCH".into(),
+                method: "PUT".into(),
                 path: format!("/repos/{slug}/rulesets/{id}"),
                 target: api::Target::Repo(slug.clone()),
                 fields: vec![],
@@ -4007,6 +4318,8 @@ fn cmd_ruleset(
                         "name": ruleset["name"],
                         "target": ruleset["target"],
                         "enforcement": enforcement,
+                        "conditions": ruleset["conditions"],
+                        "rules": ruleset["rules"],
                         "bypass_actors": ruleset["bypass_actors"],
                     })
                     .to_string(),

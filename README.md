@@ -150,6 +150,8 @@ gitvault run list [--json]                   # recent workflow runs
 gitvault run view RUN_ID [--json]            # one run's metadata
 gitvault run logs JOB_ID                     # a job's log text
 gitvault run logs --run RUN_ID               # a run's logs archive (zip)
+gitvault update [--probator DIR] [--self-src DIR] [--no-checkers] [--rekey]
+                                             # one-command build + deploy + arm
 ```
 
 Log and download endpoints answer `302` rather than a body: GitHub hands the
