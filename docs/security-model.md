@@ -283,7 +283,7 @@ only mutating requests the broker honors are marked by commands whose own
 audit already ran (`pr create/merge`, `release create`), by narrowly
 justified removals of unaudited server-side state (moved-head pull-request
 cleanup), or by an operator confirmation the open window cannot satisfy:
-`ruleset create`, `ruleset set`, `repo create` and `repo delete` change
+`repo create`, `repo delete`, `ruleset create` and `ruleset set` change
 server-side protection or repository existence - no candidate content
 moves, so there is nothing a publication audit could review. Each is minted
 only after a fresh biometric confirmation naming the exact object and
