@@ -283,14 +283,15 @@ only mutating requests the broker honors are marked by commands whose own
 audit already ran (`pr create/merge`, `release create`), by narrowly
 justified removals of unaudited server-side state (moved-head pull-request
 cleanup), or by an operator confirmation the open window cannot satisfy:
-`repo create`, `repo delete`, `ruleset create` and `ruleset set` change
-server-side protection or repository existence - no candidate content
-moves, so there is nothing a publication audit could review. Each is minted
-only after a fresh biometric confirmation naming the exact object and
-outcome (the ruleset and its enforcement, or the repository being created
-or deleted), requested on every call regardless of window state; where the
-request carries a body the prompt also binds its digest, so the confirmed
-bytes are the bytes sent. The per-call confirmation is the entire gate.
+`repo create`, `repo edit`, `repo delete`, `ruleset create` and `ruleset
+set` change server-side protection, repository metadata or repository
+existence - no candidate content moves, so there is nothing a publication
+audit could review. Each is minted only after a fresh biometric
+confirmation naming the exact object and outcome (the ruleset and its
+enforcement, or the repository being created, edited or deleted),
+requested on every call regardless of window state; where the request
+carries a body the prompt also binds its digest, so the confirmed bytes
+are the bytes sent. The per-call confirmation is the entire gate.
 `repo create` routes by the slug's owner through the same identity rules as
 any other repository-scoped request, so an unlisted owner is refused rather
 than attributed to a default account.

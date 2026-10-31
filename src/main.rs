@@ -559,7 +559,30 @@ enum RepoCommand {
         /// Short description for the repository.
         #[arg(long)]
         description: Option<String>,
+        /// Homepage URL for the repository.
+        #[arg(long)]
+        homepage: Option<String>,
         /// Print the raw API response instead of the created slug.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change a repository's description and homepage.
+    ///
+    /// The fields move no reviewed content, so there is nothing a
+    /// publication audit could read - the gate is a fresh biometric naming
+    /// the exact slug and the changed fields on every call, and the open
+    /// vault window never satisfies it. The request body's digest is bound
+    /// into the prompt, so the bytes sent are the bytes approved.
+    Edit {
+        /// OWNER/NAME to change; spelled out, never inferred from a checkout.
+        slug: String,
+        /// Set the repository description; an empty string clears it.
+        #[arg(long)]
+        description: Option<String>,
+        /// Set the repository homepage URL; an empty string clears it.
+        #[arg(long)]
+        homepage: Option<String>,
+        /// Print the raw API response instead of the edited slug.
         #[arg(long)]
         json: bool,
     },
@@ -4575,9 +4598,16 @@ fn cmd_repo(config: Option<&PathBuf>, command: RepoCommand) -> anyhow::Result<Ex
             slug,
             public,
             description,
+            homepage,
             json,
             ..
-        } => return cmd_repo_create(&cfg, &vault, &slug, public, description, json),
+        } => return cmd_repo_create(&cfg, &vault, &slug, public, description, homepage, json),
+        RepoCommand::Edit {
+            slug,
+            description,
+            homepage,
+            json,
+        } => return cmd_repo_edit(&cfg, &vault, &slug, description, homepage, json),
         RepoCommand::Delete { slug } => return cmd_repo_delete(&cfg, &vault, &slug),
     };
     emit(&cfg, &vault, req)
@@ -4621,6 +4651,7 @@ fn cmd_repo_create(
     slug: &str,
     public: bool,
     description: Option<String>,
+    homepage: Option<String>,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     let (owner, name) = parse_repo_slug(slug)?;
@@ -4654,6 +4685,9 @@ fn cmd_repo_create(
     if let Some(description) = description {
         body["description"] = description.into();
     }
+    if let Some(homepage) = homepage {
+        body["homepage"] = homepage.into();
+    }
     // Per-call authorization: the prompt names the exact repository being
     // created and binds the confirmation to the bytes sent; an open vault
     // window never satisfies it.
@@ -4666,6 +4700,74 @@ fn cmd_repo_create(
     let req = api::Request {
         method: "POST".into(),
         path,
+        target: api::Target::Repo(slug.to_string()),
+        fields: vec![],
+        raw_fields: vec![],
+        headers: vec![],
+        body: Some(body_bytes),
+        body_stream: None,
+        follow: false,
+        mutation: api::Mutation::OperatorConfirmed,
+        jq: if json {
+            None
+        } else {
+            Some(".full_name".into())
+        },
+        silent: false,
+    };
+    emit(cfg, vault, req)
+}
+
+/// The PATCH body for `repo edit`: only the fields the operator named, and
+/// at least one - an empty change would prompt a biometric for nothing. An
+/// empty string is a real field value: it clears the field server-side.
+fn repo_edit_body(
+    description: Option<String>,
+    homepage: Option<String>,
+) -> anyhow::Result<serde_json::Value> {
+    let mut body = serde_json::json!({});
+    if let Some(description) = description {
+        body["description"] = description.into();
+    }
+    if let Some(homepage) = homepage {
+        body["homepage"] = homepage.into();
+    }
+    anyhow::ensure!(
+        body.as_object().is_some_and(|fields| !fields.is_empty()),
+        "nothing to change: pass --description or --homepage"
+    );
+    Ok(body)
+}
+
+/// Change a repository's description or homepage.
+///
+/// Same gate as the other repository-lifecycle writes: the PATCH carries no
+/// reviewed content, so the per-call confirmation is the whole
+/// authorization - a fresh biometric naming the exact slug and the fields
+/// being changed, bound to the request body's digest.
+fn cmd_repo_edit(
+    cfg: &config::Config,
+    vault: &vault::Vault,
+    slug: &str,
+    description: Option<String>,
+    homepage: Option<String>,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    let _ = parse_repo_slug(slug)?;
+    let body = repo_edit_body(description, homepage)?;
+    let body_bytes = body.to_string();
+    let fields = body
+        .as_object()
+        .map(|fields| fields.keys().cloned().collect::<Vec<_>>().join(", "))
+        .unwrap_or_default();
+    eprintln!("gitvault: editing repository {slug} ({fields})");
+    unlock::require_biometric(&format!(
+        "GitVault: confirm to edit repository {slug} ({fields}), body sha256:{}",
+        body_digest(&body_bytes),
+    ))?;
+    let req = api::Request {
+        method: "PATCH".into(),
+        path: format!("/repos/{slug}"),
         target: api::Target::Repo(slug.to_string()),
         fields: vec![],
         raw_fields: vec![],
@@ -6672,8 +6774,8 @@ mod tests {
         MAX_ASSET_BYTES, MAX_RELEASE_ASSETS, blocking_findings, branch_for_api,
         check_release_assets, dispatcher_script, fetch_remote_ref, hook_stub_script, local_pr_base,
         locate_finding, outgoing_push_stdin, parse_push_args, parse_repo_slug, publication_surface,
-        push_plan, release_staging_root, remote_mirrors, ruleset_drifted, sha256_file,
-        sha256_reader, stage_release_assets, verify_remote_tag,
+        push_plan, release_staging_root, remote_mirrors, repo_edit_body, ruleset_drifted,
+        sha256_file, sha256_reader, stage_release_assets, verify_remote_tag,
     };
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -6743,6 +6845,28 @@ mod tests {
         ] {
             assert!(parse_repo_slug(bad).is_err(), "'{bad}' must be refused");
         }
+    }
+
+    /// `repo edit` carries only the fields the operator named, and refuses
+    /// an empty change rather than spending a biometric prompt on nothing.
+    #[test]
+    fn a_repo_edit_carries_only_the_named_fields() {
+        let body = repo_edit_body(Some("docs".into()), None).unwrap();
+        assert_eq!(body, serde_json::json!({"description": "docs"}));
+        let body = repo_edit_body(None, Some("https://example.invalid".into())).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"homepage": "https://example.invalid"})
+        );
+        let body = repo_edit_body(Some("d".into()), Some("h".into())).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"description": "d", "homepage": "h"})
+        );
+        // An empty string is a real edit: it clears the field server-side.
+        let body = repo_edit_body(None, Some(String::new())).unwrap();
+        assert_eq!(body, serde_json::json!({"homepage": ""}));
+        assert!(repo_edit_body(None, None).is_err());
     }
 
     /// An objection can target a blocker the previous verdict carried into
