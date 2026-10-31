@@ -6375,7 +6375,7 @@ fn cmd_objection(command: ObjectionCommand) -> anyhow::Result<ExitCode> {
                 );
                 let report = latest_report(&checker)
                     .with_context(|| format!("no report.json for checker '{checker}'"))?;
-                let candidates = blocking_findings(&report);
+                let candidates = blocking_findings(&report, &checker);
                 let hit = locate_finding(
                     &candidates,
                     &checker,
@@ -6514,26 +6514,36 @@ fn cmd_objection(command: ObjectionCommand) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// One candidate's evidence fingerprint - the identity a ruling binds:
+/// checker, location and whitespace-normalized evidence text.
+fn finding_fingerprint(checker: &str, finding: &serde_json::Value) -> String {
+    objection::fingerprint(
+        checker,
+        finding["file"].as_str().unwrap_or(""),
+        finding["line"].as_u64().unwrap_or(0),
+        finding["evidence"].as_str().unwrap_or(""),
+    )
+}
+
 /// The blocking findings an objection may target: the report's fresh
 /// findings plus the blockers a previous verdict carried into this head,
-/// deduplicated by location and evidence. This is the same standing set the
-/// engine merges before it applies rulings, so an objection filed here
-/// names the same finding the gate will evaluate.
-fn blocking_findings(report: &serde_json::Value) -> Vec<serde_json::Value> {
+/// deduplicated by fingerprint - a fresh row and a carried row naming the
+/// same blocker share its fingerprint even when the evidence's whitespace
+/// drifted, a ruling filed on either waives both, and keeping both would
+/// offer an ambiguity no fingerprint could resolve. This is the same
+/// standing set the engine merges before it applies rulings, so an
+/// objection filed here names the same finding the gate will evaluate.
+fn blocking_findings(report: &serde_json::Value, checker: &str) -> Vec<serde_json::Value> {
     let mut out: Vec<serde_json::Value> = Vec::new();
+    let mut fingerprints: std::collections::HashSet<String> = Default::default();
     for key in ["findings", "carried_findings"] {
         for finding in report[key].as_array().into_iter().flatten() {
-            if finding["severity"].as_str() != Some("blocking") {
+            if finding["severity"].as_str() != Some("blocking")
+                || !fingerprints.insert(finding_fingerprint(checker, finding))
+            {
                 continue;
             }
-            let duplicate = out.iter().any(|existing: &serde_json::Value| {
-                existing["file"] == finding["file"]
-                    && existing["line"] == finding["line"]
-                    && existing["evidence"] == finding["evidence"]
-            });
-            if !duplicate {
-                out.push(finding.clone());
-            }
+            out.push(finding.clone());
         }
     }
     out
@@ -6542,13 +6552,7 @@ fn blocking_findings(report: &serde_json::Value) -> Vec<serde_json::Value> {
 /// One candidate's fingerprint, abbreviated for display to the operator
 /// choosing between same-location blockers.
 fn finding_fingerprint_short(checker: &str, finding: &serde_json::Value) -> String {
-    let full = objection::fingerprint(
-        checker,
-        finding["file"].as_str().unwrap_or(""),
-        finding["line"].as_u64().unwrap_or(0),
-        finding["evidence"].as_str().unwrap_or(""),
-    );
-    full[..12].to_string()
+    finding_fingerprint(checker, finding)[..12].to_string()
 }
 
 /// Locate the single blocking finding the objection names, either by
@@ -6572,15 +6576,7 @@ fn locate_finding<'a>(
         );
         let matches: Vec<&serde_json::Value> = candidates
             .iter()
-            .filter(|f| {
-                objection::fingerprint(
-                    checker,
-                    f["file"].as_str().unwrap_or(""),
-                    f["line"].as_u64().unwrap_or(0),
-                    f["evidence"].as_str().unwrap_or(""),
-                )
-                .starts_with(&needle)
-            })
+            .filter(|f| finding_fingerprint(checker, f).starts_with(&needle))
             .collect();
         return match matches.as_slice() {
             [] => anyhow::bail!(
@@ -6755,7 +6751,7 @@ mod tests {
                 {"severity": "blocking", "file": "src/a.rs", "line": 10, "evidence": "fresh one"}
             ]
         });
-        let candidates = blocking_findings(&report);
+        let candidates = blocking_findings(&report, "c");
         // Advisory rows never surface, and a carried row identical to a fresh
         // one is not double-counted: 1 fresh-blocking + 1 carried = 2.
         assert_eq!(candidates.len(), 2);
@@ -6791,7 +6787,7 @@ mod tests {
                 {"severity": "blocking", "file": "src/a.rs", "line": 10, "evidence": "old wording"}
             ]
         });
-        let candidates = blocking_findings(&report);
+        let candidates = blocking_findings(&report, "c");
         let err = locate_finding(&candidates, "c", Some("src/a.rs:10"), None).unwrap_err();
         let text = format!("{err}");
         assert!(text.contains("--fingerprint"), "{text}");
@@ -6802,6 +6798,30 @@ mod tests {
             let hit = locate_finding(&candidates, "c", None, Some(&fp[..16])).unwrap();
             assert_eq!(hit["evidence"].as_str(), Some(evidence));
         }
+    }
+
+    /// A carried row re-anchors the same blocker even when the evidence's
+    /// whitespace drifted between reports - fingerprints normalize
+    /// whitespace, so the pair is one objection target, not an ambiguity no
+    /// `--fingerprint` could resolve.
+    #[test]
+    fn a_whitespace_equivalent_pair_dedupes_to_one_target() {
+        use serde_json::json;
+        let report = json!({
+            "findings": [
+                {"severity": "blocking", "file": "src/a.rs", "line": 10, "evidence": "a   b\n\tc"}
+            ],
+            "carried_findings": [
+                {"severity": "blocking", "file": "src/a.rs", "line": 10, "evidence": "a b c"}
+            ]
+        });
+        let candidates = blocking_findings(&report, "c");
+        assert_eq!(candidates.len(), 1, "one fingerprint, one candidate");
+        let hit = locate_finding(&candidates, "c", Some("src/a.rs:10"), None).unwrap();
+        assert_eq!(hit["line"].as_u64(), Some(10));
+        let fp = crate::objection::fingerprint("c", "src/a.rs", 10, "a b c");
+        let hit = locate_finding(&candidates, "c", None, Some(&fp[..16])).unwrap();
+        assert_eq!(hit["line"].as_u64(), Some(10));
     }
 
     /// A remote-prefixed base keeps the slashes that belong to the branch:
