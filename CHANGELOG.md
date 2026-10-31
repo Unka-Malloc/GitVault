@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.2
+
+- `gitvault repo edit OWNER/NAME` sets a repository's `--description` and
+  `--homepage` after creation - the PATCH channel that was missing, so the
+  fields no longer need a manual visit to the repository settings. It
+  carries the same operator-confirmed gate as `repo create`: a fresh
+  biometric on every call names the exact slug and the fields being
+  changed and binds the request body's digest; an open vault window never
+  satisfies it, and an empty value clears the field server-side.
+  `repo create` also accepts `--homepage` now.
+
 ## 0.3.1
 
 - `gitvault objection file --finding` now searches the standing set - fresh
