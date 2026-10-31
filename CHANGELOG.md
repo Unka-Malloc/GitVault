@@ -1,6 +1,24 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
+
+- `gitvault update` performs the whole deploy in one pass: builds the
+  Probator checkout (`--probator`) and, when the running binary lives under
+  a cargo target directory or `--self-src` is given, GitVault itself, plus
+  the Touch ID helper when its source is newer. It mints the signing anchor
+  when none exists (`--rekey` forces a fresh key), then runs the shared
+  install sequence with the engine and helper as payloads, sets
+  `core.hooksPath`, installs or refreshes each `tools/*/contract.json`
+  checker, and re-certifies the configuration when a signature no longer
+  verifies. The command refuses to run as root - the privileged steps
+  escalate internally, and a whole-command sudo would resolve the account
+  home to root's and deploy into the wrong tree.
+- The push-range scan skips advertised tips this checkout has not fetched
+  instead of failing the whole range on a `bad object`; the history gate
+  still refuses the push on the unfetched tip itself.
+- The Touch ID prompt refuses after a two-minute unanswered window, so an
+  unattended caller fails cleanly instead of hanging on a fingerprint that
+  never comes; expiry is a refusal, never an approval.
 
 ## 0.2.0
 
