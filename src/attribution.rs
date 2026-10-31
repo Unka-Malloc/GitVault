@@ -252,6 +252,24 @@ fn push_ranges(ctx: &Context) -> Result<Vec<RangeSpec>, String> {
             advertised.push(fields[3].to_string());
         }
     }
+    // An advertised tip this checkout does not carry cannot subtract:
+    // naming it to `git log --not` fails the whole range with `bad object`
+    // and the gate never sees the pushed commits. Dropping the missing tip
+    // widens the scan over more of the pushed ancestry instead - the safe
+    // direction for a gate that must inspect every outgoing commit. The
+    // history gate still refuses the push on the unfetched tip; this scan
+    // just stops being a second, unexplained refusal.
+    advertised.retain(|sha| {
+        run_git(
+            &ctx.repo_root,
+            &[
+                "rev-parse".into(),
+                "--verify".into(),
+                format!("{sha}^{{commit}}"),
+            ],
+        )
+        .is_ok()
+    });
     let exclusion = |local_sha: &str| -> Vec<String> {
         let mut spec = vec![local_sha.to_string()];
         if !advertised.is_empty() {
@@ -928,6 +946,54 @@ mod tests {
         assert!(
             matches!(outcome.outcome, OutcomeKind::Passed),
             "advertised tips still bound the scan: {outcome:?}"
+        );
+    }
+
+    /// The destination may advertise a tip this checkout never fetched (a
+    /// rewritten upstream, an unfetched remote): subtracting that sha reads
+    /// as `bad object` to `git log`, which used to surface as a gate crash
+    /// rather than a scan. The missing tip simply cannot exclude - the
+    /// pushed range is still scanned for what it carries.
+    #[test]
+    fn an_advertised_tip_missing_locally_cannot_break_the_scan() {
+        let dir = Dir::new("push-missing-tip");
+        dir.repo();
+        dir.git(&["config", "user.email", "test@example.invalid"]);
+        dir.git(&["config", "user.name", "Test"]);
+        std::fs::write(dir.0.join("base"), "base\n").unwrap();
+        dir.git(&["add", "base"]);
+        dir.git(&["commit", "-qm", "base"]);
+        let base = dir.git(&["rev-parse", "HEAD"]);
+        std::fs::write(dir.0.join("tainted"), "tainted\n").unwrap();
+        dir.git(&["add", "tainted"]);
+        dir.git(&[
+            "commit",
+            "-qm",
+            "feature\n\nCo-authored-by: Claude Code <noreply@anthropic.com>",
+        ]);
+        let head = dir.git(&["rev-parse", "HEAD"]);
+
+        // Two advertised tips: `base` resolves, `missing` does not. The
+        // present one still subtracts; the missing one must not turn the
+        // range into `fatal: bad object`.
+        let missing = "1".repeat(40);
+        let mut push = ctx(&dir, "pre-push", None);
+        push.push_remote = Some("origin".into());
+        push.stdin = Some(format!(
+            "refs/heads/main {head} refs/heads/main {base}\n\
+             refs/heads/side {head} refs/heads/side {missing}"
+        ));
+        let outcome = gate(&push).expect("pre-push runs the attribution gate");
+        match outcome.outcome {
+            OutcomeKind::Failed(_) => {}
+            other => {
+                panic!("a missing advertised tip must not crash the scan; got {other:?}")
+            }
+        }
+        assert!(
+            outcome.stdout.contains("co-authored-by trailer"),
+            "{}",
+            outcome.stdout
         );
     }
 
